@@ -14,6 +14,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Subprocess } from "bun";
 
+import * as fs from "node:fs";
 import { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentLaunchConfig } from "../shared/types.ts";
 import { log, getGitRoot, slugify } from "../shared/utils.ts";
@@ -205,12 +206,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "create_team",
-      description: "Create a new multi-agent team session. Launches headless agents with assigned roles and file ownership.",
+      description: "Create a new multi-agent team session. Launches headless agents (separate Claude/Codex/Gemini CLI processes) with assigned roles and file ownership. The project_dir will be created if it does not exist, and git will be initialized if needed. Returns a session_id to use with all other orchestrator tools.",
       inputSchema: {
         type: "object" as const,
         properties: {
-          project_dir: { type: "string", description: "Absolute path to the project directory" },
-          session_name: { type: "string", description: "Human-readable session name (e.g. 'Auth Implementation')" },
+          project_dir: { type: "string", description: "Absolute path where agents will work. Will be created if it does not exist. Example: /Users/me/my-project" },
+          session_name: { type: "string", description: "Short name for this session. Used to generate session_id. Example: 'calculator-app'" },
           agents: {
             type: "array",
             items: {
@@ -244,7 +245,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_team_status",
-      description: "Get current status of all agents in a session, including health, progress, and issues.",
+      description: "Get current status of all agents in a multiagents session — their roles, connection state, task state (idle/working/done/addressing_feedback), and what they are working on. Use the session_id returned by create_team.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -255,7 +256,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "broadcast_to_team",
-      description: "Send a message to all connected agents in the session.",
+      description: "Send a message to ALL connected agents in a multiagents session. Use for requirement changes, priority shifts, or announcements that every team member must see.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -268,7 +269,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "direct_agent",
-      description: "Send a direct message to a specific agent by name, role, or slot ID.",
+      description: "Send a direct message to a specific agent by name, role, or slot ID. The agent receives this as a peer message and must respond.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -281,7 +282,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "add_agent",
-      description: "Add a new agent to an existing session.",
+      description: "Spawn and add a new agent (Claude/Codex/Gemini CLI process) to an existing multiagents session. The agent auto-connects to the broker and receives team context.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -298,7 +299,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "remove_agent",
-      description: "Gracefully stop and remove an agent from the session.",
+      description: "Gracefully stop and remove an agent from the session. Kills the CLI process and marks the slot as disconnected.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -310,7 +311,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "control_session",
-      description: "Control the session: pause_all, resume_all, pause_agent, resume_agent, extend_budget, set_budget, status.",
+      description: "Control a multiagents session. Actions: pause_all (pause every agent), resume_all (resume every agent), pause_agent (pause one by name/role), resume_agent (resume one), extend_budget (add minutes to time limit), set_budget (set exact time limit), status (get control state).",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -324,7 +325,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "adjust_guardrail",
-      description: "View or update guardrail limits for a session.",
+      description: "View or update multiagents session guardrail limits (e.g. max restarts per agent). Use action='view' to see all guardrails, action='update' to change one.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -338,7 +339,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_session_log",
-      description: "Get the message history for a session.",
+      description: "Get the inter-agent message history for a multiagents session. Returns timestamped messages between agents with sender/recipient info.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -351,7 +352,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "release_agent",
-      description: "Release a specific agent, allowing it to disconnect. Use after their work is approved and complete.",
+      description: "Release a specific agent from the multiagents session, allowing it to disconnect. Only use after their work is approved and complete. Agents cannot self-disconnect — only the orchestrator can release them.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -364,7 +365,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "release_all",
-      description: "Release all agents in a session, allowing them to disconnect. Use when the entire team's work is complete.",
+      description: "Release ALL agents in a multiagents session, allowing them to disconnect. Use when the entire team's work is complete and production-grade.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -376,7 +377,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "end_session",
-      description: "End a session: stop all agents, archive the session. Optionally create a PR.",
+      description: "End a multiagents session: releases and stops all agents, archives the session. Use when the project is complete.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -426,7 +427,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const sessionId = slugify(session_name);
-        const gitRoot = await getGitRoot(project_dir);
+
+        // Auto-create project directory if it doesn't exist
+        if (!fs.existsSync(project_dir)) {
+          fs.mkdirSync(project_dir, { recursive: true });
+        }
+
+        // Init git if not already a repo (needed for file coordination, but session works without it)
+        let gitRoot = await getGitRoot(project_dir);
+        if (!gitRoot) {
+          try {
+            const initProc = Bun.spawnSync(["git", "init"], { cwd: project_dir });
+            if (initProc.exitCode === 0) {
+              gitRoot = project_dir;
+            }
+          } catch { /* git not installed — session still works without it */ }
+        }
 
         // Create session in broker
         await brokerClient.createSession({

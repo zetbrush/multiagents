@@ -286,54 +286,17 @@ export function buildCliArgs(agentType: AgentType, task: string): string[] {
       ];
     }
     case "codex": {
-      // Inject multiagents MCP server via dotted-path config overrides.
-      //
-      // CRITICAL: Codex loads ALL MCP servers from ~/.codex/config.toml at
-      // startup. We must neutralize any global entries that would interfere:
-      //
-      // 1. Entries with `url` (like figma) are remote MCP — not supported
-      //    in stdio mode, causes connection errors.
-      // 2. Entries with slow `npx` commands (like chrome-devtools) cause
-      //    10s+ timeouts during MCP handshake.
-      // 3. NEVER use `echo "disabled"` as a dummy — Codex reads stdout as
-      //    JSON-RPC and "disabled" fails to parse, crashing the agent.
-      //
-      // The fix: read ~/.codex/config.toml, find all [mcp_servers.*] keys,
-      // and override each non-multiagents entry with noop-mcp.ts — a tiny
-      // MCP server that completes the JSON-RPC handshake instantly with zero
-      // tools, then stays alive. This avoids:
-      //   - /usr/bin/true: exits immediately → 10s MCP handshake timeout
-      //   - echo "disabled": stdout parsed as JSON-RPC → deserialization crash
-      const noopMcpPath = path.resolve(import.meta.dir, "..", "noop-mcp.ts");
+      // Inject multiagents MCP via dotted-path config overrides.
+      // We ONLY add our own MCP server — never touch other user-configured servers.
+      // The multiagents entry is already in ~/.codex/config.toml (written by install-mcp),
+      // but we override here to ensure the spawned agent uses the correct binary path.
       const codexMcp = mcpServerCommand("codex");
       const argsJson = JSON.stringify(codexMcp.args);
       const overrides: string[] = [
-        // Our MCP server
         `mcp_servers.multiagents.command="${codexMcp.command}"`,
         `mcp_servers.multiagents.args=${argsJson}`,
         'model_reasoning_effort="high"',
       ];
-
-      // Neutralize global MCP servers by reading config
-      const globalConfigPath = path.join(process.env.HOME ?? "", ".codex", "config.toml");
-      try {
-        const configText = fs.readFileSync(globalConfigPath, "utf-8");
-        // Find all [mcp_servers.XXX] section names
-        const mcpPattern = /\[mcp_servers\.(\w[\w-]*)\]/g;
-        let match;
-        while ((match = mcpPattern.exec(configText)) !== null) {
-          const serverName = match[1];
-          if (serverName !== "multiagents") {
-            // Override with noop-mcp.ts — instant handshake, zero tools
-            overrides.push(`mcp_servers.${serverName}.command="bun"`);
-            overrides.push(`mcp_servers.${serverName}.args=["${noopMcpPath}"]`);
-            // Clear url field if present (remote MCP entries)
-            overrides.push(`mcp_servers.${serverName}.url=""`);
-          }
-        }
-      } catch {
-        // No global config — nothing to neutralize
-      }
 
       const args: string[] = [
         "exec",

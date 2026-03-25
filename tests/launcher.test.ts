@@ -181,37 +181,18 @@ describe("buildCliArgs — codex", () => {
     expect(parsed).toContain("codex");
   });
 
-  test("neutralizes broken figma MCP entry with noop-mcp", () => {
+  test("does NOT touch other user MCP servers", () => {
     const args = buildCliArgs("codex", task);
     const cFlags: string[] = [];
     for (let i = 0; i < args.length; i++) {
       if (args[i] === "-c") cFlags.push(args[i + 1]);
     }
 
-    // Figma is neutralized with noop-mcp.ts (instant handshake, no tools)
-    const figmaCmd = cFlags.find((f) => f.startsWith("mcp_servers.figma.command="));
-    expect(figmaCmd).toBeDefined();
-    expect(figmaCmd).toContain('"bun"');
-
-    const figmaArgs = cFlags.find((f) => f.startsWith("mcp_servers.figma.args="));
-    expect(figmaArgs).toBeDefined();
-    expect(figmaArgs).toContain("noop-mcp.ts");
-  });
-
-  test("neutralizes broken chrome-devtools MCP entry with noop-mcp", () => {
-    const args = buildCliArgs("codex", task);
-    const cFlags: string[] = [];
-    for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-c") cFlags.push(args[i + 1]);
-    }
-
-    const cdCmd = cFlags.find((f) => f.startsWith("mcp_servers.chrome-devtools.command="));
-    expect(cdCmd).toBeDefined();
-    expect(cdCmd).toContain('"bun"');
-
-    const cdArgs = cFlags.find((f) => f.startsWith("mcp_servers.chrome-devtools.args="));
-    expect(cdArgs).toBeDefined();
-    expect(cdArgs).toContain("noop-mcp.ts");
+    // Should only have multiagents and model_reasoning_effort overrides
+    const nonMultiagent = cFlags.filter(
+      (f) => !f.startsWith("mcp_servers.multiagents.") && !f.startsWith("model_reasoning_effort")
+    );
+    expect(nonMultiagent).toEqual([]);
   });
 
   test("overrides model_reasoning_effort to high", () => {

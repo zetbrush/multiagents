@@ -168,12 +168,25 @@ interface DashboardState {
 }
 
 export async function dashboard(sessionId?: string): Promise<void> {
-  const sid = sessionId ?? readLocalSession()?.session_id ?? null;
   const client = new BrokerClient(BROKER_URL);
 
   if (!(await client.isAlive())) {
-    console.error("Broker is not running. Start it with: bun broker.ts");
+    console.error("Broker is not running. Start it with: multiagents broker start");
     process.exit(1);
+  }
+
+  // Resolve session ID: explicit arg > local file > most recent active session from broker > null
+  let sid = sessionId ?? readLocalSession()?.session_id ?? null;
+  if (!sid) {
+    try {
+      const sessions = await client.listSessions();
+      const active = sessions.filter((s: any) => s.status === "active" || s.status === "paused");
+      if (active.length > 0) {
+        // Pick the most recently active session
+        active.sort((a: any, b: any) => (b.last_active_at ?? 0) - (a.last_active_at ?? 0));
+        sid = active[0].id;
+      }
+    } catch { /* broker doesn't support listSessions or no sessions */ }
   }
 
   const state: DashboardState = {
