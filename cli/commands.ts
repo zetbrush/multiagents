@@ -13,7 +13,8 @@ function printUsage(): void {
   console.log(`multiagents CLI
 
 Usage:
-  multiagents setup                          Interactive setup wizard
+  multiagents install-mcp                     Configure MCP servers for Claude Code
+  multiagents setup                           Interactive setup wizard
   multiagents dashboard [session-id]          TUI dashboard
   multiagents session create <name>           Create a new session
   multiagents session list                    List all sessions
@@ -35,6 +36,12 @@ export async function runCli(args: string[]): Promise<void> {
   const command = args[0];
 
   switch (command) {
+    case "install-mcp": {
+      const { installMcp } = await import("./install-mcp.ts");
+      await installMcp();
+      break;
+    }
+
     case "setup": {
       const { setup } = await import("./setup.ts");
       await setup();
