@@ -1,0 +1,29 @@
+# Dev/test scripts
+launch-calculator-team.ts
+fix-round.ts
+qa-emulator-round.ts
+showcase-team.ts
+tests/
+*.test.ts
+
+# Project artifacts
+hello-world-app/
+calculator-app/
+.multiagents/
+*.db
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+node_modules/
+bun.lock

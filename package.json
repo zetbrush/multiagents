@@ -1,0 +1,70 @@
+{
+  "name": "multiagents",
+  "version": "0.1.0",
+  "description": "Multi-agent orchestration platform for Claude Code, Codex CLI, and Gemini CLI",
+  "module": "index.ts",
+  "type": "module",
+  "private": false,
+  "bin": {
+    "multiagents": "./cli.ts",
+    "multiagents-server": "./server.ts",
+    "multiagents-orch": "./orchestrator/orchestrator-server.ts",
+    "multiagents-broker": "./broker.ts"
+  },
+  "files": [
+    "cli.ts",
+    "server.ts",
+    "broker.ts",
+    "index.ts",
+    "noop-mcp.ts",
+    "shared/",
+    "adapters/",
+    "orchestrator/",
+    "cli/",
+    ".mcp.json",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json",
+    "scripts/"
+  ],
+  "scripts": {
+    "broker": "bun broker.ts",
+    "server": "bun server.ts",
+    "orchestrator": "bun orchestrator/orchestrator-server.ts",
+    "setup": "bun cli.ts setup",
+    "dashboard": "bun cli.ts dashboard",
+    "test": "bun test",
+    "version:patch": "bun run scripts/version.ts patch",
+    "version:minor": "bun run scripts/version.ts minor",
+    "version:major": "bun run scripts/version.ts major",
+    "prepack": "bun test",
+    "postinstall": "bun run scripts/postinstall.ts 2>/dev/null || true"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.12"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zetbrush/multiagents"
+  },
+  "keywords": [
+    "mcp",
+    "multi-agent",
+    "claude",
+    "codex",
+    "gemini",
+    "orchestration",
+    "ai-agents"
+  ],
+  "license": "MIT",
+  "author": "Arman Andreasyan"
+}
