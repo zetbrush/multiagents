@@ -1,6 +1,6 @@
 {
   "name": "multiagents",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Multi-agent orchestration platform for Claude Code, Codex CLI, and Gemini CLI",
   "module": "index.ts",
   "type": "module",
@@ -38,7 +38,8 @@
     "version:minor": "bun run scripts/version.ts minor",
     "version:major": "bun run scripts/version.ts major",
     "prepack": "bun test",
-    "postinstall": "bun run scripts/postinstall.ts 2>/dev/null || true"
+    "postinstall": "bun run scripts/postinstall.ts 2>/dev/null || true",
+    "preuninstall": "bun run scripts/preuninstall.ts 2>/dev/null || true"
   },
   "engines": {
     "bun": ">=1.1.0"
