@@ -1,6 +1,6 @@
 {
   "name": "multiagents",
-  "version": "0.1.7",
+  "version": "0.2.1",
   "description": "Multi-agent orchestration platform for Claude Code, Codex CLI, and Gemini CLI",
   "module": "index.ts",
   "type": "module",
@@ -50,7 +50,8 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1"
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "multiagents": "^0.2.0"
   },
   "repository": {
     "type": "git",
