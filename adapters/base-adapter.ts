@@ -400,10 +400,16 @@ export abstract class BaseAdapter {
     }
 
     // 2. Create MCP Server
+    // Merge resources capability — base-adapter registers a ListResources
+    // handler (empty list) for all adapters, so the capability MUST be
+    // declared or the MCP SDK rejects resources/list requests. Codex and
+    // Gemini CLIs send resources/list during init even if not advertised.
+    const subclassCapabilities = this.getCapabilities();
+    const mergedCapabilities = { resources: {}, ...subclassCapabilities };
     this.mcp = new Server(
       { name: "multiagents-peer", version: "0.2.0" },
       {
-        capabilities: this.getCapabilities(),
+        capabilities: mergedCapabilities,
         instructions: this.getSystemPrompt() + this.getLifecyclePromptSection(),
       },
     );

@@ -1,6 +1,6 @@
 {
   "name": "multiagents",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Multi-agent orchestration platform for Claude Code, Codex CLI, and Gemini CLI",
   "module": "index.ts",
   "type": "module",
