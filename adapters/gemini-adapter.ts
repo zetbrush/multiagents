@@ -118,7 +118,39 @@ QUALITY STANDARD: You produce production-grade code. Plan before coding. Verify 
     return this.wrapResult(r);
   }
 
-  private wrapResult(result: { content: { type: "text"; text: string }[]; isError?: boolean }) {
+  // --- Lifecycle tool wrappers (critical for message delivery) ---
+
+  protected override async handleSignalDone(args: any) {
+    const r = await super.handleSignalDone(args);
+    return this.wrapResult(r);
+  }
+
+  protected override async handleSubmitFeedback(args: any) {
+    const r = await super.handleSubmitFeedback(args);
+    return this.wrapResult(r);
+  }
+
+  protected override async handleApprove(args: any) {
+    const r = await super.handleApprove(args);
+    return this.wrapResult(r);
+  }
+
+  protected override async handleCheckTeamStatus() {
+    const r = await super.handleCheckTeamStatus();
+    return this.wrapResult(r);
+  }
+
+  protected override async handleGetPlan() {
+    const r = await super.handleGetPlan();
+    return this.wrapResult(r);
+  }
+
+  protected override async handleUpdatePlan(args: any) {
+    const r = await super.handleUpdatePlan(args);
+    return this.wrapResult(r);
+  }
+
+  private wrapResult(result: { content: { type: string; text: string }[]; isError?: boolean }) {
     const text = result.content[0]?.text ?? "";
     const wrapped = this.wrapToolResult(text);
     return {

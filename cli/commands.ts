@@ -9,27 +9,137 @@ import { BrokerClient } from "../shared/broker-client.ts";
 const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
 const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
 
-function printUsage(): void {
-  console.log(`multiagents CLI
+const COMMAND_HELP: Record<string, string> = {
+  "setup": `multiagents setup
 
-Usage:
-  multiagents install-mcp                     Configure MCP servers for Claude Code
-  multiagents setup                           Interactive setup wizard
-  multiagents dashboard [session-id]          TUI dashboard
-  multiagents session create <name>           Create a new session
-  multiagents session list                    List all sessions
-  multiagents session resume [session-id]     Resume a paused session
-  multiagents session pause [session-id]      Pause a session
-  multiagents session archive <session-id>    Archive a session
-  multiagents session delete <session-id>     Delete a session
-  multiagents session export <session-id>     Export session transcript
-  multiagents send <target> <message>         Send message to peer/slot
-  multiagents peers                           List connected peers
-  multiagents status                          Broker health + peers summary
-  multiagents broker start|stop|status        Manage broker daemon
-  multiagents mcp-server [--agent-type <t>]   Run MCP server
-  multiagents orchestrator                    Run orchestrator server
-  multiagents help                            Show this help`);
+  Interactive setup wizard. Detects installed agent CLIs (Claude Code, Codex, Gemini),
+  configures MCP servers, and starts the broker daemon.
+
+  Run this once after installing multiagents.
+
+  Example:
+    multiagents setup`,
+
+  "dashboard": `multiagents dashboard [session-id]
+
+  Open the TUI dashboard for monitoring a multi-agent session.
+  Shows: agents, messages, guardrails, file locks, plan progress.
+
+  If no session-id is given, auto-detects the most recent active session.
+
+  Keys: 1-5 switch tabs, j/k scroll, q quit, +/- adjust guardrails.
+
+  Examples:
+    multiagents dashboard
+    multiagents dashboard my-session-abc123`,
+
+  "session": `multiagents session <subcommand>
+
+  Manage multi-agent sessions.
+
+  Subcommands:
+    create <name>           Create a new session in the current directory
+    list                    List all sessions (active, paused, archived)
+    resume [session-id]     Resume a paused session (respawns disconnected agents)
+    pause [session-id]      Pause a session (holds messages, agents wait)
+    archive <session-id>    Archive a completed session
+    delete <session-id>     Permanently delete a session and all data
+    export <session-id>     Export session transcript as JSON
+
+  Examples:
+    multiagents session create auth-feature
+    multiagents session list
+    multiagents session resume
+    multiagents session pause
+    multiagents session export abc123 > transcript.json`,
+
+  "send": `multiagents send <target> <message>
+
+  Send a message to a connected agent by peer ID or slot ID.
+
+  Examples:
+    multiagents send cl-a1b2c3d4 "Please check the auth module"
+    multiagents send 3 "Your tests are failing on line 42"`,
+
+  "peers": `multiagents peers
+
+  List all currently connected agent instances on this machine.
+  Shows: peer ID, PID, agent type, working directory, summary.
+
+  Example:
+    multiagents peers`,
+
+  "status": `multiagents status
+
+  Show broker health and connected peers summary.
+  Shows: broker URL, session count, peer count, agent details.
+
+  Example:
+    multiagents status`,
+
+  "broker": `multiagents broker <start|stop|status>
+
+  Manage the broker daemon (HTTP + SQLite on localhost:7899).
+
+  Subcommands:
+    start     Start the broker in the background
+    stop      Stop the running broker
+    status    Check if broker is running
+
+  The broker auto-starts when needed, so manual management is rarely required.
+
+  Examples:
+    multiagents broker start
+    multiagents broker status
+    multiagents broker stop`,
+
+  "install-mcp": `multiagents install-mcp
+
+  Configure MCP servers for all detected agent CLIs.
+  Writes to ~/.claude/.mcp.json (Claude), ~/.codex/config.toml (Codex),
+  and ~/.gemini/settings.json (Gemini).
+
+  Example:
+    multiagents install-mcp`,
+};
+
+function printUsage(topic?: string): void {
+  if (topic && COMMAND_HELP[topic]) {
+    console.log(COMMAND_HELP[topic]);
+    return;
+  }
+
+  console.log(`multiagents — Multi-agent orchestration platform
+
+Usage: multiagents <command> [options]
+
+Commands:
+  setup                           Interactive setup wizard (run first!)
+  dashboard [session-id]          TUI dashboard for monitoring
+  session <subcommand>            Manage sessions (create/list/resume/pause/archive/delete/export)
+  send <target> <message>         Send message to an agent
+  peers                           List connected agents
+  status                          Broker health + peers summary
+  broker start|stop|status        Manage broker daemon
+  install-mcp                     Configure MCP servers
+  mcp-server [--agent-type <t>]   Run agent MCP server (internal)
+  orchestrator                    Run orchestrator MCP server (internal)
+  help [command]                  Show help (optionally for a specific command)
+
+Getting Started:
+  1. multiagents setup                    # Configure MCP + detect agents
+  2. Restart Claude Code                  # Load multiagents tools
+  3. Ask Claude to create a team          # Or use the orchestrator MCP
+
+Quick Examples:
+  multiagents setup                       # First-time setup
+  multiagents dashboard                   # Monitor active session
+  multiagents session list                # See all sessions
+  multiagents session resume              # Resume a paused session
+  multiagents status                      # Check broker + peers
+
+For detailed help on a command:
+  multiagents help <command>              # e.g., multiagents help session`);
 }
 
 export async function runCli(args: string[]): Promise<void> {
@@ -185,11 +295,19 @@ export async function runCli(args: string[]): Promise<void> {
       break;
     }
 
+    case "version":
+    case "--version":
+    case "-v": {
+      const pkg = await import("../package.json");
+      console.log(pkg.version);
+      break;
+    }
+
     case "help":
     case "--help":
     case "-h":
     case undefined: {
-      printUsage();
+      printUsage(args[1]);
       break;
     }
 

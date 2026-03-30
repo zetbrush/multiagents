@@ -173,6 +173,34 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string): P
 }
 
 /**
+ * Auto-detect platform signals from task text, role description, and project dir.
+ * Appends detected platform context to role_description so the adapter's
+ * keyword matcher fires the correct role-specific practices.
+ */
+function enrichRoleDescription(config: AgentLaunchConfig, projectDir: string): string {
+  const signal = `${config.initial_task} ${config.role_description} ${projectDir}`.toLowerCase();
+  const platforms: string[] = [];
+
+  if (/\b(react|next\.?js|vue|angular|svelte|web|frontend|html|css|tailwind|vite)\b/.test(signal))
+    platforms.push("Web/Frontend");
+  if (/\b(android|kotlin|gradle|jetpack|compose|apk)\b/.test(signal))
+    platforms.push("Android");
+  if (/\b(ios|swift|xcode|swiftui|uikit|xcodeproj|cocoapods)\b/.test(signal))
+    platforms.push("iOS");
+  if (/\b(api|backend|server|database|rest|graphql|microservice|express|fastapi|django|flask|hono)\b/.test(signal))
+    platforms.push("Backend/API");
+  if (/\b(cli|command.line|terminal|argv|yargs|commander)\b/.test(signal))
+    platforms.push("CLI");
+
+  let desc = config.role_description;
+  const detected = platforms.filter(p => !desc.toLowerCase().includes(p.toLowerCase()));
+  if (detected.length > 0) {
+    desc += `\nPlatform context (auto-detected): ${detected.join(", ")}.`;
+  }
+  return desc;
+}
+
+/**
  * Spawn an agent as a background process with the appropriate CLI flags.
  *
  * Creates a slot in the broker, then spawns the agent process with env vars
@@ -188,13 +216,16 @@ export async function launchAgent(
   // Ensure MCP configs and session file exist before spawning any agent
   await ensureMcpConfigs(projectDir, sessionId);
 
+  // Enrich role_description with auto-detected platform context
+  const enrichedDescription = enrichRoleDescription(config, projectDir);
+
   // Create a slot in the broker for this agent
   const slot = await brokerClient.createSlot({
     session_id: sessionId,
     agent_type: config.agent_type,
     display_name: config.name,
     role: config.role,
-    role_description: config.role_description,
+    role_description: enrichedDescription,
   });
 
   log(LOG_PREFIX, `Created slot ${slot.id} for ${config.name} (${config.agent_type})`);
@@ -209,12 +240,27 @@ export async function launchAgent(
     });
   }
 
-  // Build the task prompt with role context
+  // Build the task prompt with role context (using enriched description)
+  // CRITICAL: The startup instructions MUST be in the task prompt (not just MCP instructions)
+  // because agents read the -p flag first and may start working before MCP tools load.
+  // Without explicit enforcement here, agents execute their task using native tools only
+  // and never call check_messages, set_summary, or signal_done.
   const taskPrompt = [
     `You are "${config.name}", role: ${config.role}.`,
-    config.role_description,
+    enrichedDescription,
     "",
     `Your task: ${config.initial_task}`,
+    "",
+    "MANDATORY STARTUP SEQUENCE (do these FIRST, before any other work):",
+    "1. Call the multiagents MCP tool set_summary with a brief description of your task",
+    "2. Call check_team_status to see your teammates and their roles",
+    "3. Call get_plan to see the team plan and your assigned items",
+    "4. Call check_messages to read any messages from teammates",
+    "5. ONLY THEN begin your work",
+    "",
+    "MANDATORY ONGOING: Call check_messages after every major action (file write, build, test run).",
+    "When your work is complete: call signal_done with a summary of what you did and test results.",
+    "NEVER work silently — your teammates depend on your status updates via set_summary and messages.",
   ].join("\n");
 
   // Build CLI args based on agent type
@@ -246,6 +292,74 @@ export async function launchAgent(
   });
 
   log(LOG_PREFIX, `Launched ${config.name} (PID ${proc.pid}) in slot ${slot.id}`);
+
+  return {
+    slotId: slot.id,
+    pid: proc.pid,
+    process: proc,
+  };
+}
+
+/**
+ * Relaunch an agent into an EXISTING disconnected slot.
+ * Used by resume_session to restore agents without creating new slots.
+ * The key difference from launchAgent(): no new slot is created — the
+ * MULTIAGENTS_SLOT env var points to the existing slot.id, and the broker's
+ * registration logic handles reconnection when slot_id is provided.
+ */
+export async function relaunchIntoSlot(
+  sessionId: string,
+  projectDir: string,
+  slot: Slot,
+  handoffTask: string,
+  brokerClient: BrokerClient,
+): Promise<LaunchResult> {
+  await ensureMcpConfigs(projectDir, sessionId);
+
+  // Enrich role_description with platform detection
+  const enrichedDescription = enrichRoleDescription({
+    agent_type: slot.agent_type,
+    name: slot.display_name ?? `Agent #${slot.id}`,
+    role: slot.role ?? "general",
+    role_description: slot.role_description ?? "",
+    initial_task: handoffTask,
+  }, projectDir);
+
+  // Build the task prompt with mandatory MCP enforcement
+  const taskPrompt = [
+    `You are "${slot.display_name ?? `Agent #${slot.id}`}", role: ${slot.role ?? "general"}.`,
+    enrichedDescription,
+    "",
+    handoffTask,
+    "",
+    "MANDATORY: Call check_messages after every major action. Call signal_done when your work is complete. NEVER work silently.",
+  ].join("\n");
+
+  const args = buildCliArgs(slot.agent_type, taskPrompt);
+  const cmd = AGENT_COMMANDS[slot.agent_type];
+
+  if (!cmd) {
+    throw new Error(`No CLI command configured for agent type: ${slot.agent_type}`);
+  }
+
+  const spawnEnv: Record<string, string | undefined> = {
+    ...process.env,
+    MULTIAGENTS_SESSION: sessionId,
+    MULTIAGENTS_ROLE: slot.role ?? undefined,
+    MULTIAGENTS_NAME: slot.display_name ?? undefined,
+    MULTIAGENTS_SLOT: String(slot.id),
+  };
+  delete spawnEnv.CLAUDECODE;
+
+  const proc = Bun.spawn([cmd, ...args], {
+    cwd: projectDir,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: spawnEnv,
+  });
+
+  log(LOG_PREFIX, `Relaunched ${slot.display_name ?? `slot ${slot.id}`} (PID ${proc.pid}) into existing slot ${slot.id}`);
 
   return {
     slotId: slot.id,

@@ -16,6 +16,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  ListResourcesRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { BrokerClient } from "../shared/broker-client.ts";
 import type {
@@ -318,138 +319,10 @@ const TOOLS = [
 ];
 
 // ---------------------------------------------------------------------------
-// Role-specific best practices injection
+// Role-specific best practices injection (from role-practices.ts module)
 // ---------------------------------------------------------------------------
 
-interface RolePattern {
-  /** Keywords that match this role (checked against role name + description, case-insensitive) */
-  keywords: string[];
-  /** Best practices injected when role matches */
-  practices: string;
-}
-
-const ROLE_PRACTICES: RolePattern[] = [
-  {
-    keywords: ["android", "kotlin", "jetpack", "compose"],
-    practices: `ANDROID ENGINEERING:
-- Use Kotlin with Jetpack Compose for UI. Follow MVVM architecture.
-- Structure: feature-first modules. Each feature has ui/, data/, domain/ layers.
-- Use StateFlow for state management. Avoid LiveData in new code.
-- Build with Gradle. Ensure build.gradle.kts has correct compileSdk, minSdk, targetSdk.
-- Test on Android Emulator: use "emulator" or "adb" commands to verify the app runs.
-- Check logcat for crashes: "adb logcat *:E" to filter errors.
-- Before signaling done: build succeeds (./gradlew assembleDebug), no lint errors, app launches on emulator.`,
-  },
-  {
-    keywords: ["ios", "swift", "swiftui", "xcode", "uikit"],
-    practices: `iOS ENGINEERING:
-- Use Swift with SwiftUI for new UI. Follow MVVM or TCA architecture.
-- Project structure: feature folders, each with Views/, ViewModels/, Models/.
-- Use async/await for concurrency. Avoid callback-based patterns in new code.
-- Build with xcodebuild or swift build. Ensure .xcodeproj or Package.swift is valid.
-- Test on iOS Simulator: use "xcrun simctl" to boot simulator, install, and launch.
-- Check for crashes: "xcrun simctl spawn booted log stream --level error".
-- Before signaling done: build succeeds, no warnings treated as errors, app launches on simulator.`,
-  },
-  {
-    keywords: ["react", "frontend", "web", "nextjs", "next.js", "typescript", "javascript", "vue", "angular", "svelte"],
-    practices: `WEB/FRONTEND ENGINEERING:
-- Use TypeScript strictly. No "any" types unless absolutely necessary.
-- Follow the framework's conventions: file-based routing, server/client component boundaries.
-- CSS: use the project's existing approach (Tailwind, CSS modules, styled-components).
-- Accessibility: semantic HTML, ARIA labels, keyboard navigation, proper heading hierarchy.
-- Performance: lazy load heavy components, optimize images, minimize client-side JS.
-- Test in browser: start dev server, verify all routes render, check console for errors.
-- Before signaling done: dev server runs without errors, no console warnings, responsive on mobile viewports.`,
-  },
-  {
-    keywords: ["backend", "api", "server", "microservice", "database", "python", "go", "rust", "java", "node"],
-    practices: `BACKEND ENGINEERING:
-- Follow RESTful conventions or the project's existing API pattern (GraphQL, gRPC, etc.).
-- Validate all inputs at system boundaries. Never trust client data.
-- Error handling: return proper HTTP status codes, structured error responses.
-- Database: use migrations, parameterized queries (never string concatenation), proper indexing.
-- Security: no secrets in code, use environment variables, sanitize user input.
-- Before signaling done: server starts, all endpoints respond correctly, no unhandled exceptions in logs.`,
-  },
-  {
-    keywords: ["qa", "tester", "test", "quality", "testing"],
-    practices: `QA / TESTING:
-- Your job is to FIND BUGS, not confirm things work. Be adversarial.
-- Test categories: functional correctness, edge cases, error handling, UI/UX, performance, security.
-- For mobile apps: test on actual emulators/simulators, not just code review.
-  - Android: use "adb" to install APK, run the app, test user flows.
-  - iOS: use "xcrun simctl" to install and run on simulator.
-  - Web: open in browser, test responsive layouts, check console for errors.
-- Bug reports must include: file:line (if code-level), reproduction steps, expected vs actual, severity.
-- Severity levels: P0 (crash/data loss), P1 (major feature broken), P2 (minor issue), P3 (cosmetic).
-- Re-test EVERY fix. Don't assume fixes are correct — verify them.
-- Before approving: all P0/P1 issues resolved, app runs end-to-end on target platform without crashes.`,
-  },
-  {
-    keywords: ["reviewer", "review", "code review"],
-    practices: `CODE REVIEW:
-- Review for: correctness, security, performance, readability, maintainability, test coverage.
-- Check architecture: does this follow the project's patterns? Is it consistent with existing code?
-- Security checklist: input validation, SQL injection, XSS, auth/authz, secrets exposure, dependency vulnerabilities.
-- Performance: unnecessary re-renders, N+1 queries, missing indexes, large bundle imports.
-- Provide actionable feedback with file paths and line numbers. Not "this could be better" but "this should use X because Y".
-- Distinguish blocking issues (must fix) from suggestions (nice to have).
-- Before approving: no security issues, no architectural violations, code is production-ready.`,
-  },
-  {
-    keywords: ["designer", "design", "ui/ux", "ux", "figma", "spec"],
-    practices: `DESIGN / UI SPECIFICATION:
-- Produce a clear, implementable design specification — not vague descriptions.
-- Spec must include: component hierarchy, layout (dimensions, spacing), colors (hex/tokens), typography (font, size, weight), states (default, hover, active, disabled, error, loading, empty).
-- For each screen/component: describe the visual layout, user interactions, transitions/animations.
-- Platform-specific considerations:
-  - Android: Material Design 3 guidelines, system back gesture, dynamic color.
-  - iOS: Human Interface Guidelines, safe areas, Dynamic Type, SF Symbols.
-  - Web: responsive breakpoints (mobile/tablet/desktop), accessibility, keyboard navigation.
-- Deliver the spec as a structured document (Markdown) that engineers can implement from directly.
-- Before signaling done: every screen has a spec, every interaction is described, edge cases covered (empty state, error state, loading state).`,
-  },
-  {
-    keywords: ["architect", "lead", "team lead", "tech lead", "principal"],
-    practices: `ARCHITECTURE / TEAM LEAD:
-- Your primary job is COORDINATION and QUALITY, not implementation.
-- Define the plan: break the project into tasks, assign to team members, set dependencies.
-- Resolve conflicts: if two agents disagree or block each other, make the decision.
-- Quality gate: review the overall integration — do all parts work together?
-- Communication: keep the team aligned. Broadcast requirement changes immediately.
-- When releasing agents: verify ALL work is integrated, tested, and production-grade.
-- You decide when the team is done. Don't release prematurely.`,
-  },
-  {
-    keywords: ["devops", "infrastructure", "ci/cd", "deploy", "cloud"],
-    practices: `DEVOPS / INFRASTRUCTURE:
-- Infrastructure as code: use declarative configs (Terraform, CloudFormation, Docker Compose).
-- CI/CD: ensure builds are reproducible. Pin dependency versions. Cache aggressively.
-- Security: no secrets in repos, use secret managers, principle of least privilege.
-- Monitoring: set up health checks, log aggregation, alerting.
-- Before signaling done: pipeline runs green, deployment succeeds, health checks pass.`,
-  },
-];
-
-/**
- * Match a role name + description against known patterns and return
- * applicable best practices. Multiple patterns can match (e.g., "Android QA").
- */
-function getRolePractices(role?: string | null, roleDescription?: string | null): string | null {
-  if (!role && !roleDescription) return null;
-
-  const haystack = `${role ?? ""} ${roleDescription ?? ""}`.toLowerCase();
-  const matched: string[] = [];
-
-  for (const pattern of ROLE_PRACTICES) {
-    if (pattern.keywords.some(kw => haystack.includes(kw))) {
-      matched.push(pattern.practices);
-    }
-  }
-
-  return matched.length > 0 ? matched.join("\n\n") : null;
-}
+import { getRolePractices, getStructuredRolePractices } from "./role-practices.ts";
 
 // ---------------------------------------------------------------------------
 // BaseAdapter
@@ -748,12 +621,21 @@ export abstract class BaseAdapter {
       }
     }
 
-    // Inject role-specific best practices based on role category
-    const practices = getRolePractices(slot.role, slot.role_description);
-    if (practices) {
+    // Inject structured role-specific practices, tool hints, and completion criteria
+    const structured = getStructuredRolePractices(slot.role, slot.role_description);
+    if (structured) {
       parts.push("");
       parts.push("--- ROLE-SPECIFIC PRACTICES ---");
-      parts.push(practices);
+      parts.push(structured.practices);
+      parts.push("");
+      parts.push("--- TOOL DISCOVERY ---");
+      parts.push(structured.toolHints);
+      parts.push("On startup, examine your available tools and skills. Use the most capable tools for your role.");
+      parts.push("If you need a tool that isn't available (emulator, browser, database, etc.), escalate to orchestrator via: send_message(to_id=\"orchestrator\", \"BLOCKED: Need [tool] to [reason]\")");
+      parts.push("");
+      parts.push("--- YOUR COMPLETION CRITERIA ---");
+      parts.push(structured.completionCriteria);
+      parts.push("You are NOT done until these criteria are met. Do NOT call signal_done prematurely.");
     }
 
     if (parts.length > 0) {
@@ -766,6 +648,11 @@ export abstract class BaseAdapter {
   protected registerTools(): void {
     this.mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: TOOLS,
+    }));
+
+    // Return empty resources list — prevents Codex -32601 errors on startup
+    this.mcp.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: [],
     }));
 
     this.mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -803,7 +690,7 @@ export abstract class BaseAdapter {
         case "get_plan":
           return this.handleGetPlan();
         case "update_plan":
-          return this.handleUpdatePlan(toolArgs as { item_id: number; status: string });
+          return this.handleUpdatePlan(args as { item_id: number; status: string });
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
@@ -926,11 +813,20 @@ export abstract class BaseAdapter {
       return this.errorResult("Not registered with broker yet");
     }
     try {
+      // Resolve target peer's slot_id so the broker persists the role on the slot,
+      // not just as a queued message (review finding #5).
+      let slotId: number | undefined;
+      if (this.sessionId) {
+        const slots = await this.broker.listSlots(this.sessionId);
+        const match = slots.find(s => s.peer_id === args.peer_id);
+        if (match) slotId = match.id;
+      }
       await this.broker.setRole({
         peer_id: args.peer_id,
         assigner_id: this.myId,
         role: args.role,
         role_description: args.role_description,
+        slot_id: slotId,
       });
       return this.textResult(
         `Role "${args.role}" assigned to peer ${args.peer_id}.`,
@@ -950,10 +846,18 @@ export abstract class BaseAdapter {
       return this.errorResult("Not registered with broker yet");
     }
     try {
+      // Resolve target peer's slot_id so the broker persists the name on the slot (review finding #5).
+      let slotId: number | undefined;
+      if (this.sessionId) {
+        const slots = await this.broker.listSlots(this.sessionId);
+        const match = slots.find(s => s.peer_id === args.peer_id);
+        if (match) slotId = match.id;
+      }
       await this.broker.renamePeer({
         peer_id: args.peer_id,
         assigner_id: this.myId,
         display_name: args.display_name,
+        slot_id: slotId,
       });
       return this.textResult(
         `Peer ${args.peer_id} renamed to "${args.display_name}".`,
@@ -1184,13 +1088,31 @@ export abstract class BaseAdapter {
     const header = `Team Status (${slots.filter(s => s.status === "connected").length}/${slots.length} online):`;
     const needsReview = slots.filter(s => s.task_state === "done_pending_review");
     const addressingFb = slots.filter(s => s.task_state === "addressing_feedback");
+    const approved = slots.filter(s => s.task_state === "approved");
+    const idle = slots.filter(s => !s.task_state || s.task_state === "idle");
 
     let actionItems = "";
     if (needsReview.length > 0) {
-      actionItems += `\n\nAWAITING REVIEW: ${needsReview.map(s => s.display_name || s.role || s.id).join(", ")} — review their work now!`;
+      actionItems += `\n\nAWAITING REVIEW: ${needsReview.map(s => s.display_name || s.role || s.id).join(", ")} — if you are a reviewer/QA, start reviewing NOW!`;
     }
     if (addressingFb.length > 0) {
-      actionItems += `\nADDRESSING FEEDBACK: ${addressingFb.map(s => s.display_name || s.role || s.id).join(", ")} — be ready to re-review.`;
+      actionItems += `\nADDRESSING FEEDBACK: ${addressingFb.map(s => s.display_name || s.role || s.id).join(", ")} — be ready to re-review when they signal_done again.`;
+    }
+    if (approved.length > 0) {
+      actionItems += `\nAPPROVED: ${approved.map(s => s.display_name || s.role || s.id).join(", ")} — work accepted, awaiting release.`;
+    }
+    if (idle.length > 0) {
+      const idleOthers = idle.filter(s => s.peer_id !== this.myId);
+      if (idleOthers.length > 0) {
+        actionItems += `\nIDLE: ${idleOthers.map(s => s.display_name || s.role || s.id).join(", ")} — may need a task or may be waiting for dependencies.`;
+      }
+    }
+
+    // Check if all OTHER agents are approved (session nearing completion)
+    const others = slots.filter(s => s.peer_id !== this.myId);
+    const allOthersApproved = others.length > 0 && others.every(s => s.task_state === "approved" || s.task_state === "released");
+    if (allOthersApproved) {
+      actionItems += `\n\nALL OTHER AGENTS APPROVED. If your work is also complete and approved, the session is ready to finish.`;
     }
 
     return {
@@ -1394,7 +1316,22 @@ Before writing any code, PLAN:
 - If something breaks or your approach fails: STOP. Re-plan. Do not brute-force.
 - Update the plan as you learn: call update_plan when items change status.
 
---- 2. EXECUTION ---
+--- 2. DEPENDENCY RESOLUTION & CLARIFICATION PROTOCOL ---
+
+BEFORE you begin implementation, verify you have everything you need:
+- Read the specs/requirements from your teammates carefully. Identify ANY unknowns, ambiguities, missing details, or assumptions.
+- For EACH unknown: send a specific question to the relevant teammate via send_message. Do NOT guess or assume.
+- WAIT for their response. Check check_messages repeatedly until you get answers.
+- If the answer raises new questions, ask follow-up questions. Continue this loop until EVERY unknown is resolved.
+- Only begin implementation once you have zero open questions.
+
+This applies in BOTH directions:
+- If YOU receive questions from a teammate: respond IMMEDIATELY with clear, specific answers. If you need to research or think, say so and give a timeline.
+- If a teammate's answer is unclear: say so and ask them to clarify. Do NOT proceed with ambiguous information.
+
+The pattern is: ASK → RECEIVE → VERIFY → (if unclear) ASK AGAIN → RECEIVE → VERIFY → ... → ALL CLEAR → PROCEED.
+
+--- 3. EXECUTION ---
 
 Work autonomously and decisively:
 - Break your task into steps. Complete each fully before moving on.
@@ -1403,7 +1340,7 @@ Work autonomously and decisively:
 - No TODO comments, no placeholder logic, no "fix later" patterns.
 - Match complexity to the task — don't overengineer small changes, don't underengineer critical ones.
 
---- 3. VERIFICATION BEFORE DONE ---
+--- 4. VERIFICATION BEFORE DONE ---
 
 NEVER call signal_done without proof your work is correct:
 - Run the code. Check the output. Test edge cases.
@@ -1414,7 +1351,7 @@ NEVER call signal_done without proof your work is correct:
 
 signal_done summary MUST include: what changed, what was tested, what the results were.
 
---- 4. FEEDBACK & SELF-IMPROVEMENT ---
+--- 5. FEEDBACK & REVIEW LOOPS ---
 
 When you receive feedback:
 - Address EVERY item. Do not skip or defer.
@@ -1428,7 +1365,10 @@ When you give feedback (reviewers/QA):
 - Distinguish blocking issues (actionable=true) from suggestions (actionable=false).
 - "Looks good" is not feedback. Cite specific files, line numbers, test results, and what you verified.
 
---- 5. TEAM AWARENESS ---
+The review loop is: signal_done → review → feedback (actionable) → fix → signal_done → re-review → ... → approve.
+This loop MUST continue until the reviewer/QA explicitly calls approve(). Do NOT assume approval.
+
+--- 6. TEAM AWARENESS ---
 
 Stay aware and proactive:
 - Call check_messages frequently — new work arrives at any time.
@@ -1437,7 +1377,7 @@ Stay aware and proactive:
 - If you see a teammate stuck: message them with specific help, not "need help?".
 - If you have suggestions that improve overall quality, message the relevant teammate.
 
---- 6. BUG FIXING ---
+--- 7. BUG FIXING ---
 
 When bugs are reported to you:
 - Investigate autonomously. Trace logs, read error output, find the root cause.
@@ -1446,14 +1386,63 @@ When bugs are reported to you:
 - Verify the fix resolves the issue AND doesn't break other things.
 - Then signal_done with the fix summary.
 
---- 7. HANDOFF PROTOCOL ---
+--- 8. HANDOFF PROTOCOL (role-specific workflows) ---
 
-Engineers: implement -> verify -> signal_done -> receive feedback -> fix -> verify -> signal_done -> repeat until approved.
-QA/Testers: watch for task_complete -> test/verify -> submit_feedback or approve -> watch for re-submissions.
-Reviewers: watch for task_complete -> review code quality, correctness, security -> submit_feedback or approve -> re-review after fixes.
-Team Lead: coordinates priorities, resolves conflicts, releases agents when ALL work is production-grade.
+Software Engineers:
+  1. Receive specs/task → read carefully → identify ALL unknowns
+  2. Ask Designer/spec-writer via send_message → wait for answer → verify clarity → repeat until ZERO unknowns
+  3. Implement with TDD: write failing test → implement → verify → refactor
+  4. Run linters, type checkers, full test suite. Fix ALL issues.
+  5. signal_done with proof: test output, build log, manual verification results
+  6. Receive Code Reviewer feedback → fix ALL [BLOCKING] items → signal_done again
+  7. Receive QA bugs → fix → signal_done → QA re-tests
+  8. Loop steps 6-7 until BOTH Reviewer AND QA call approve() on you
 
---- 8. COMMUNICATION STANDARDS ---
+UI/UX Designers:
+  1. Analyze requirements → produce detailed spec with ALL component states
+  2. signal_done with the spec deliverable
+  3. Answer ALL engineer questions IMMEDIATELY via send_message — they are blocked on you
+  4. Review engineer implementation against your spec → provide visual feedback
+  5. Done when: engineer matches spec AND QA approves accessibility
+
+Code Reviewers:
+  1. Monitor check_team_status — when any engineer reaches "done_pending_review", START IMMEDIATELY
+  2. Read ALL changed files + trace cross-file dependencies
+  3. Check: security (OWASP Top 10), performance, architecture, code smells, test coverage
+  4. submit_feedback with prefixes: [BLOCKING] for must-fix, [SUGGESTION] for nice-to-have
+  5. After engineer fixes → RE-REVIEW every prior [BLOCKING] issue + inspect new changes
+  6. approve() ONLY when zero [BLOCKING] issues remain
+  7. Continue monitoring — QA may find issues requiring engineer re-work and another review round
+
+QA Engineers:
+  1. Monitor check_team_status — when any engineer reaches "done_pending_review", START IMMEDIATELY
+  2. Design a platform-appropriate test plan (see your ROLE-SPECIFIC PRACTICES for platform details)
+  3. Execute ALL tests: happy path + edge cases + error states + platform lifecycle
+  4. Use ALL available tools: browser automation for web, emulator for mobile, CLI for commands
+  5. submit_feedback(actionable=true) with [P0-P3] severity + file:line + repro steps for each bug
+  6. After engineer fixes → RE-TEST every bug + run regression on related features
+  7. approve() ONLY when ALL P0/P1 bugs fixed and app works end-to-end on target platform
+  8. If you need infrastructure: send_message(to_id="orchestrator", "BLOCKED: Need [what] for [why]")
+
+CRITICAL FOR ALL ROLES:
+- Do NOT call signal_done or approve() prematurely.
+- The session continues until EVERY team member's work is approved by ALL relevant parties.
+- If you are waiting: call check_team_status and check_messages every few seconds. Pick up new work.
+- If a teammate is unresponsive after 3+ messages: escalate to orchestrator.
+
+--- 9. ESCALATION TO ORCHESTRATOR ---
+
+When you are BLOCKED by something outside your control:
+- Missing infrastructure (emulator, simulator, test database, etc.)
+- Need a dependency installed or configured
+- Need access/credentials to a service
+- A teammate is unresponsive after multiple attempts (3+ messages with no reply)
+- Unclear requirements that no teammate can answer
+
+Send a message to the orchestrator: send_message(to_id="orchestrator", message="BLOCKED: [specific description of what you need and why]")
+The orchestrator will either resolve it directly or communicate with the user.
+
+--- 10. COMMUNICATION STANDARDS ---
 
 - Lead with the answer, not the reasoning. Be concise.
 - When reporting status: what you did, what the result was, what's next.
@@ -1461,7 +1450,7 @@ Team Lead: coordinates priorities, resolves conflicts, releases agents when ALL 
 - Respond to ALL teammate messages promptly.
 - Use send_message for targeted communication. Use signal_done for completion signals.
 
---- 9. STAYING ACTIVE ---
+--- 11. STAYING ACTIVE ---
 
 The system DENIES disconnect attempts until you are released. While waiting:
 - Check messages and team status every few seconds.
@@ -1469,6 +1458,25 @@ The system DENIES disconnect attempts until you are released. While waiting:
 - Look for review/QA work you can start.
 - If truly nothing to do: set your summary to describe your availability and what you can help with.
 - NEVER go silent. The team depends on your responsiveness.
+
+--- 12. COMPLETION CRITERIA (cross-role dependency matrix) ---
+
+The SESSION is NOT complete until ALL of these conditions are met:
+- Every Engineer: approved by BOTH Code Reviewer AND QA Engineer
+- Every Designer: specs confirmed implementable by Engineer, accessibility verified by QA
+- Every Reviewer: has reviewed and approved ALL Engineers
+- Every QA: has tested and approved ALL Engineers
+- Plan: 100% of items marked "done"
+
+YOUR individual work is not done until:
+- Your deliverable is complete and verified (see YOUR COMPLETION CRITERIA in role context)
+- You have called signal_done with specific proof of correctness
+- ALL relevant teammates have called approve() on you (or you have called approve() on all of them if you are a reviewer/QA)
+- You have addressed ALL feedback — zero unresolved items
+- Your plan items are marked "done"
+
+If ANY condition is unmet, continue the feedback loop. Do NOT go silent.
+When ALL conditions are met, set your summary to "All work approved, ready for release."
 `;
   }
 

@@ -240,6 +240,31 @@ db.run(`
   )
 `);
 
+// --- Context snapshot builder ---
+
+/** Build a rich context snapshot for a disconnecting peer/slot. */
+function buildContextSnapshot(peer: { summary?: string | null; cwd?: string | null }, slotId: number): string {
+  const slotRow = db.query("SELECT task_state FROM slots WHERE id = ?").get(slotId) as { task_state: string } | null;
+
+  // Get plan items assigned to this slot (if any plan exists)
+  let planItems: { label: string; status: string }[] = [];
+  try {
+    const planRow = db.query(
+      "SELECT pi.label, pi.status FROM plan_items pi JOIN plans p ON pi.plan_id = p.id JOIN slots s ON p.session_id = s.session_id WHERE pi.assigned_to_slot = ? ORDER BY pi.sort_order",
+    ).all(slotId) as { label: string; status: string }[];
+    planItems = planRow;
+  } catch { /* plan tables may not have data */ }
+
+  return JSON.stringify({
+    last_summary: peer.summary ?? null,
+    last_status: "disconnected",
+    last_cwd: peer.cwd ?? null,
+    task_state: slotRow?.task_state ?? null,
+    plan_items: planItems.length > 0 ? planItems : null,
+    disconnected_at: Date.now(),
+  });
+}
+
 // --- Stale peer cleanup ---
 
 function cleanStalePeers() {
@@ -250,14 +275,10 @@ function cleanStalePeers() {
     try {
       process.kill(peer.pid, 0);
     } catch {
-      // Disconnect slots for this peer (capture snapshot before deleting peer)
+      // Disconnect slots for this peer (capture rich snapshot before deleting peer)
       const slots = db.query("SELECT id FROM slots WHERE peer_id = ?").all(peer.id) as any[];
       for (const slot of slots) {
-        const snapshot = JSON.stringify({
-          last_summary: peer.summary ?? null,
-          last_status: "disconnected",
-          last_cwd: peer.cwd ?? null,
-        });
+        const snapshot = buildContextSnapshot(peer, slot.id);
         db.run(
           "UPDATE slots SET status = 'disconnected', peer_id = NULL, last_disconnected = ?, context_snapshot = ? WHERE id = ?",
           [now, snapshot, slot.id]
@@ -492,9 +513,14 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResult {
 
   if (!toId) return { ok: false, error: "No target specified" };
 
-  // Verify target exists
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(toId) as { id: string } | null;
-  if (!target) return { ok: false, error: `Peer ${toId} not found` };
+  // Allow messages to "orchestrator" — these are escalation messages read by the orchestrator's monitoring loop
+  const isOrchestratorTarget = toId === "orchestrator" || toId === "__orchestrator__";
+
+  // Verify target exists (unless targeting orchestrator)
+  if (!isOrchestratorTarget) {
+    const target = db.query("SELECT id FROM peers WHERE id = ?").get(toId) as { id: string } | null;
+    if (!target) return { ok: false, error: `Peer ${toId} not found` };
+  }
 
   // Determine from_slot_id
   let fromSlotId: number | null = null;
@@ -557,11 +583,7 @@ function handleUnregister(body: { id: string }): { ok: boolean; denied?: boolean
       };
     }
 
-    const snapshot = JSON.stringify({
-      last_summary: peer.summary ?? null,
-      last_status: "disconnected",
-      last_cwd: peer.cwd ?? null,
-    });
+    const snapshot = buildContextSnapshot(peer, peer.slot_id);
     db.run(
       "UPDATE slots SET status = 'disconnected', peer_id = NULL, last_disconnected = ?, context_snapshot = ? WHERE id = ?",
       [now, snapshot, peer.slot_id]
@@ -617,6 +639,43 @@ function handleGetSession(body: { id: string }): Session | null {
 
 function handleListSessions(): Session[] {
   return db.query("SELECT * FROM sessions ORDER BY last_active_at DESC").all() as Session[];
+}
+
+function handleDeleteSession(body: { id: string }): { ok: boolean; deleted: { slots: number; messages: number; plans: number; locks: number } } {
+  const session = db.query("SELECT id FROM sessions WHERE id = ?").get(body.id) as { id: string } | null;
+  if (!session) return { ok: false, deleted: { slots: 0, messages: 0, plans: 0, locks: 0 } };
+
+  // Delete in dependency order: plan_items → plans → messages → file_locks → file_ownership → slots → session
+  const plans = db.query("SELECT id FROM plans WHERE session_id = ?").all(body.id) as { id: number }[];
+  for (const plan of plans) {
+    db.run("DELETE FROM plan_items WHERE plan_id = ?", [plan.id]);
+  }
+  const planCount = plans.length;
+  db.run("DELETE FROM plans WHERE session_id = ?", [body.id]);
+
+  const msgResult = db.run("DELETE FROM messages WHERE session_id = ?", [body.id]);
+  const msgCount = msgResult.changes;
+
+  db.run("DELETE FROM file_locks WHERE session_id = ?", [body.id]);
+  db.run("DELETE FROM file_ownership WHERE session_id = ?", [body.id]);
+
+  // Delete peers associated with this session's slots
+  const slots = db.query("SELECT id, peer_id FROM slots WHERE session_id = ?").all(body.id) as { id: number; peer_id: string | null }[];
+  for (const slot of slots) {
+    if (slot.peer_id) {
+      db.run("DELETE FROM peers WHERE id = ?", [slot.peer_id]);
+    }
+  }
+  const slotResult = db.run("DELETE FROM slots WHERE session_id = ?", [body.id]);
+  const slotCount = slotResult.changes;
+
+  // Delete guardrail overrides and events
+  db.run("DELETE FROM guardrail_overrides WHERE session_id = ?", [body.id]);
+  db.run("DELETE FROM guardrail_events WHERE session_id = ?", [body.id]);
+
+  db.run("DELETE FROM sessions WHERE id = ?", [body.id]);
+
+  return { ok: true, deleted: { slots: slotCount, messages: msgCount, plans: planCount, locks: 0 } };
 }
 
 function handleUpdateSession(body: UpdateSessionRequest): Session | null {
@@ -1101,6 +1160,8 @@ Bun.serve({
           const updated = handleUpdateSession(body as UpdateSessionRequest);
           return updated ? Response.json(updated) : Response.json({ error: "Session not found" }, { status: 404 });
         }
+        case "/sessions/delete":
+          return Response.json(handleDeleteSession(body as { id: string }));
 
         // --- Slots ---
         case "/slots/create":
@@ -1209,19 +1270,61 @@ Bun.serve({
           const targetSlot = db.query("SELECT * FROM slots WHERE id = ?").get(target_slot_id) as any;
           if (!targetSlot) return Response.json({ error: "Target slot not found" }, { status: 404 });
 
-          db.run("UPDATE slots SET task_state = 'approved' WHERE id = ?", [target_slot_id]);
-
           const approverSlot = peer?.slot_id ? db.query("SELECT * FROM slots WHERE id = ?").get(peer.slot_id) as any : null;
           const approverName = approverSlot?.display_name || peer_id;
+          const approverRole = approverSlot?.role ?? "unknown";
 
+          // Record the approval message first
           db.run(
             "INSERT INTO messages (session_id, from_id, from_slot_id, to_id, to_slot_id, text, msg_type, sent_at, delivered, held) VALUES (?, ?, ?, ?, ?, ?, 'approval', ?, 0, ?)",
             [session_id, peer_id, peer?.slot_id ?? null, targetSlot.peer_id, target_slot_id,
-             `APPROVED by ${approverName}${message ? ": " + message : ""}. Your work has been approved.`,
+             `APPROVED by ${approverName} (${approverRole})${message ? ": " + message : ""}`,
              new Date().toISOString(), targetSlot.paused ? 1 : 0]
           );
 
-          return Response.json({ ok: true, task_state: "approved" });
+          // Count distinct approver roles for this slot (reviewer vs QA vs lead etc.)
+          // Only transition to 'approved' if we have approvals from 2+ distinct roles,
+          // OR if there's only one reviewer/QA-type role in the session.
+          const approvalMessages = db.query(
+            "SELECT DISTINCT m.from_slot_id FROM messages m WHERE m.session_id = ? AND m.to_slot_id = ? AND m.msg_type = 'approval'"
+          ).all(session_id, target_slot_id) as { from_slot_id: number | null }[];
+
+          const approverSlotIds = approvalMessages.map(m => m.from_slot_id).filter(Boolean) as number[];
+          const approverRoles = new Set<string>();
+          for (const sid of approverSlotIds) {
+            const s = db.query("SELECT role FROM slots WHERE id = ?").get(sid) as { role: string } | null;
+            if (s?.role) approverRoles.add(s.role.toLowerCase());
+          }
+
+          // Count how many distinct reviewer/QA roles exist in the session
+          const allSlots = db.query("SELECT role FROM slots WHERE session_id = ? AND id != ?").all(session_id, target_slot_id) as { role: string }[];
+          const reviewRoles = new Set<string>();
+          for (const s of allSlots) {
+            if (s.role && /qa|review|test|lead/i.test(s.role)) {
+              reviewRoles.add(s.role.toLowerCase());
+            }
+          }
+
+          // Transition to 'approved' if we have approvals from all review roles,
+          // or if there's only one review role and it approved.
+          const allReviewRolesApproved = reviewRoles.size > 0 && [...reviewRoles].every(r => approverRoles.has(r));
+          const singleReviewerApproved = reviewRoles.size <= 1 && approverRoles.size >= 1;
+
+          let newState: string;
+          if (allReviewRolesApproved || singleReviewerApproved) {
+            db.run("UPDATE slots SET task_state = 'approved' WHERE id = ?", [target_slot_id]);
+            newState = "approved";
+          } else {
+            // Keep in done_pending_review — still waiting for more approvals
+            newState = targetSlot.task_state;
+          }
+
+          const remaining = [...reviewRoles].filter(r => !approverRoles.has(r));
+          const statusMsg = newState === "approved"
+            ? "All required approvals received."
+            : `Approval recorded (${approverRole}). Still waiting for: ${remaining.join(", ")}.`;
+
+          return Response.json({ ok: true, task_state: newState, approvals: approverRoles.size, required: reviewRoles.size, message: statusMsg });
         }
 
         case "/lifecycle/release": {

@@ -9,7 +9,7 @@ import type { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentEvent } from "./monitor.ts";
 import { FLAP_THRESHOLD, FLAP_WINDOW_MS } from "../shared/constants.ts";
 import { log, safeJsonParse, formatDuration } from "../shared/utils.ts";
-import { launchAgent, buildTeamContext } from "./launcher.ts";
+import { relaunchIntoSlot, buildTeamContext } from "./launcher.ts";
 
 const LOG_PREFIX = "recovery";
 
@@ -161,16 +161,11 @@ export async function respawnAgent(
     .filter(Boolean)
     .join("\n");
 
-  // Launch with the handoff prompt
-  const result = await launchAgent(sessionId, projectDir, {
-    agent_type: slot.agent_type,
-    name: slot.display_name ?? `Agent #${slotId}`,
-    role: slot.role ?? "general",
-    role_description: slot.role_description ?? "",
-    initial_task: handoffTask,
-  }, brokerClient);
+  // Relaunch into the EXISTING slot (not a new one) to preserve plan items,
+  // file ownership, message history, and task-state continuity (review finding #3).
+  const result = await relaunchIntoSlot(sessionId, projectDir, slot, handoffTask, brokerClient);
 
-  log(LOG_PREFIX, `Respawned slot ${slotId} as new slot ${result.slotId} (PID ${result.pid})`);
+  log(LOG_PREFIX, `Respawned into existing slot ${slotId} (PID ${result.pid})`);
 
   return { pid: result.pid };
 }

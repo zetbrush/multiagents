@@ -427,7 +427,11 @@ export async function dashboard(sessionId?: string): Promise<void> {
     }
 
     render(state, sid);
-    await Bun.sleep(DASHBOARD_REFRESH);
+    // Slow down polling for inactive sessions — no need to hammer the broker
+    const refreshMs = state.session?.status === "archived" ? 5000
+      : state.session?.status === "paused" ? 2000
+      : DASHBOARD_REFRESH;
+    await Bun.sleep(refreshMs);
   }
 }
 
@@ -515,7 +519,13 @@ function render(state: DashboardState, sid: string | null): void {
       return r?.status === "connected";
     }).length;
     const sessionStatus = colorStatus(state.session.status);
-    const uptime = formatDuration(Date.now() - state.session.created_at);
+    // Freeze timer for archived/paused sessions — show duration at time of stop, not keep counting
+    const endTime = state.session.status === "archived"
+      ? (state.session.last_active_at ?? Date.now())
+      : state.session.status === "paused"
+        ? (state.session.paused_at ?? state.session.last_active_at ?? Date.now())
+        : Date.now();
+    const uptime = formatDuration(endTime - state.session.created_at);
     headerRight = `${connectedCount}/${state.slots.length} agents  ${sessionStatus}  ${DIM}${uptime}${RESET}`;
   }
 
@@ -535,6 +545,14 @@ function render(state: DashboardState, sid: string | null): void {
   }
   lines.push(tabBar);
   lines.push(`${DIM}${"─".repeat(cols)}${RESET}`);
+
+  // === SESSION STATE BANNER ===
+  if (state.session?.status === "archived") {
+    lines.push(` ${RED}${BOLD}▸ SESSION ENDED${RESET} ${DIM}— archived at ${new Date(state.session.last_active_at).toLocaleTimeString()}. Dashboard is read-only.${RESET}`);
+  } else if (state.session?.status === "paused") {
+    const reason = state.session.pause_reason ? ` (${state.session.pause_reason})` : "";
+    lines.push(` ${YELLOW}${BOLD}▸ SESSION PAUSED${RESET}${reason} ${DIM}— agents are holding. Resume with orchestrator or CLI.${RESET}`);
+  }
 
   // === TOAST ===
   if (state.toast) {

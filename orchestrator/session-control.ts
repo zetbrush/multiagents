@@ -133,6 +133,18 @@ export async function pauseAgent(
   slot: Slot,
   brokerClient: BrokerClient,
 ): Promise<void> {
+  // Send control message to the agent BEFORE holding — otherwise the hold
+  // makes the pause message itself undeliverable (review finding #2).
+  if (slot.peer_id) {
+    await brokerClient.sendMessage({
+      from_id: "orchestrator",
+      to_id: slot.peer_id,
+      text: JSON.stringify({ action: "pause", reason: "Paused by orchestrator" }),
+      msg_type: "control",
+      session_id: sessionId,
+    });
+  }
+
   // Update slot state
   await brokerClient.updateSlot({
     id: slot.id,
@@ -140,7 +152,7 @@ export async function pauseAgent(
     paused_at: Date.now(),
   });
 
-  // Hold incoming messages
+  // Hold future incoming messages
   await brokerClient.holdMessages(sessionId, slot.id);
 
   // Release file locks held by this agent
@@ -157,17 +169,6 @@ export async function pauseAgent(
     }
   } catch {
     // Best-effort lock release
-  }
-
-  // Send control message to the agent
-  if (slot.peer_id) {
-    await brokerClient.sendMessage({
-      from_id: "orchestrator",
-      to_id: slot.peer_id,
-      text: JSON.stringify({ action: "pause", reason: "Paused by orchestrator" }),
-      msg_type: "control",
-      session_id: sessionId,
-    });
   }
 
   log(LOG_PREFIX, `Paused agent ${slot.display_name ?? slot.id}`);

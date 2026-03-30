@@ -123,6 +123,10 @@ export class BrokerClient {
     return this.post("/sessions/list", {});
   }
 
+  deleteSession(id: string): Promise<{ ok: boolean; deleted: { slots: number; messages: number; plans: number; locks: number } }> {
+    return this.post("/sessions/delete", { id });
+  }
+
   updateSession(req: UpdateSessionRequest): Promise<Session> {
     return this.post("/sessions/update", req);
   }

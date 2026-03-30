@@ -223,10 +223,21 @@ async function deleteSession(client: BrokerClient, sessionId?: string): Promise<
     return;
   }
 
-  // Archive first (soft delete via broker — actual delete if broker supports it)
+  // Actually delete from broker (review finding #7 — was only archiving before)
   try {
-    await client.updateSession({ id: sessionId, status: "archived" });
-  } catch { /* ok */ }
+    const result = await client.deleteSession(sessionId);
+    if (result.ok) {
+      console.log(`Session "${sessionId}" permanently deleted. Removed: ${result.deleted.slots} slot(s), ${result.deleted.messages} message(s), ${result.deleted.plans} plan(s).`);
+    } else {
+      console.error(`Session "${sessionId}" not found in broker.`);
+    }
+  } catch {
+    // Fallback for older broker without delete endpoint — archive instead
+    try {
+      await client.updateSession({ id: sessionId, status: "archived" });
+      console.log(`Session "${sessionId}" archived (broker does not support full delete).`);
+    } catch { /* ok */ }
+  }
 
   // Clean local session file if it matches
   const local = readLocalSession();
@@ -234,8 +245,6 @@ async function deleteSession(client: BrokerClient, sessionId?: string): Promise<
     const sessionFilePath = path.resolve(process.cwd(), SESSION_FILE);
     if (fs.existsSync(sessionFilePath)) fs.unlinkSync(sessionFilePath);
   }
-
-  console.log(`Session "${sessionId}" deleted.`);
 }
 
 async function exportSession(client: BrokerClient, sessionId?: string): Promise<void> {

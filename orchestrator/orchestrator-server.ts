@@ -17,7 +17,7 @@ import type { Subprocess } from "bun";
 import * as fs from "node:fs";
 import { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentLaunchConfig } from "../shared/types.ts";
-import { log, getGitRoot, slugify } from "../shared/utils.ts";
+import { log, getGitRoot, slugify, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
   DEFAULT_BROKER_PORT,
   BROKER_HOSTNAME,
@@ -25,7 +25,8 @@ import {
   CONFLICT_CHECK_INTERVAL,
 } from "../shared/constants.ts";
 
-import { detectAgent, launchAgent, announceNewMember, buildTeamContext } from "./launcher.ts";
+import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext } from "./launcher.ts";
+import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
 import { monitorProcess, type AgentEvent } from "./monitor.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
@@ -108,13 +109,36 @@ function handleEvent(event: AgentEvent): void {
 
   // Auto-respawn on crash (unless flapping)
   if (event.type === "agent_crashed" && event.data && !event.data.is_flapping) {
-    const sessionProcesses = activeProcesses.get(event.sessionId);
-    if (sessionProcesses) {
-      // Trigger async respawn — handleAgentCrash is the sole source of the crash event
+    const sessionMeta = activeSessions.get(event.sessionId);
+    if (sessionMeta) {
       const brokerClient = new BrokerClient(BROKER_URL);
+      // First compute crash metadata (flap detection), then actually respawn
       handleAgentCrash(event.slotId, event.data.exit_code as number, event.sessionId, brokerClient)
-        .then((crashEvent) => {
+        .then(async (crashEvent) => {
           pendingEvents.push(crashEvent);
+          // Only respawn if handleAgentCrash didn't detect flapping
+          if (!crashEvent.data?.is_flapping) {
+            try {
+              const { respawnAgent } = await import("./recovery.ts");
+              const result = await respawnAgent(event.slotId, event.sessionId, brokerClient, sessionMeta.projectDir);
+              const sessionProcs = activeProcesses.get(event.sessionId);
+              if (sessionProcs && result.pid) {
+                // Monitor the new process
+                const { monitorProcess: mp } = await import("./monitor.ts");
+                // Process tracking handled by relaunchIntoSlot
+                log(LOG_PREFIX, `Auto-respawned crashed agent slot ${event.slotId} (PID ${result.pid})`);
+              }
+              pendingEvents.push({
+                type: "agent_restarted",
+                severity: "info",
+                slotId: event.slotId,
+                sessionId: event.sessionId,
+                message: `Slot ${event.slotId} auto-respawned after crash (PID ${result.pid})`,
+              });
+            } catch (err) {
+              log(LOG_PREFIX, `Failed to auto-respawn slot ${event.slotId}: ${err}`);
+            }
+          }
         })
         .catch((err) => log(LOG_PREFIX, `Crash handler error: ${err}`));
     }
@@ -151,7 +175,7 @@ async function autoRestartIfIncomplete(
     const name = taskInfo.display_name ?? `Slot ${slotId}`;
 
     // Only restart if the agent hasn't completed its work
-    if (state === "idle" || state === "addressing_feedback") {
+    if (state === "idle" || state === "in_progress" || state === "addressing_feedback") {
       log(LOG_PREFIX, `${name} exited with code 0 but task_state="${state}" — auto-restarting`);
 
       // Find the session's project dir from active sessions
@@ -206,30 +230,42 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "create_team",
-      description: "Create a new multi-agent team session. Launches headless agents (separate Claude/Codex/Gemini CLI processes) with assigned roles and file ownership. The project_dir will be created if it does not exist, and git will be initialized if needed. Returns a session_id to use with all other orchestrator tools.",
+      description: `Create a new multi-agent team session. Launches headless agents with assigned roles and file ownership. The project_dir will be created if it does not exist, and git will be initialized if needed.
+
+IMPORTANT — For best results, provide detailed role_descriptions including platform/framework, expertise, and constraints. The richer the description, the better the agent performs.
+
+Recommended team compositions:
+- Feature development: Software Engineer + Code Reviewer + QA Engineer
+- UI feature: UI/UX Designer + Software Engineer + Code Reviewer + QA Engineer
+- Bug fix: Software Engineer + QA Engineer
+
+Core roles: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'
+Prefix with platform: 'Android Software Engineer', 'Web QA Engineer', 'iOS UI/UX Designer'
+
+Each agent receives role-specific best practices, tool discovery hints, and completion criteria automatically based on their role name and description. Agents communicate bidirectionally and loop until all parties approve.`,
       inputSchema: {
         type: "object" as const,
         properties: {
-          project_dir: { type: "string", description: "Absolute path where agents will work. Will be created if it does not exist. Example: /Users/me/my-project" },
-          session_name: { type: "string", description: "Short name for this session. Used to generate session_id. Example: 'calculator-app'" },
+          project_dir: { type: "string", description: "Absolute path where agents will work. Will be created if it does not exist." },
+          session_name: { type: "string", description: "Short name for this session. Used to generate session_id." },
           agents: {
             type: "array",
             items: {
               type: "object",
               properties: {
                 agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
-                name: { type: "string" },
-                role: { type: "string" },
-                role_description: { type: "string" },
-                initial_task: { type: "string" },
-                file_ownership: { type: "array", items: { type: "string" } },
+                name: { type: "string", description: "Display name for the agent, e.g., 'Alice' or 'Backend Engineer'" },
+                role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity: 'Android Software Engineer', 'Web QA Engineer'." },
+                role_description: { type: "string", description: "Detailed role brief including platform (web/android/ios/cli/api), framework/stack, specific expertise, constraints, and acceptance criteria. The richer this is, the better the agent performs." },
+                initial_task: { type: "string", description: "Specific task with acceptance criteria. Include what 'done' looks like, files to modify, APIs to use, and verification steps." },
+                file_ownership: { type: "array", items: { type: "string" }, description: "Glob patterns for files this agent owns exclusively, e.g., 'src/auth/**'" },
               },
               required: ["agent_type", "name", "role", "role_description", "initial_task"],
             },
           },
           plan: {
             type: "array",
-            description: "Optional plan items to track progress. Each item has a label and optional agent_name assignment.",
+            description: "Plan items to track progress. Include review and QA tasks, not just implementation. Example: [{label: 'Implement auth API', agent_name: 'Engineer'}, {label: 'Review auth code', agent_name: 'Reviewer'}, {label: 'Test auth E2E', agent_name: 'QA'}]",
             items: {
               type: "object",
               properties: {
@@ -282,17 +318,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "add_agent",
-      description: "Spawn and add a new agent (Claude/Codex/Gemini CLI process) to an existing multiagents session. The agent auto-connects to the broker and receives team context.",
+      description: "Spawn and add a new agent to an existing multiagents session. The agent auto-connects to the broker, receives team context, and gets role-specific best practices injected automatically based on role name and description.",
       inputSchema: {
         type: "object" as const,
         properties: {
           session_id: { type: "string" },
           agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
-          name: { type: "string" },
-          role: { type: "string" },
-          role_description: { type: "string" },
-          initial_task: { type: "string" },
-          file_ownership: { type: "array", items: { type: "string" } },
+          name: { type: "string", description: "Display name for the agent" },
+          role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity." },
+          role_description: { type: "string", description: "Detailed role brief including platform, framework, expertise, constraints. The richer this is, the better the agent performs." },
+          initial_task: { type: "string", description: "Specific task with acceptance criteria. Include what 'done' looks like." },
+          file_ownership: { type: "array", items: { type: "string" }, description: "Glob patterns for files this agent owns exclusively" },
         },
         required: ["session_id", "agent_type", "name", "role", "role_description", "initial_task"],
       },
@@ -399,6 +435,49 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["session_id"],
       },
     },
+    {
+      name: "list_sessions",
+      description: "List all multiagents sessions (active, paused, archived). Use to discover sessions from previous conversations that can be resumed with resume_session.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          status_filter: { type: "string", enum: ["all", "active", "paused", "archived"], description: "Filter by session status. Default: all" },
+        },
+      },
+    },
+    {
+      name: "resume_session",
+      description: "Resume a previously paused or stopped multiagents session. Respawns all disconnected agents with their previous role, context, message history, and plan items. Use list_sessions first to find the session_id.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          session_id: { type: "string", description: "Session ID to resume (from list_sessions)" },
+          agents_to_skip: { type: "array", items: { type: "string" }, description: "Agent names or roles to NOT respawn (optional)" },
+        },
+        required: ["session_id"],
+      },
+    },
+    {
+      name: "delete_session",
+      description: "Permanently delete a multiagents session and all its data (slots, messages, plans, file locks). Use when a session is no longer needed. Kills any running agents first. Cannot be undone.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          session_id: { type: "string", description: "Session ID to delete (from list_sessions)" },
+        },
+        required: ["session_id"],
+      },
+    },
+    {
+      name: "get_guide",
+      description: "Get comprehensive documentation and guidance for using multiagents. Call with no topic to see all available topics. Topics: overview, quickstart, roles, workflows, tools, session_lifecycle, troubleshooting, examples, best_practices. Start with 'quickstart' for a step-by-step tutorial.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          topic: { type: "string", enum: ["overview", "quickstart", "roles", "workflows", "tools", "session_lifecycle", "troubleshooting", "examples", "best_practices"], description: "Guide topic to read. Omit to see the topic list." },
+        },
+      },
+    },
   ],
 }));
 
@@ -418,15 +497,48 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           plan?: { label: string; agent_name?: string }[];
         };
 
-        // Detect available agents
+        // Detect available agents — check ALL before failing, report what IS available
+        const unavailable: { name: string; type: string }[] = [];
+        const availableTypes = new Set<string>();
         for (const agentCfg of agents) {
           const detection = await detectAgent(agentCfg.agent_type);
           if (!detection.available) {
-            return { content: [{ type: "text", text: `Error: ${agentCfg.agent_type} CLI not found on PATH. Install it first.` }] };
+            unavailable.push({ name: agentCfg.name, type: agentCfg.agent_type });
+          } else {
+            availableTypes.add(agentCfg.agent_type);
           }
         }
+        if (unavailable.length > 0) {
+          // Check what IS available on this machine
+          const allTypes: Array<"claude" | "codex" | "gemini"> = ["claude", "codex", "gemini"];
+          for (const t of allTypes) {
+            const d = await detectAgent(t);
+            if (d.available) availableTypes.add(t);
+          }
+          const availableList = availableTypes.size > 0
+            ? `Available agent CLIs on this machine: ${[...availableTypes].join(", ")}.`
+            : "No agent CLIs found. Install claude, codex, or gemini CLI first.";
+          const failedList = unavailable.map(u => `${u.name} (${u.type})`).join(", ");
+          return {
+            content: [{
+              type: "text",
+              text: `Cannot create team — the following agent CLIs are not installed: ${failedList}.\n\n${availableList}\n\nPlease adjust your team to only use available agent types, or install the missing CLIs.`,
+            }],
+          };
+        }
 
-        const sessionId = slugify(session_name);
+        // Generate unique session ID — check existing sessions to avoid collisions
+        let sessionId = slugify(session_name);
+        try {
+          const existing = await brokerClient.listSessions();
+          const existingIds = new Set(existing.map((s: any) => s.id));
+          if (existingIds.has(sessionId)) {
+            // Append incrementing suffix until unique
+            let i = 2;
+            while (existingIds.has(`${sessionId}-${i}`)) i++;
+            sessionId = `${sessionId}-${i}`;
+          }
+        } catch { /* broker may not support list yet — proceed with base slug */ }
 
         // Auto-create project directory if it doesn't exist
         if (!fs.existsSync(project_dir)) {
@@ -456,9 +568,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         activeProcesses.set(sessionId, sessionProcs);
         activeSessions.set(sessionId, { projectDir: project_dir });
 
-        // Launch each agent
+        // Launch each agent with staggered delays to prevent race conditions.
+        // Codex agents share a global skills directory (~/.codex/system-skills/)
+        // that gets corrupted when multiple instances initialize simultaneously.
+        // Gemini via npx can also race on package caching.
         const launchedAgents: { name: string; slot_id: number; pid: number }[] = [];
+        const launchedTypes = new Set<string>();
         for (const agentCfg of agents) {
+          // Stagger if we've already launched an agent of this type
+          if (launchedTypes.has(agentCfg.agent_type)) {
+            await new Promise((r) => setTimeout(r, 3000));
+          }
+          launchedTypes.add(agentCfg.agent_type);
+
           const result = await launchAgent(sessionId, project_dir, agentCfg, brokerClient);
           sessionProcs.set(result.slotId, result.process);
 
@@ -551,7 +673,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           ? "\n\nRecent events:\n" + events.map((e) => `[${e.severity}] ${e.message}`).join("\n")
           : "";
 
-        return { content: [{ type: "text", text: display + eventText }] };
+        // Check for BLOCKED messages from agents to orchestrator
+        let blockedText = "";
+        try {
+          const recentMsgs = await brokerClient.getMessageLog(session_id, { limit: 50 });
+          const blockedMsgs = recentMsgs.filter((m: any) =>
+            m.to_id === "orchestrator" && m.text && /BLOCKED|NEED HELP|ESCALAT/i.test(m.text)
+          );
+          if (blockedMsgs.length > 0) {
+            blockedText = "\n\nBLOCKED AGENTS (need your help):\n" +
+              blockedMsgs.slice(0, 5).map((m: any) => {
+                const fromSlot = status.agents.find((a) => a.slot_id === m.from_slot_id);
+                const fromName = fromSlot?.name ?? m.from_id;
+                return `  [!] ${fromName}: ${m.text.slice(0, 200)}`;
+              }).join("\n");
+          }
+        } catch { /* best effort */ }
+
+        // Completion check: all agents approved → suggest releasing
+        let completionText = "";
+        const connectedAgents = status.agents.filter((a) => a.status === "connected");
+        const allApproved = connectedAgents.length > 0 && connectedAgents.every((a) => a.task_state === "approved");
+        const allDoneOrApproved = connectedAgents.length > 0 && connectedAgents.every((a) =>
+          a.task_state === "approved" || a.task_state === "released"
+        );
+        if (allApproved) {
+          completionText = "\n\nALL AGENTS APPROVED — Team work is complete. You can now call release_all to release all agents, or end_session to archive the session.";
+        } else if (!allDoneOrApproved && connectedAgents.length > 0) {
+          const needsWork = connectedAgents.filter((a) => a.task_state !== "approved" && a.task_state !== "released");
+          completionText = `\n\nCompletion: ${connectedAgents.length - needsWork.length}/${connectedAgents.length} agents approved. Still working: ${needsWork.map((a) => `${a.name} (${a.task_state})`).join(", ")}`;
+        }
+
+        return { content: [{ type: "text", text: display + eventText + blockedText + completionText }] };
       }
 
       // ---- broadcast_to_team ----
@@ -760,6 +913,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "release_all": {
         const { session_id, message } = args as { session_id: string; message?: string };
         const slots = await brokerClient.listSlots(session_id);
+
+        // Warn if not all agents are approved
+        const connectedSlots = slots.filter((s) => s.status === "connected");
+        const notApproved = connectedSlots.filter((s) =>
+          s.task_state !== "approved" && s.task_state !== "released"
+        );
+        if (notApproved.length > 0) {
+          const warning = `WARNING: ${notApproved.length} agent(s) not yet approved: ${notApproved.map((s) => `${s.display_name || s.role || s.id} (${s.task_state || "idle"})`).join(", ")}. Releasing anyway as requested.`;
+          log(LOG_PREFIX, warning);
+          // Still proceed — orchestrator explicitly asked to release
+        }
+
         let released = 0;
         for (const slot of slots) {
           if (slot.task_state !== "released" && slot.task_state !== "idle") {
@@ -864,6 +1029,255 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      // ---- delete_session ----
+      case "delete_session": {
+        const { session_id } = args as { session_id: string };
+
+        // Kill any running agent processes first
+        const sessionProcs = activeProcesses.get(session_id);
+        if (sessionProcs) {
+          for (const [slotId, proc] of sessionProcs) {
+            try { proc.kill(); } catch { /* already dead */ }
+          }
+          activeProcesses.delete(session_id);
+        }
+        activeSessions.delete(session_id);
+
+        const result = await brokerClient.deleteSession(session_id);
+        if (!result.ok) {
+          return { content: [{ type: "text", text: `Session "${session_id}" not found.` }] };
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: `Session "${session_id}" permanently deleted. Removed: ${result.deleted.slots} slot(s), ${result.deleted.messages} message(s), ${result.deleted.plans} plan(s).`,
+          }],
+        };
+      }
+
+      // ---- list_sessions ----
+      case "list_sessions": {
+        const { status_filter } = args as { status_filter?: string };
+        const allSessions = await brokerClient.listSessions();
+
+        // Filter by status
+        const filtered = status_filter && status_filter !== "all"
+          ? allSessions.filter((s: any) => s.status === status_filter)
+          : allSessions;
+
+        if (filtered.length === 0) {
+          return { content: [{ type: "text", text: `No sessions found${status_filter ? ` with status "${status_filter}"` : ""}.` }] };
+        }
+
+        // Enrich each session with slot counts and plan progress
+        const lines: string[] = ["=== Multiagents Sessions ===", ""];
+        for (const session of filtered) {
+          const sid = (session as any).id;
+          let slotInfo = "";
+          let planInfo = "";
+          try {
+            const slots = await brokerClient.listSlots(sid);
+            const connected = slots.filter((s: any) => s.status === "connected").length;
+            const disconnected = slots.filter((s: any) => s.status === "disconnected").length;
+            slotInfo = ` | Agents: ${connected} online, ${disconnected} disconnected (${slots.length} total)`;
+
+            // Plan progress
+            const plan = await brokerClient.getPlan(sid);
+            if (plan?.items && plan.items.length > 0) {
+              const done = plan.items.filter((i: any) => i.status === "done").length;
+              planInfo = ` | Plan: ${done}/${plan.items.length} done`;
+            }
+          } catch { /* best effort */ }
+
+          const elapsed = Date.now() - ((session as any).created_at ?? 0);
+          const isManaged = activeProcesses.has(sid) ? " [MANAGED]" : "";
+          lines.push(`  ${sid}`);
+          lines.push(`    Name: ${(session as any).name} | Status: ${(session as any).status}${isManaged} | Elapsed: ${formatDuration(elapsed)}`);
+          lines.push(`    Dir: ${(session as any).project_dir}${slotInfo}${planInfo}`);
+          lines.push("");
+        }
+
+        lines.push(`${filtered.length} session(s) found. Use resume_session to restart a paused/stopped session.`);
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      // ---- resume_session ----
+      case "resume_session": {
+        const { session_id, agents_to_skip } = args as { session_id: string; agents_to_skip?: string[] };
+        const skipSet = new Set((agents_to_skip ?? []).map(s => s.toLowerCase()));
+
+        // Get session
+        const session = await brokerClient.getSession(session_id);
+        if (!session) {
+          return { content: [{ type: "text", text: `Session "${session_id}" not found.` }] };
+        }
+
+        // Update session status to active
+        await brokerClient.updateSession({
+          id: session_id,
+          status: "active",
+          pause_reason: null,
+          paused_at: null,
+        });
+
+        // Get all slots
+        const slots = await brokerClient.listSlots(session_id);
+        const disconnected = slots.filter((s: any) =>
+          s.status === "disconnected" &&
+          s.task_state !== "released" &&
+          !skipSet.has((s.display_name ?? "").toLowerCase()) &&
+          !skipSet.has((s.role ?? "").toLowerCase())
+        );
+
+        if (disconnected.length === 0) {
+          // Track session even if no agents to respawn (for monitoring loops)
+          activeSessions.set(session_id, { projectDir: session.project_dir });
+          if (!activeProcesses.has(session_id)) {
+            activeProcesses.set(session_id, new Map());
+          }
+          return { content: [{ type: "text", text: `Session "${session_id}" resumed (status → active). No disconnected agents to respawn. ${slots.filter((s: any) => s.status === "connected").length} agent(s) already online.` }] };
+        }
+
+        // Respawn each disconnected agent with rich handoff context
+        const respawned: string[] = [];
+        const failed: string[] = [];
+        const resumeLaunchedTypes = new Set<string>();
+
+        for (const slot of disconnected) {
+          try {
+            // Detect agent CLI availability
+            const detection = await detectAgent(slot.agent_type);
+            if (!detection.available) {
+              failed.push(`${slot.display_name || slot.role || slot.id} (${slot.agent_type} CLI not found)`);
+              continue;
+            }
+
+            // Build rich handoff prompt
+            const snapshot = safeJsonParse<Record<string, any>>(slot.context_snapshot, {});
+
+            // Get message recap for this slot
+            let recapLines: string[] = [];
+            try {
+              const messages = await brokerClient.getMessageLog(session_id, { limit: 30, with_slot: slot.id });
+              recapLines = messages.map((m: any) =>
+                `[${m.msg_type}] ${m.from_id}: ${(m.text ?? "").slice(0, 200)}`
+              );
+            } catch { /* ok */ }
+
+            // Get plan items assigned to this slot
+            let planItemLines: string[] = [];
+            try {
+              const plan = await brokerClient.getPlan(session_id);
+              if (plan?.items) {
+                const myItems = plan.items.filter((i: any) => i.assigned_to_slot === slot.id);
+                planItemLines = myItems.map((i: any) => {
+                  const marker = i.status === "done" ? "[x]" : i.status === "in_progress" ? "[~]" : "[ ]";
+                  return `  ${marker} ${i.label}`;
+                });
+              }
+            } catch { /* ok */ }
+
+            // Build team context
+            const teamContext = await buildTeamContext(session_id, slot.id, brokerClient);
+
+            const handoffParts = [
+              "SESSION RESUMED — You are being restarted to continue a previous session.",
+              "",
+              `Your role: ${slot.role ?? "unassigned"}`,
+              slot.role_description ? `Role description: ${slot.role_description}` : "",
+              snapshot.last_summary ? `Your last status: ${snapshot.last_summary}` : "",
+              snapshot.task_state ? `Your task state when you left: ${snapshot.task_state}` : "",
+              "",
+              teamContext,
+            ];
+
+            if (planItemLines.length > 0) {
+              handoffParts.push("", "Your assigned plan items:");
+              handoffParts.push(...planItemLines);
+            }
+
+            if (recapLines.length > 0) {
+              handoffParts.push("", "Recent message history (most recent last):");
+              handoffParts.push(...recapLines);
+            }
+
+            handoffParts.push(
+              "",
+              "INSTRUCTIONS:",
+              "1. Read the current state of the codebase — files may have changed since you disconnected.",
+              "2. Call check_team_status to see who else is online and what state they are in.",
+              "3. Call get_plan to see overall progress.",
+              "4. Resume your work from where you left off. If your task_state was 'addressing_feedback', check for unresolved feedback first.",
+              "5. Call set_summary to broadcast your current status to the team.",
+            );
+
+            const handoffTask = handoffParts.filter(Boolean).join("\n");
+
+            // Stagger same-type agent launches to prevent race conditions
+            if (resumeLaunchedTypes.has(slot.agent_type)) {
+              await new Promise((r) => setTimeout(r, 3000));
+            }
+            resumeLaunchedTypes.add(slot.agent_type);
+
+            // Relaunch into existing slot
+            const result = await relaunchIntoSlot(session_id, session.project_dir, slot, handoffTask, brokerClient);
+
+            // Track process
+            const sessionProcs = activeProcesses.get(session_id) ?? new Map();
+            sessionProcs.set(result.slotId, result.process);
+            activeProcesses.set(session_id, sessionProcs);
+
+            // Monitor process
+            monitorProcess(result.process, result.slotId, session_id, brokerClient, handleEvent);
+
+            // Release held messages for this slot
+            try {
+              await brokerClient.releaseHeldMessages(session_id, slot.id);
+            } catch { /* ok */ }
+
+            respawned.push(`${slot.display_name || slot.role || slot.id} (PID ${result.pid})`);
+          } catch (err) {
+            failed.push(`${slot.display_name || slot.role || slot.id}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
+        // Track session for monitoring loops
+        activeSessions.set(session_id, { projectDir: session.project_dir });
+
+        // Launch dashboard
+        launchDashboard(session_id, session.project_dir);
+
+        const lines: string[] = [`Session "${session_id}" resumed.`];
+        if (respawned.length > 0) {
+          lines.push(`Respawned ${respawned.length} agent(s): ${respawned.join(", ")}`);
+        }
+        if (failed.length > 0) {
+          lines.push(`Failed to respawn ${failed.length}: ${failed.join("; ")}`);
+        }
+        const skipped = slots.length - disconnected.length - slots.filter((s: any) => s.status === "connected").length;
+        if (skipped > 0) {
+          lines.push(`Skipped ${skipped} slot(s) (released/archived).`);
+        }
+        lines.push(`\nDashboard launched. Use get_team_status to monitor progress.`);
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+
+      // ---- get_guide ----
+      case "get_guide": {
+        const { topic } = args as { topic?: string };
+        if (!topic) {
+          return { content: [{ type: "text", text: formatTopicList() }] };
+        }
+        const content = getGuide(topic as GuideTopic);
+        if (!content) {
+          return { content: [{ type: "text", text: `Unknown topic "${topic}".\n\n${formatTopicList()}` }] };
+        }
+        return { content: [{ type: "text", text: content }] };
+      }
+
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }] };
     }
@@ -936,17 +1350,29 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
           const silentMs = Date.now() - lastActivity;
           if (silentMs > 2 * 60 * 1000) {
+            const agentName = slot.display_name || `slot ${slot.id}`;
+            const silentMin = Math.round(silentMs / 60000);
+
             // Nudge the agent
             await brokerClient.sendMessage({
               from_id: "orchestrator",
               to_id: slot.peer_id,
-              text: `[NUDGE] You have been silent for ${Math.round(silentMs / 60000)} minutes. ` +
+              text: `[NUDGE] You have been silent for ${silentMin} minutes. ` +
                     `Check your teammates with check_team_status and check_messages. ` +
-                    `If you are done, call signal_done. If you are blocked, message your team for help.`,
+                    `If you are done, call signal_done. If you are blocked, send a message to "orchestrator" explaining what you need.`,
               msg_type: "system",
               session_id: sessionId,
             });
-            log(LOG_PREFIX, `Nudged silent agent ${slot.display_name || slot.id} (${Math.round(silentMs / 60000)}m silent)`);
+
+            // Also alert the orchestrator user via pending events
+            pendingEvents.push({
+              type: "agent_silent",
+              severity: silentMs > 5 * 60 * 1000 ? "warning" : "info",
+              slotId: slot.id,
+              sessionId,
+              message: `${agentName} (${slot.role || "unknown"}) silent for ${silentMin}m — task_state: ${(slot as any).task_state || "idle"}. May need intervention.`,
+            });
+            log(LOG_PREFIX, `Nudged silent agent ${agentName} (${silentMin}m silent)`);
           }
         }
       } catch { /* ok */ }
@@ -990,6 +1416,45 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
       }
     }
   }, CONFLICT_CHECK_INTERVAL);
+
+  // Agent escalation monitor — check for messages sent TO "orchestrator" and surface as events
+  const seenEscalations = new Set<string>();
+  setInterval(async () => {
+    for (const sessionId of activeProcesses.keys()) {
+      try {
+        const messages = await brokerClient.getMessageLog(sessionId, { limit: 30 });
+        for (const msg of messages) {
+          if (msg.to_id !== "orchestrator") continue;
+          // Deduplicate by message id or sent_at+from_id
+          const key = `${msg.from_id}:${msg.sent_at}`;
+          if (seenEscalations.has(key)) continue;
+          seenEscalations.add(key);
+
+          const isBlocked = /BLOCKED|NEED HELP|ESCALAT|STUCK|CANNOT PROCEED/i.test(msg.text);
+          if (isBlocked) {
+            const slots = await brokerClient.listSlots(sessionId);
+            const fromSlot = slots.find((s) => s.peer_id === msg.from_id);
+            const fromName = fromSlot?.display_name || fromSlot?.role || msg.from_id;
+
+            pendingEvents.push({
+              type: "agent_blocked",
+              severity: "warning",
+              slotId: fromSlot?.id ?? -1,
+              sessionId,
+              message: `AGENT BLOCKED — ${fromName}: ${msg.text.slice(0, 300)}`,
+            });
+            log(LOG_PREFIX, `Agent escalation from ${fromName}: ${msg.text.slice(0, 100)}`);
+          }
+        }
+
+        // Prune old escalation keys (keep set from growing unbounded)
+        if (seenEscalations.size > 500) {
+          const entries = [...seenEscalations];
+          for (let i = 0; i < 250; i++) seenEscalations.delete(entries[i]);
+        }
+      } catch { /* ok */ }
+    }
+  }, 15_000);
 }
 
 // --- Main ---
