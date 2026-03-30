@@ -114,7 +114,11 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string): P
 
   const mcpServers = (mcpConfig.mcpServers as Record<string, unknown>) ?? {};
   const claudeMcp = mcpServerCommand("claude");
-  mcpServers["multiagents"] = { command: claudeMcp.command, args: claudeMcp.args };
+  // Use "multiagents-peer" to avoid collision with the globally-installed
+  // "multiagents" server in ~/.claude.json. The global one is for standalone
+  // use; this one is the per-agent server with slot/session env vars.
+  delete mcpServers["multiagents"]; // Remove stale entries from older versions
+  mcpServers["multiagents-peer"] = { command: claudeMcp.command, args: claudeMcp.args };
   mcpConfig.mcpServers = mcpServers;
   await Bun.write(mcpJsonPath, JSON.stringify(mcpConfig, null, 2));
 
@@ -126,10 +130,14 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string): P
   let codexToml = "";
   try { codexToml = await Bun.file(codexTomlPath).text(); } catch { /* ok */ }
 
-  // Add multiagents section if not present
-  if (!codexToml.includes("[mcp_servers.multiagents]")) {
+  // Add multiagents-peer section if not present (avoids collision with global "multiagents")
+  // Remove stale "multiagents" entries from older versions
+  if (codexToml.includes("[mcp_servers.multiagents]") && !codexToml.includes("[mcp_servers.multiagents-peer]") && !codexToml.includes('[mcp_servers."multiagents-peer"]')) {
+    codexToml = codexToml.replace(/\[mcp_servers\.multiagents\][^\[]*/s, "");
+  }
+  if (!codexToml.includes("multiagents-peer")) {
     const codexMcp = mcpServerCommand("codex");
-    const entry = `\n[mcp_servers.multiagents]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\n`;
+    const entry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\n`;
     await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + entry);
   }
 
@@ -143,9 +151,13 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string): P
     } catch { /* ok */ }
 
     const geminiMcpServers = (geminiConfig.mcpServers as Record<string, unknown>) ?? {};
-    if (!geminiMcpServers["multiagents"]) {
+    // Remove stale "multiagents" entries from older versions
+    if (geminiMcpServers["multiagents"] && !geminiMcpServers["multiagents-peer"]) {
+      delete geminiMcpServers["multiagents"];
+    }
+    if (!geminiMcpServers["multiagents-peer"]) {
       const geminiMcp = mcpServerCommand("gemini");
-      geminiMcpServers["multiagents"] = {
+      geminiMcpServers["multiagents-peer"] = {
         command: geminiMcp.command,
         args: geminiMcp.args,
       };
@@ -281,6 +293,20 @@ export async function launchAgent(
   };
   delete spawnEnv.CLAUDECODE;
 
+  // Update session file with slot info so sandboxed agents (Codex, Gemini)
+  // can recover slot_id even if MULTIAGENTS_* env vars are stripped.
+  // The adapter reads this as a fallback when env vars are absent.
+  const sessionDir = path.join(projectDir, ".multiagents");
+  const sessionFilePath = path.join(sessionDir, "session.json");
+  try {
+    let sessionFile: Record<string, unknown> = {};
+    try { sessionFile = JSON.parse(fs.readFileSync(sessionFilePath, "utf-8")); } catch { /* ok */ }
+    // Store the latest slot_id — each agent reads this, but env vars take priority
+    sessionFile.last_slot_id = slot.id;
+    sessionFile.last_slot_name = config.name;
+    fs.writeFileSync(sessionFilePath, JSON.stringify(sessionFile, null, 2));
+  } catch { /* best effort — env vars are the primary mechanism */ }
+
   // Spawn the agent process
   // stdin MUST be "pipe" for MCP stdio transport (bidirectional JSON-RPC)
   const proc = Bun.spawn([cmd, ...args], {
@@ -379,11 +405,16 @@ export async function relaunchIntoSlot(
 export function buildCliArgs(agentType: AgentType, task: string): string[] {
   switch (agentType) {
     case "claude": {
-      // Build inline MCP config JSON for --mcp-config
+      // Build inline MCP config JSON for --mcp-config.
+      // CRITICAL: Use "multiagents-peer" — NOT "multiagents" — to avoid
+      // collision with the globally-installed "multiagents" server in
+      // ~/.claude.json (registered by install-mcp for standalone use).
+      // If both use the same name, Claude Code's global config overrides
+      // the inline one, and agents get the wrong MCP server.
       const claudeMcp = mcpServerCommand("claude");
       const mcpConfigJson = JSON.stringify({
         mcpServers: {
-          "multiagents": {
+          "multiagents-peer": {
             command: claudeMcp.command,
             args: claudeMcp.args,
           },
@@ -401,14 +432,13 @@ export function buildCliArgs(agentType: AgentType, task: string): string[] {
     }
     case "codex": {
       // Inject multiagents MCP via dotted-path config overrides.
-      // We ONLY add our own MCP server — never touch other user-configured servers.
-      // The multiagents entry is already in ~/.codex/config.toml (written by install-mcp),
-      // but we override here to ensure the spawned agent uses the correct binary path.
+      // Use "multiagents-peer" to avoid collision with globally-installed
+      // "multiagents" server (same reason as Claude — see comment above).
       const codexMcp = mcpServerCommand("codex");
       const argsJson = JSON.stringify(codexMcp.args);
       const overrides: string[] = [
-        `mcp_servers.multiagents.command="${codexMcp.command}"`,
-        `mcp_servers.multiagents.args=${argsJson}`,
+        `mcp_servers."multiagents-peer".command="${codexMcp.command}"`,
+        `mcp_servers."multiagents-peer".args=${argsJson}`,
         'model_reasoning_effort="high"',
       ];
 
@@ -434,7 +464,7 @@ export function buildCliArgs(agentType: AgentType, task: string): string[] {
         "--sandbox",
         "--approval-mode", "yolo",
         "--output-format", "stream-json",
-        "--allowed-mcp-server-names", "multiagents",
+        "--allowed-mcp-server-names", "multiagents-peer",
         "-p", task,
       ];
     }

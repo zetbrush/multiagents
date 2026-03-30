@@ -50,11 +50,34 @@ export interface TeamStatus {
   plan_completion: number;
 }
 
+/** Grace period for agents to start up and register with the broker. */
+const STARTUP_GRACE_MS = 90_000; // 90 seconds — covers MCP init, broker registration, first tool call
+
+/** Additional health state for slots that haven't connected yet. */
+export type ExtendedHealthState = HealthState | "starting";
+
 /**
  * Assess the health of a single slot based on timing thresholds.
+ *
+ * CRITICAL: Slots are created with status="disconnected" BEFORE agents register.
+ * A disconnected slot that has never been connected (last_connected is null/0)
+ * is NOT crashed — it's still starting up. Marking it "crashed" causes the
+ * orchestrator LLM to panic and delete slots, destroying the session.
  */
-export function assessHealth(slot: Slot): HealthState {
+export function assessHealth(slot: Slot): ExtendedHealthState {
   if (slot.status === "disconnected") {
+    // Has this slot EVER been connected?
+    if (!slot.last_connected) {
+      // Never connected — still starting up. Use a grace period.
+      // Without created_at on slots, estimate from the session or just allow 90s.
+      return "starting";
+    }
+    // Was connected before but now disconnected — check how long ago
+    const disconnectedFor = Date.now() - (slot.last_disconnected ?? slot.last_connected ?? 0);
+    if (disconnectedFor < STARTUP_GRACE_MS) {
+      // Recently disconnected — might be restarting (auto-restart flow)
+      return "starting";
+    }
     return "crashed";
   }
 
@@ -128,7 +151,13 @@ export async function getTeamStatus(
   // Collect issues
   const issues: Issue[] = [];
   for (const agent of agents) {
-    if (agent.health === "crashed") {
+    if (agent.health === "starting") {
+      issues.push({
+        severity: "info",
+        slot_id: agent.slot_id,
+        message: `${agent.name} is starting up (loading MCP servers, connecting to broker)`,
+      });
+    } else if (agent.health === "crashed") {
       issues.push({
         severity: "critical",
         slot_id: agent.slot_id,
@@ -150,9 +179,9 @@ export async function getTeamStatus(
   }
 
   // Determine overall status
-  const healthCounts = { healthy: 0, slow: 0, stuck: 0, crashed: 0 };
+  const healthCounts = { healthy: 0, slow: 0, stuck: 0, crashed: 0, starting: 0 };
   for (const a of agents) {
-    healthCounts[a.health]++;
+    healthCounts[a.health as keyof typeof healthCounts]++;
   }
 
   let overall: string;
@@ -160,6 +189,10 @@ export async function getTeamStatus(
     overall = "paused";
   } else if (healthCounts.crashed > 0) {
     overall = "degraded";
+  } else if (healthCounts.starting > 0 && healthCounts.starting === agents.length) {
+    overall = "starting";
+  } else if (healthCounts.starting > 0) {
+    overall = "launching";
   } else if (healthCounts.stuck > 0) {
     overall = "issues";
   } else if (healthCounts.slow > 0) {
@@ -222,7 +255,7 @@ export function formatTeamStatusForDisplay(status: TeamStatus): string {
     lines.push("");
     lines.push("Workflow:");
     for (const [state, names] of stateEntries) {
-      const icon = state === "approved" ? "[OK]" : state === "done_pending_review" ? "[REVIEW]" : state === "addressing_feedback" ? "[FIX]" : state === "released" ? "[DONE]" : "[..]";
+      const icon = state === "approved" ? "[OK]" : state === "done_pending_review" ? "[REVIEW]" : state === "addressing_feedback" ? "[FIX]" : state === "released" ? "[DONE]" : state === "starting" ? "[>>]" : "[..]";
       lines.push(`  ${icon} ${state}: ${names.join(", ")}`);
     }
   }

@@ -112,22 +112,23 @@ function handleEvent(event: AgentEvent): void {
     const sessionMeta = activeSessions.get(event.sessionId);
     if (sessionMeta) {
       const brokerClient = new BrokerClient(BROKER_URL);
-      // First compute crash metadata (flap detection), then actually respawn
       handleAgentCrash(event.slotId, event.data.exit_code as number, event.sessionId, brokerClient)
         .then(async (crashEvent) => {
           pendingEvents.push(crashEvent);
-          // Only respawn if handleAgentCrash didn't detect flapping
           if (!crashEvent.data?.is_flapping) {
             try {
               const { respawnAgent } = await import("./recovery.ts");
-              const result = await respawnAgent(event.slotId, event.sessionId, brokerClient, sessionMeta.projectDir);
+              const result = await respawnAgent(event.sessionId, event.slotId, brokerClient, sessionMeta.projectDir);
+
+              // CRITICAL: Track + monitor the new process — without this the
+              // respawned process runs orphaned (nobody reads its stdout/exit)
               const sessionProcs = activeProcesses.get(event.sessionId);
-              if (sessionProcs && result.pid) {
-                // Monitor the new process
-                const { monitorProcess: mp } = await import("./monitor.ts");
-                // Process tracking handled by relaunchIntoSlot
-                log(LOG_PREFIX, `Auto-respawned crashed agent slot ${event.slotId} (PID ${result.pid})`);
+              if (sessionProcs && result.process) {
+                sessionProcs.set(event.slotId, result.process);
+                monitorProcess(result.process, event.slotId, event.sessionId, brokerClient, handleEvent);
               }
+              log(LOG_PREFIX, `Auto-respawned crashed agent slot ${event.slotId} (PID ${result.pid})`);
+
               pendingEvents.push({
                 type: "agent_restarted",
                 severity: "info",
@@ -163,6 +164,10 @@ function handleEvent(event: AgentEvent): void {
   }
 }
 
+/** Flap detection for code-0 auto-restarts (separate from crash flap detection). */
+const completionRestartHistory: Map<number, number[]> = new Map();
+const COMPLETION_RESTART_LIMIT = 3; // max code-0 restarts in FLAP_WINDOW_MS
+
 /** Check if a completed agent actually finished its task; if not, respawn it. */
 async function autoRestartIfIncomplete(
   slotId: number,
@@ -175,26 +180,45 @@ async function autoRestartIfIncomplete(
     const name = taskInfo.display_name ?? `Slot ${slotId}`;
 
     // Only restart if the agent hasn't completed its work
-    if (state === "idle" || state === "in_progress" || state === "addressing_feedback") {
-      log(LOG_PREFIX, `${name} exited with code 0 but task_state="${state}" — auto-restarting`);
+    // "working" = actively implementing (was incorrectly "in_progress" before)
+    if (state === "idle" || state === "working" || state === "addressing_feedback") {
+      // Flap detection for code-0 exits — prevent infinite restart loops
+      const now = Date.now();
+      const history = completionRestartHistory.get(slotId) ?? [];
+      const recent = history.filter((t) => now - t < FLAP_WINDOW_MS);
+      recent.push(now);
+      completionRestartHistory.set(slotId, recent);
 
-      // Find the session's project dir from active sessions
+      if (recent.length >= COMPLETION_RESTART_LIMIT) {
+        log(LOG_PREFIX, `${name} hit code-0 restart limit (${recent.length} in 5 min) — stopping auto-restart`);
+        pendingEvents.push({
+          type: "agent_flapping",
+          severity: "critical",
+          slotId,
+          sessionId,
+          message: `${name} keeps exiting without completing work (${recent.length} restarts). Stopped auto-restart. Investigate why the agent exits early.`,
+        });
+        return false;
+      }
+
+      log(LOG_PREFIX, `${name} exited with code 0 but task_state="${state}" — auto-restarting (${recent.length}/${COMPLETION_RESTART_LIMIT})`);
+
       const sessionMeta = activeSessions.get(sessionId);
       if (!sessionMeta) {
         log(LOG_PREFIX, `No session metadata for ${sessionId}, cannot restart`);
         return false;
       }
 
-      // Use respawnAgent from recovery module — it preserves context
       const { respawnAgent } = await import("./recovery.ts");
       const result = await respawnAgent(sessionId, slotId, brokerClient, sessionMeta.projectDir);
 
-      // Track the new process
+      // CRITICAL: Track + monitor the new process
       const sessionProcesses = activeProcesses.get(sessionId);
-      if (sessionProcesses && result.pid) {
-        // The new process is tracked by respawnAgent's launchAgent call
-        log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid})`);
+      if (sessionProcesses && result.process) {
+        sessionProcesses.set(slotId, result.process);
+        monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent);
       }
+      log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid})`);
 
       pendingEvents.push({
         type: "agent_restarted",
@@ -656,7 +680,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return {
           content: [{
             type: "text",
-            text: `Session "${sessionId}" created with ${launchedAgents.length} agents.${planSummary}\n\n${display}\n\nDashboard launched — run \`bun cli.ts dashboard ${sessionId}\` to reopen.`,
+            text: [
+              `Session "${sessionId}" created with ${launchedAgents.length} agents.${planSummary}`,
+              "",
+              display,
+              "",
+              "IMPORTANT: Agents take 15-60 seconds to start up (loading MCP servers, connecting to broker).",
+              "They will show as 'starting' until they register. This is NORMAL — do NOT call cleanup_dead_slots",
+              "or assume agents have crashed. Wait at least 60 seconds before checking status.",
+              "",
+              `Dashboard launched — run \`multiagents dashboard ${sessionId}\` to reopen.`,
+            ].join("\n"),
           }],
         };
       }
@@ -949,19 +983,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         let removed = 0;
         const removedNames: string[] = [];
 
+        const now = Date.now();
+        let skippedStarting = 0;
+
         for (const slot of slots) {
           const isDead = slot.status === "disconnected" && slot.task_state !== "released";
           const isReleased = slot.task_state === "released";
           const shouldRemove = isDead || (isReleased && !keep_released);
 
+          // SAFETY: Never clean up slots that are still starting up.
+          // A slot that has never been connected (last_connected is null) is still
+          // booting its MCP server. Deleting it destroys the session.
+          if (shouldRemove && isDead && !slot.last_connected) {
+            skippedStarting++;
+            continue; // Still starting — don't delete
+          }
+          // Also skip slots that were recently connected (within 2 min) — might be restarting
+          if (shouldRemove && isDead && slot.last_disconnected && (now - slot.last_disconnected < 120_000)) {
+            skippedStarting++;
+            continue;
+          }
+
           if (shouldRemove) {
-            // Delete the slot from the DB
-            try {
-              await brokerClient.post("/slots/delete", { id: slot.id });
-            } catch {
-              // If no delete endpoint, mark it archived via status
-              await brokerClient.updateSlot({ id: slot.id, status: "archived" as any });
-            }
+            // Delete the slot from the broker DB
+            await brokerClient.post("/slots/delete", { id: slot.id });
             removedNames.push(slot.display_name || slot.role || `slot-${slot.id}`);
             removed++;
 
@@ -977,12 +1022,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
+        const startingNote = skippedStarting > 0
+          ? `\nSkipped ${skippedStarting} slot(s) still starting up — these agents are booting and will connect shortly. Do NOT clean them up.`
+          : "";
         return {
           content: [{
             type: "text",
-            text: removed > 0
+            text: (removed > 0
               ? `Cleaned up ${removed} dead slot(s): ${removedNames.join(", ")}`
-              : `No dead slots found. All ${slots.length} slot(s) are active.`,
+              : `No dead slots found. All ${slots.length} slot(s) are active.`) + startingNote,
           }],
         };
       }
@@ -1318,10 +1366,10 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           const deadFor = now - disconnectedAt;
           if (deadFor < 5 * 60 * 1000) continue; // <5 min, might reconnect
 
-          // Auto-cleanup: mark as archived
+          // Auto-cleanup: delete the dead slot
           try {
-            await brokerClient.updateSlot({ id: slot.id, status: "archived" as any });
-            log(LOG_PREFIX, `Auto-cleaned dead slot ${slot.id} (${slot.display_name || slot.role}) — disconnected for ${Math.round(deadFor / 60000)}m`);
+            await brokerClient.post("/slots/delete", { id: slot.id });
+            log(LOG_PREFIX, `Auto-deleted dead slot ${slot.id} (${slot.display_name || slot.role}) — disconnected for ${Math.round(deadFor / 60000)}m`);
           } catch { /* best effort */ }
         }
       } catch { /* ok */ }

@@ -375,162 +375,59 @@ export abstract class BaseAdapter {
   // --- Main entry point ---
 
   async start(): Promise<void> {
-    // === PHASE 1: MCP HANDSHAKE (must complete FAST) ===
-    // The MCP client (Claude/Codex/Gemini) connects to us over stdio and
-    // sends an initialize request. If we don't respond quickly, the client
-    // times out (Codex: 10s). So we create the MCP server, register tools,
-    // and connect FIRST — before any network calls to the broker.
+    // === ARCHITECTURE ===
+    // Two things must happen:
+    //   A) MCP handshake over stdio (so the parent CLI can call our tools)
+    //   B) Broker registration (so teammates can see us and send messages)
+    //
+    // CRITICAL: These MUST run in parallel. The MCP `connect()` blocks until
+    // the parent CLI sends an `initialize` message — which may be delayed
+    // while Claude/Codex loads other servers, prepares context, or optimizes
+    // startup. If we sequence broker registration AFTER `connect()`, agents
+    // that delay `initialize` will never register with the broker, staying
+    // "disconnected" permanently in the dashboard.
+    //
+    // Solution: Start broker registration immediately in the background.
+    // Tool handlers already check `this.myId` and defer if not yet registered.
 
     this.myCwd = process.cwd();
 
-    // 1. Create MCP Server immediately
+    // 1. Resolve session/slot info eagerly (before any async work)
+    const envSession = process.env.MULTIAGENTS_SESSION;
+    if (envSession && !this.sessionId) {
+      this.sessionId = envSession;
+      this.log(`Session from env MULTIAGENTS_SESSION: ${envSession}`);
+    }
+
+    // 2. Create MCP Server
     this.mcp = new Server(
-      { name: "multiagents", version: "0.2.0" },
+      { name: "multiagents-peer", version: "0.2.0" },
       {
         capabilities: this.getCapabilities(),
         instructions: this.getSystemPrompt() + this.getLifecyclePromptSection(),
       },
     );
 
-    // 2. Register tools (all tool handlers check this.myId and defer if not registered yet)
+    // 3. Register tool handlers (they check this.myId and defer if not registered yet)
     this.registerTools();
 
-    // 3. Connect MCP over stdio — this completes the handshake with the client
+    // 4. Start broker registration in the BACKGROUND — don't block on MCP handshake
+    const brokerPromise = this.registerWithBroker();
+
+    // 5. Connect MCP over stdio — blocks until parent sends `initialize`
+    //    Broker registration runs concurrently with this wait.
     await this.mcp.connect(new StdioServerTransport());
     this.log("MCP connected (handshake complete)");
 
-    // === PHASE 2: BROKER REGISTRATION (can take time, client is already connected) ===
-
-    // 4. Ensure broker is running
-    await this.ensureBroker();
-
-    // 5. Gather context
-    this.myGitRoot = await getGitRoot(this.myCwd);
-    this.myTty = getTty();
-
-    this.log(`CWD: ${this.myCwd}`);
-    this.log(`Git root: ${this.myGitRoot ?? "(none)"}`);
-    this.log(`TTY: ${this.myTty ?? "(unknown)"}`);
-
-    // 6. Generate initial summary (non-blocking, 3s timeout)
-    let initialSummary = "";
-    const summaryPromise = (async () => {
-      try {
-        const branch = await getGitBranch(this.myCwd);
-        const recentFiles = await getRecentFiles(this.myCwd);
-        const summary = await generateSummary({
-          cwd: this.myCwd,
-          git_root: this.myGitRoot,
-          git_branch: branch,
-          recent_files: recentFiles,
-        });
-        if (summary) {
-          initialSummary = summary;
-          this.log(`Auto-summary: ${summary}`);
-        }
-      } catch (e) {
-        this.log(
-          `Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`,
-        );
-      }
-    })();
-
-    await Promise.race([
-      summaryPromise,
-      new Promise((r) => setTimeout(r, 3000)),
-    ]);
-
-    // 7. Register with broker
-    const regBody: Record<string, unknown> = {
-      pid: process.pid,
-      cwd: this.myCwd,
-      git_root: this.myGitRoot,
-      tty: this.myTty,
-      summary: initialSummary,
-      agent_type: this.agentType,
-    };
-    if (this.sessionId) {
-      regBody.session_id = this.sessionId;
-    }
-    if (this.sessionFile) {
-      regBody.reconnect = true;
-    }
-    // Pass orchestrator-assigned slot/role for explicit slot targeting
-    const envSlot = process.env.MULTIAGENTS_SLOT;
-    const envRole = process.env.MULTIAGENTS_ROLE;
-    const envName = process.env.MULTIAGENTS_NAME;
-    if (envSlot) {
-      regBody.slot_id = parseInt(envSlot, 10);
-    }
-    if (envRole) {
-      regBody.role = envRole;
-    }
-    if (envName) {
-      regBody.display_name = envName;
-    }
-
-    const reg = await this.broker.register(regBody as any);
-    this.myId = reg.id;
-    this.log(`Registered as peer ${this.myId}`);
-
-    // Handle slot matching
-    if (reg.slot) {
-      this.mySlot = reg.slot;
-      this.log(`Matched to slot ${reg.slot.id} (${reg.slot.display_name ?? "unnamed"})`);
-      this.restoreRoleContext(reg.slot);
-    } else if ((reg as any).choose_slot) {
-      // Multiple slot candidates — pick by role or take first
-      const candidates = (reg as any).choose_slot as { slot_id: number; role: string | null }[];
-      const match = envRole
-        ? candidates.find((c) => c.role === envRole) ?? candidates[0]
-        : candidates[0];
-      if (match) {
-        this.log(`Auto-selecting slot ${match.slot_id} from ${candidates.length} candidates`);
-        try {
-          const claimed = await this.broker.updateSlot({
-            id: match.slot_id,
-            peer_id: reg.id,
-            status: "connected",
-          });
-          if (claimed) {
-            this.mySlot = claimed;
-            this.restoreRoleContext(claimed);
-          }
-        } catch (e) {
-          this.log(`Failed to claim slot ${match.slot_id}: ${e}`);
-        }
-      }
-    }
-
-    // Deliver recap messages if reconnecting
-    if (reg.recap && reg.recap.length > 0) {
-      this.log(`Delivering ${reg.recap.length} recap message(s)`);
-      for (const msg of reg.recap) {
-        const enriched = await this.enrichMessage(msg);
-        await this.deliverMessage(enriched);
-      }
-    }
-
-    // If summary generation is still running, update when done
-    if (!initialSummary) {
-      summaryPromise.then(async () => {
-        if (initialSummary && this.myId) {
-          try {
-            await this.broker.setSummary(this.myId, initialSummary);
-            this.log(`Late auto-summary applied: ${initialSummary}`);
-          } catch {
-            // Non-critical
-          }
-        }
-      });
-    }
+    // 6. Ensure broker registration completed (it likely already did, but wait to be sure)
+    await brokerPromise;
 
     // === PHASE 3: START BACKGROUND LOOPS ===
 
-    // 8. Start poll loop
+    // 7. Start poll loop
     this.startPollLoop();
 
-    // 9. Start heartbeat
+    // 8. Start heartbeat
     this.startHeartbeat();
 
     // 10. Cleanup on exit
@@ -557,6 +454,119 @@ export abstract class BaseAdapter {
 
     process.on("SIGINT", cleanup);
     process.on("SIGTERM", cleanup);
+  }
+
+  // --- Broker registration (runs in parallel with MCP handshake) ---
+
+  private async registerWithBroker(): Promise<void> {
+    // 1. Ensure broker is running
+    await this.ensureBroker();
+
+    // 2. Gather context
+    this.myGitRoot = await getGitRoot(this.myCwd);
+    this.myTty = getTty();
+
+    this.log(`CWD: ${this.myCwd}`);
+    this.log(`Git root: ${this.myGitRoot ?? "(none)"}`);
+    this.log(`TTY: ${this.myTty ?? "(unknown)"}`);
+
+    // 3. Generate initial summary (non-blocking, 3s timeout)
+    let initialSummary = "";
+    try {
+      const summaryResult = await Promise.race([
+        (async () => {
+          const branch = await getGitBranch(this.myCwd);
+          const recentFiles = await getRecentFiles(this.myCwd);
+          return await generateSummary({
+            cwd: this.myCwd,
+            git_root: this.myGitRoot,
+            git_branch: branch,
+            recent_files: recentFiles,
+          });
+        })(),
+        new Promise<null>((r) => setTimeout(() => r(null), 3000)),
+      ]);
+      if (summaryResult) {
+        initialSummary = summaryResult;
+        this.log(`Auto-summary: ${initialSummary}`);
+      }
+    } catch (e) {
+      this.log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    // 4. Build registration body
+    const regBody: Record<string, unknown> = {
+      pid: process.pid,
+      cwd: this.myCwd,
+      git_root: this.myGitRoot,
+      tty: this.myTty,
+      summary: initialSummary,
+      agent_type: this.agentType,
+    };
+    if (this.sessionId) {
+      regBody.session_id = this.sessionId;
+    }
+    if (this.sessionFile) {
+      regBody.reconnect = true;
+    }
+    // Pass orchestrator-assigned slot/role for explicit slot targeting.
+    // BOTH slot_id AND session_id are required for the broker to match
+    // the pre-created slot (broker.ts handleRegister). The broker also
+    // has a fallback to infer session_id from the slot's own record.
+    const envSlot = process.env.MULTIAGENTS_SLOT;
+    const envRole = process.env.MULTIAGENTS_ROLE;
+    const envName = process.env.MULTIAGENTS_NAME;
+    if (envSlot) {
+      regBody.slot_id = parseInt(envSlot, 10);
+    }
+    if (envRole) {
+      regBody.role = envRole;
+    }
+    if (envName) {
+      regBody.display_name = envName;
+    }
+
+    // 5. Register with broker
+    const reg = await this.broker.register(regBody as any);
+    this.myId = reg.id;
+    this.log(`Registered as peer ${this.myId}`);
+
+    // 6. Handle slot matching
+    if (reg.slot) {
+      this.mySlot = reg.slot;
+      this.log(`Matched to slot ${reg.slot.id} (${reg.slot.display_name ?? "unnamed"})`);
+      this.restoreRoleContext(reg.slot);
+    } else if ((reg as any).choose_slot) {
+      const candidates = (reg as any).choose_slot as { slot_id: number; role: string | null }[];
+      const match = envRole
+        ? candidates.find((c) => c.role === envRole) ?? candidates[0]
+        : candidates[0];
+      if (match) {
+        this.log(`Auto-selecting slot ${match.slot_id} from ${candidates.length} candidates`);
+        try {
+          const claimed = await this.broker.updateSlot({
+            id: match.slot_id,
+            peer_id: reg.id,
+            status: "connected",
+          });
+          if (claimed) {
+            this.mySlot = claimed;
+            this.restoreRoleContext(claimed);
+          }
+        } catch (e) {
+          this.log(`Failed to claim slot ${match.slot_id}: ${e}`);
+        }
+      }
+    }
+
+    // 7. Deliver recap messages if reconnecting
+    if (reg.recap && reg.recap.length > 0) {
+      this.log(`Delivering ${reg.recap.length} recap message(s)`);
+      for (const msg of reg.recap) {
+        const enriched = await this.enrichMessage(msg);
+        await this.deliverMessage(enriched);
+      }
+    }
   }
 
   // --- Broker lifecycle ---
@@ -587,14 +597,15 @@ export abstract class BaseAdapter {
 
   private readSessionFile(): void {
     try {
-      const file = Bun.file(SESSION_FILE);
-      // Synchronous check — Bun.file doesn't throw if missing, but reading will
-      const text = require("fs").readFileSync(SESSION_FILE, "utf-8");
+      // Resolve relative to CWD — the orchestrator writes the file into
+      // projectDir/.multiagents/session.json and spawns agents with cwd=projectDir.
+      const sessionPath = require("path").resolve(process.cwd(), SESSION_FILE);
+      const text = require("fs").readFileSync(sessionPath, "utf-8");
       this.sessionFile = JSON.parse(text) as SessionFile;
       this.sessionId = this.sessionFile.session_id;
-      this.log(`Session file found: ${this.sessionId}`);
+      this.log(`Session file found: ${this.sessionId} (from ${sessionPath})`);
     } catch {
-      // No session file — standalone mode
+      // No session file — standalone mode or env vars will provide session info
     }
   }
 

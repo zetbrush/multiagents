@@ -121,7 +121,7 @@ export async function respawnAgent(
   slotId: number,
   brokerClient: BrokerClient,
   projectDir: string,
-): Promise<{ pid: number }> {
+): Promise<{ pid: number; process: import("bun").Subprocess }> {
   // Get the crashed slot's info
   const slot = await brokerClient.getSlot(slotId);
   const snapshot = safeJsonParse<{ last_summary?: string; last_status?: string }>(
@@ -167,5 +167,5 @@ export async function respawnAgent(
 
   log(LOG_PREFIX, `Respawned into existing slot ${slotId} (PID ${result.pid})`);
 
-  return { pid: result.pid };
+  return { pid: result.pid, process: result.process };
 }

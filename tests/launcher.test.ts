@@ -105,16 +105,16 @@ describe("buildCliArgs — claude", () => {
     const mcpJson = args[idx + 1];
     const parsed = JSON.parse(mcpJson);
     expect(parsed.mcpServers).toBeDefined();
-    expect(parsed.mcpServers["multiagents"]).toBeDefined();
-    expect(parsed.mcpServers["multiagents"].command).toBe("bun");
-    expect(parsed.mcpServers["multiagents"].args).toBeArray();
-    expect(parsed.mcpServers["multiagents"].args).toContain("mcp-server");
+    expect(parsed.mcpServers["multiagents-peer"]).toBeDefined();
+    expect(parsed.mcpServers["multiagents-peer"].command).toBe("bun");
+    expect(parsed.mcpServers["multiagents-peer"].args).toBeArray();
+    expect(parsed.mcpServers["multiagents-peer"].args).toContain("mcp-server");
   });
 
   test("--mcp-config JSON points to correct agent type", () => {
     const args = buildCliArgs("claude", task);
     const mcpJson = JSON.parse(args[args.indexOf("--mcp-config") + 1]);
-    expect(mcpJson.mcpServers["multiagents"].args).toContain("claude");
+    expect(mcpJson.mcpServers["multiagents-peer"].args).toContain("claude");
   });
 
   test("ends with -p and the task", () => {
@@ -167,11 +167,11 @@ describe("buildCliArgs — codex", () => {
       if (args[i] === "-c") cFlags.push(args[i + 1]);
     }
 
-    const commandFlag = cFlags.find((f) => f.startsWith("mcp_servers.multiagents.command="));
+    const commandFlag = cFlags.find((f) => f.startsWith('mcp_servers."multiagents-peer".command='));
     expect(commandFlag).toBeDefined();
     expect(commandFlag).toContain('"bun"');
 
-    const argsFlag = cFlags.find((f) => f.startsWith("mcp_servers.multiagents.args="));
+    const argsFlag = cFlags.find((f) => f.startsWith('mcp_servers."multiagents-peer".args='));
     expect(argsFlag).toBeDefined();
     // Should be valid JSON array
     const argsValue = argsFlag!.split("=").slice(1).join("=");
@@ -190,7 +190,7 @@ describe("buildCliArgs — codex", () => {
 
     // Should only have multiagents and model_reasoning_effort overrides
     const nonMultiagent = cFlags.filter(
-      (f) => !f.startsWith("mcp_servers.multiagents.") && !f.startsWith("model_reasoning_effort")
+      (f) => !f.startsWith('mcp_servers."multiagents-peer".') && !f.startsWith("model_reasoning_effort")
     );
     expect(nonMultiagent).toEqual([]);
   });
@@ -251,7 +251,7 @@ describe("buildCliArgs — gemini", () => {
     const args = buildCliArgs("gemini", task);
     const idx = args.indexOf("--allowed-mcp-server-names");
     expect(idx).toBeGreaterThan(-1);
-    expect(args[idx + 1]).toBe("multiagents");
+    expect(args[idx + 1]).toBe("multiagents-peer");
   });
 
   test("ends with -p and the task", () => {
@@ -284,9 +284,9 @@ describe("ensureMcpConfigs — Claude .mcp.json", () => {
 
     const config = JSON.parse(fs.readFileSync(mcpPath, "utf-8"));
     expect(config.mcpServers).toBeDefined();
-    expect(config.mcpServers["multiagents"]).toBeDefined();
-    expect(config.mcpServers["multiagents"].command).toBe("bun");
-    expect(config.mcpServers["multiagents"].args).toContain("mcp-server");
+    expect(config.mcpServers["multiagents-peer"]).toBeDefined();
+    expect(config.mcpServers["multiagents-peer"].command).toBe("bun");
+    expect(config.mcpServers["multiagents-peer"].args).toContain("mcp-server");
   });
 
   test("preserves existing mcpServers entries", async () => {
@@ -304,7 +304,7 @@ describe("ensureMcpConfigs — Claude .mcp.json", () => {
     const config = JSON.parse(fs.readFileSync(mcpPath, "utf-8"));
     expect(config.mcpServers["my-custom-server"]).toBeDefined();
     expect(config.mcpServers["my-custom-server"].command).toBe("node");
-    expect(config.mcpServers["multiagents"]).toBeDefined();
+    expect(config.mcpServers["multiagents-peer"]).toBeDefined();
   });
 
   test("overwrites stale multiagents entry with fresh config", async () => {
@@ -319,8 +319,10 @@ describe("ensureMcpConfigs — Claude .mcp.json", () => {
     await ensureMcpConfigs(tmpDir, "test-session");
 
     const config = JSON.parse(fs.readFileSync(mcpPath, "utf-8"));
-    expect(config.mcpServers["multiagents"].command).toBe("bun");
-    expect(config.mcpServers["multiagents"].args).not.toContain("stale");
+    // Old "multiagents" entry should be removed, replaced by "multiagents-peer"
+    expect(config.mcpServers["multiagents"]).toBeUndefined();
+    expect(config.mcpServers["multiagents-peer"].command).toBe("bun");
+    expect(config.mcpServers["multiagents-peer"].args).not.toContain("stale");
   });
 });
 
@@ -335,20 +337,23 @@ describe("ensureMcpConfigs — Codex .codex/config.toml", () => {
     expect(fs.existsSync(tomlPath)).toBe(true);
 
     const content = fs.readFileSync(tomlPath, "utf-8");
-    expect(content).toContain("[mcp_servers.multiagents]");
+    expect(content).toContain('[mcp_servers."multiagents-peer"]');
     expect(content).toContain('command = "bun"');
     expect(content).toContain("mcp-server");
     expect(content).toContain("codex");
   });
 
-  test("does not duplicate multiagents if already present", async () => {
+  test("does not duplicate multiagents-peer if already present", async () => {
     // Run twice
     await ensureMcpConfigs(tmpDir, "test-session");
     await ensureMcpConfigs(tmpDir, "test-session");
 
     const content = fs.readFileSync(path.join(tmpDir, ".codex", "config.toml"), "utf-8");
-    const matches = content.match(/\[mcp_servers\.multiagents\]/g);
-    expect(matches).toHaveLength(1);
+    const matches = content.match(/multiagents-peer/g);
+    expect(matches!.length).toBeGreaterThanOrEqual(1);
+    // Should only have ONE section header
+    const sections = content.match(/\[mcp_servers\."multiagents-peer"\]/g);
+    expect(sections).toHaveLength(1);
   });
 
   test("preserves existing codex config content", async () => {
@@ -363,7 +368,7 @@ describe("ensureMcpConfigs — Codex .codex/config.toml", () => {
 
     const content = fs.readFileSync(path.join(codexDir, "config.toml"), "utf-8");
     expect(content).toContain('model = "gpt-5.4"');
-    expect(content).toContain("[mcp_servers.multiagents]");
+    expect(content).toContain('[mcp_servers."multiagents-peer"]');
   });
 });
 
@@ -512,14 +517,14 @@ describe("MCP config consistency across agent types", () => {
     const claudeMcpJson = JSON.parse(
       claudeCliArgs[claudeCliArgs.indexOf("--mcp-config") + 1],
     );
-    const claudeMcpArgs = claudeMcpJson.mcpServers["multiagents"].args;
+    const claudeMcpArgs = claudeMcpJson.mcpServers["multiagents-peer"].args;
 
     // Extract Codex's MCP args from -c flag
     const cFlags: string[] = [];
     for (let i = 0; i < codexCliArgs.length; i++) {
       if (codexCliArgs[i] === "-c") cFlags.push(codexCliArgs[i + 1]);
     }
-    const codexArgsFlag = cFlags.find((f) => f.startsWith("mcp_servers.multiagents.args="))!;
+    const codexArgsFlag = cFlags.find((f) => f.startsWith('mcp_servers."multiagents-peer".args='))!;
     const codexMcpArgs = JSON.parse(codexArgsFlag.split("=").slice(1).join("="));
 
     // Both should reference the same cli.ts path

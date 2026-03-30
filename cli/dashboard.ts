@@ -11,12 +11,19 @@
 import { DEFAULT_BROKER_PORT, BROKER_HOSTNAME, SESSION_FILE, DASHBOARD_REFRESH } from "../shared/constants.ts";
 import { BrokerClient, type PlanState, type PlanItem } from "../shared/broker-client.ts";
 import { formatDuration, formatTime, truncate } from "../shared/utils.ts";
-import type { Session, Slot, Peer, Message, FileLock, GuardrailState, SessionFile } from "../shared/types.ts";
+import type { Session, Slot, Peer, Message, FileLock, FileOwnership, GuardrailState, SessionFile } from "../shared/types.ts";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
 const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
 const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
+
+// Read version from package.json at startup
+let PKG_VERSION = "?";
+try {
+  const pkgPath = path.resolve(import.meta.dir, "../package.json");
+  PKG_VERSION = JSON.parse(fs.readFileSync(pkgPath, "utf-8")).version ?? "?";
+} catch { /* ok */ }
 
 // --- ANSI helpers ---
 const ESC = "\x1b";
@@ -42,6 +49,7 @@ const INVERSE = `${ESC}[7m`;
 function colorStatus(status: string): string {
   switch (status) {
     case "connected": case "active": case "ok": return `${GREEN}${status}${RESET}`;
+    case "starting": case "launching": return `${CYAN}${status}${RESET}`;
     case "disconnected": case "paused": case "warning": return `${YELLOW}${status}${RESET}`;
     case "archived": case "triggered": case "error": return `${RED}${status}${RESET}`;
     default: return status;
@@ -156,6 +164,7 @@ interface DashboardState {
   messages: Message[];
   guardrails: GuardrailState[];
   fileLocks: FileLock[];
+  fileOwnership: FileOwnership[];
   planState: PlanState | null;
   brokerAlive: boolean;
   error: string | null;
@@ -196,6 +205,7 @@ export async function dashboard(sessionId?: string): Promise<void> {
     messages: [],
     guardrails: [],
     fileLocks: [],
+    fileOwnership: [],
     planState: null,
     brokerAlive: true,
     error: null,
@@ -447,12 +457,13 @@ async function fetchState(client: BrokerClient, sessionId: string | null, state:
     state.allPeers = allPeers;
 
     if (sessionId) {
-      const [session, slots, messages, guardrails, fileLocks, planState] = await Promise.all([
+      const [session, slots, messages, guardrails, fileLocks, fileOwnership, planState] = await Promise.all([
         client.getSession(sessionId).catch(() => null),
         client.listSlots(sessionId).catch(() => [] as Slot[]),
         client.getMessageLog(sessionId, { limit: 100 }).catch(() => [] as Message[]),
         client.getGuardrails(sessionId).catch(() => [] as GuardrailState[]),
         client.listFileLocks(sessionId).catch(() => [] as FileLock[]),
+        client.listFileOwnership(sessionId).catch(() => [] as FileOwnership[]),
         client.getPlan(sessionId).catch(() => null as PlanState | null),
       ]);
 
@@ -461,6 +472,7 @@ async function fetchState(client: BrokerClient, sessionId: string | null, state:
       state.messages = messages;
       state.guardrails = guardrails;
       state.fileLocks = fileLocks;
+      state.fileOwnership = fileOwnership;
       state.planState = planState;
     } else {
       state.session = null;
@@ -468,6 +480,7 @@ async function fetchState(client: BrokerClient, sessionId: string | null, state:
       state.messages = [];
       state.guardrails = [];
       state.fileLocks = [];
+      state.fileOwnership = [];
       state.planState = null;
     }
 
@@ -496,7 +509,12 @@ function resolveSlots(state: DashboardState, sid: string | null): Map<number, { 
         matchedPeerIds.add(slotMatch.id);
         result.set(slot.id, { status: "connected", peer: slotMatch });
       } else {
-        result.set(slot.id, { status: slot.status, peer: null });
+        // Distinguish "starting" (never connected) from "disconnected" (was connected, now gone)
+        let displayStatus = slot.status;
+        if (slot.status === "disconnected" && !slot.last_connected) {
+          displayStatus = "starting";
+        }
+        result.set(slot.id, { status: displayStatus, peer: null });
       }
     }
   }
@@ -530,7 +548,8 @@ function render(state: DashboardState, sid: string | null): void {
   }
 
   const title = `${brokerDot} ${BOLD}${CYAN}${state.session?.name ?? sid ?? "multiagents"}${RESET}`;
-  lines.push(` ${title}  ${headerRight}`);
+  const versionTag = `${DIM}v${PKG_VERSION}${RESET}`;
+  lines.push(` ${title}  ${headerRight}  ${versionTag}`);
 
   // === TAB BAR ===
   let tabBar = " ";
@@ -615,7 +634,8 @@ function getBadge(tab: Tab, state: DashboardState): string {
       return "";
     }
     case "files":
-      return state.fileLocks.length > 0 ? ` ${DIM}${state.fileLocks.length}${RESET}` : "";
+      const fileCount = state.fileLocks.length + state.fileOwnership.length;
+      return fileCount > 0 ? ` ${DIM}${fileCount}${RESET}` : "";
     default:
       return "";
   }
@@ -753,11 +773,7 @@ function renderMessagesTab(state: DashboardState, cols: number, maxRows: number,
 
 // === TAB: STATS ===
 function renderStatsTab(state: DashboardState, cols: number, maxRows: number, lines: string[]): void {
-  if (state.guardrails.length === 0) {
-    lines.push("");
-    lines.push(`${DIM}  No stats available${RESET}`);
-    return;
-  }
+  let hasContent = false;
 
   // Separate monitoring stats from enforced guardrails
   const monitorStats = state.guardrails.filter((g) => g.action === "monitor");
@@ -765,11 +781,11 @@ function renderStatsTab(state: DashboardState, cols: number, maxRows: number, li
 
   // --- Monitoring stats section ---
   if (monitorStats.length > 0) {
+    hasContent = true;
     lines.push("");
     lines.push(`${BOLD} Session Metrics${RESET}`);
     lines.push("");
 
-    // Render stats in a compact grid (2 columns if terminal is wide enough)
     const wide = cols >= 80;
     const items: string[] = [];
 
@@ -780,7 +796,6 @@ function renderStatsTab(state: DashboardState, cols: number, maxRows: number, li
     }
 
     if (wide && items.length > 1) {
-      // 2-column layout
       const mid = Math.ceil(items.length / 2);
       for (let i = 0; i < mid; i++) {
         const left = items[i] ?? "";
@@ -792,86 +807,95 @@ function renderStatsTab(state: DashboardState, cols: number, maxRows: number, li
         lines.push(item);
       }
     }
+  }
 
-    // Token usage section
-    const slotsWithTokens = state.slots.filter((s) => (s.input_tokens ?? 0) + (s.output_tokens ?? 0) > 0);
-    if (slotsWithTokens.length > 0) {
+  // --- Token usage section (always rendered, independent of guardrails) ---
+  const slotsWithTokens = state.slots.filter((s) => (s.input_tokens ?? 0) + (s.output_tokens ?? 0) > 0);
+  if (slotsWithTokens.length > 0) {
+    hasContent = true;
+    lines.push("");
+    lines.push(`${BOLD} Token Usage${RESET}`);
+    lines.push("");
+
+    let totalInput = 0;
+    let totalOutput = 0;
+    let totalCache = 0;
+
+    for (const slot of slotsWithTokens) {
+      const inp = slot.input_tokens ?? 0;
+      const out = slot.output_tokens ?? 0;
+      const cache = slot.cache_read_tokens ?? 0;
+      totalInput += inp;
+      totalOutput += out;
+      totalCache += cache;
+
+      const name = truncate(slot.display_name ?? `Slot ${slot.id}`, 16);
+      const inStr = formatTokenCount(inp);
+      const outStr = formatTokenCount(out);
+      const cacheStr = cache > 0 ? `  ${DIM}cache:${RESET} ${formatTokenCount(cache)}` : "";
+      lines.push(`  ${name.padEnd(18)} ${DIM}in:${RESET} ${CYAN}${inStr.padStart(7)}${RESET}  ${DIM}out:${RESET} ${GREEN}${outStr.padStart(7)}${RESET}${cacheStr}`);
+    }
+
+    lines.push(`${DIM}  ${"─".repeat(50)}${RESET}`);
+    const totalStr = formatTokenCount(totalInput + totalOutput);
+    const cacheStr = totalCache > 0 ? `  ${DIM}cache:${RESET} ${formatTokenCount(totalCache)}` : "";
+    lines.push(`  ${"Total".padEnd(18)} ${DIM}in:${RESET} ${CYAN}${formatTokenCount(totalInput).padStart(7)}${RESET}  ${DIM}out:${RESET} ${GREEN}${formatTokenCount(totalOutput).padStart(7)}${RESET}${cacheStr}  ${BOLD}= ${totalStr}${RESET}`);
+  } else {
+    // Show placeholder with slot names even before tokens arrive
+    if (state.slots.length > 0) {
+      hasContent = true;
       lines.push("");
       lines.push(`${BOLD} Token Usage${RESET}`);
       lines.push("");
-
-      let totalInput = 0;
-      let totalOutput = 0;
-      let totalCache = 0;
-
-      for (const slot of slotsWithTokens) {
-        const inp = slot.input_tokens ?? 0;
-        const out = slot.output_tokens ?? 0;
-        const cache = slot.cache_read_tokens ?? 0;
-        totalInput += inp;
-        totalOutput += out;
-        totalCache += cache;
-
+      for (const slot of state.slots) {
         const name = truncate(slot.display_name ?? `Slot ${slot.id}`, 16);
-        const inStr = formatTokenCount(inp);
-        const outStr = formatTokenCount(out);
-        const cacheStr = cache > 0 ? `  ${DIM}cache:${RESET} ${formatTokenCount(cache)}` : "";
-        lines.push(`  ${name.padEnd(18)} ${DIM}in:${RESET} ${CYAN}${inStr.padStart(7)}${RESET}  ${DIM}out:${RESET} ${GREEN}${outStr.padStart(7)}${RESET}${cacheStr}`);
+        lines.push(`  ${name.padEnd(18)} ${DIM}in:${RESET} ${CYAN}${"0".padStart(7)}${RESET}  ${DIM}out:${RESET} ${GREEN}${"0".padStart(7)}${RESET}`);
       }
+    }
+  }
 
-      // Totals row
-      lines.push(`${DIM}  ${"─".repeat(50)}${RESET}`);
-      const totalStr = formatTokenCount(totalInput + totalOutput);
-      const cacheStr = totalCache > 0 ? `  ${DIM}cache:${RESET} ${formatTokenCount(totalCache)}` : "";
-      lines.push(`  ${"Total".padEnd(18)} ${DIM}in:${RESET} ${CYAN}${formatTokenCount(totalInput).padStart(7)}${RESET}  ${DIM}out:${RESET} ${GREEN}${formatTokenCount(totalOutput).padStart(7)}${RESET}${cacheStr}  ${BOLD}= ${totalStr}${RESET}`);
+  // --- Interaction summary (always rendered, independent of guardrails) ---
+  if (state.messages.length > 0) {
+    hasContent = true;
+    lines.push("");
+    lines.push(`${BOLD} Interaction Summary${RESET}`);
+    lines.push("");
+
+    const slotMap = new Map(state.slots.map((s) => [s.id, s]));
+    const senderCounts = new Map<string, number>();
+    const interactions = new Map<string, number>();
+
+    for (const m of state.messages) {
+      const fromName = (m as any).from_display_name ?? slotMap.get(m.from_slot_id ?? -1)?.display_name ?? m.from_id ?? "system";
+      const toName = (m as any).to_display_name ?? (m.to_slot_id != null ? slotMap.get(m.to_slot_id)?.display_name : null) ?? "broadcast";
+
+      senderCounts.set(fromName, (senderCounts.get(fromName) ?? 0) + 1);
+
+      if (fromName !== "orchestrator") {
+        const key = `${fromName} → ${toName}`;
+        interactions.set(key, (interactions.get(key) ?? 0) + 1);
+      }
     }
 
-    // Interaction summary
-    if (state.messages.length > 0) {
+    const topSenders = [...senderCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6);
+
+    for (const [name, count] of topSenders) {
+      const bar = "█".repeat(Math.min(20, Math.round(count / Math.max(1, topSenders[0][1]) * 20)));
+      lines.push(`  ${name.padEnd(18)} ${CYAN}${bar}${RESET} ${DIM}${count}${RESET}`);
+    }
+
+    if (interactions.size > 0) {
       lines.push("");
-      lines.push(`${BOLD} Interaction Summary${RESET}`);
+      lines.push(`${BOLD} Top Interactions${RESET}`);
       lines.push("");
-
-      const slotMap = new Map(state.slots.map((s) => [s.id, s]));
-      // Count messages per sender
-      const senderCounts = new Map<string, number>();
-      // Count unique interactions (sender→recipient pairs)
-      const interactions = new Map<string, number>();
-
-      for (const m of state.messages) {
-        const fromName = (m as any).from_display_name ?? slotMap.get(m.from_slot_id ?? -1)?.display_name ?? m.from_id ?? "system";
-        const toName = (m as any).to_display_name ?? (m.to_slot_id != null ? slotMap.get(m.to_slot_id)?.display_name : null) ?? "broadcast";
-
-        senderCounts.set(fromName, (senderCounts.get(fromName) ?? 0) + 1);
-
-        if (fromName !== "orchestrator") {
-          const key = `${fromName} → ${toName}`;
-          interactions.set(key, (interactions.get(key) ?? 0) + 1);
-        }
-      }
-
-      // Top senders
-      const topSenders = [...senderCounts.entries()]
+      const topInteractions = [...interactions.entries()]
         .sort((a, b) => b[1] - a[1])
-        .slice(0, 6);
+        .slice(0, 5);
 
-      for (const [name, count] of topSenders) {
-        const bar = "█".repeat(Math.min(20, Math.round(count / Math.max(1, topSenders[0][1]) * 20)));
-        lines.push(`  ${name.padEnd(18)} ${CYAN}${bar}${RESET} ${DIM}${count}${RESET}`);
-      }
-
-      // Top interactions
-      if (interactions.size > 0) {
-        lines.push("");
-        lines.push(`${BOLD} Top Interactions${RESET}`);
-        lines.push("");
-        const topInteractions = [...interactions.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 5);
-
-        for (const [pair, count] of topInteractions) {
-          lines.push(`  ${DIM}${String(count).padStart(4)}×${RESET}  ${pair}`);
-        }
+      for (const [pair, count] of topInteractions) {
+        lines.push(`  ${DIM}${String(count).padStart(4)}×${RESET}  ${pair}`);
       }
     }
   }
@@ -909,6 +933,11 @@ function renderStatsTab(state: DashboardState, cols: number, maxRows: number, li
         lines.push(`  ${DIM}└─ Press ${RESET}${BOLD}+/-${RESET}${DIM} to adjust:${RESET} ${opts} ${g.unit}`);
       }
     }
+  }
+
+  if (!hasContent) {
+    lines.push("");
+    lines.push(`${DIM}  No stats available yet — token data will appear as agents work${RESET}`);
   }
 }
 
@@ -997,23 +1026,47 @@ function renderPlanTab(state: DashboardState, cols: number, maxRows: number, lin
 
 // === TAB: FILES ===
 function renderFilesTab(state: DashboardState, cols: number, maxRows: number, lines: string[]): void {
-  if (state.fileLocks.length === 0) {
+  const slotMap = new Map(state.slots.map((s) => [s.id, s]));
+  let hasContent = false;
+
+  // --- Ownership zones (persistent assignments from create_team) ---
+  if (state.fileOwnership.length > 0) {
+    hasContent = true;
     lines.push("");
-    lines.push(`${DIM}  No active file locks${RESET}`);
-    return;
+    lines.push(`${BOLD} Ownership Zones${RESET}`);
+    lines.push("");
+    lines.push(`${DIM} ${"Pattern".padEnd(40)}${"Owner".padEnd(22)}${"Assigned By"}${RESET}`);
+    lines.push(`${DIM} ${"─".repeat(Math.min(cols - 2, 72))}${RESET}`);
+
+    for (const own of state.fileOwnership) {
+      const pattern = truncate(own.path_pattern, 38);
+      const slot = slotMap.get(own.slot_id);
+      const owner = truncate(slot?.display_name ?? `Slot ${own.slot_id}`, 20);
+      const by = truncate(own.assigned_by, 14);
+      lines.push(` ${pattern.padEnd(40)}${owner.padEnd(22)}${DIM}${by}${RESET}`);
+    }
   }
 
-  lines.push("");
-  lines.push(`${DIM} ${"File".padEnd(45)}${"Held By".padEnd(20)}${"Type".padEnd(12)}${RESET}`);
-  lines.push(`${DIM} ${"─".repeat(Math.min(cols - 2, 77))}${RESET}`);
+  // --- Active file locks (transient, held during edits) ---
+  if (state.fileLocks.length > 0) {
+    hasContent = true;
+    lines.push("");
+    lines.push(`${BOLD} Active Locks${RESET}`);
+    lines.push("");
+    lines.push(`${DIM} ${"File".padEnd(40)}${"Held By".padEnd(22)}${"Type"}${RESET}`);
+    lines.push(`${DIM} ${"─".repeat(Math.min(cols - 2, 72))}${RESET}`);
 
-  const slotMap = new Map(state.slots.map((s) => [s.id, s]));
+    for (const lock of state.fileLocks) {
+      const file = truncate(lock.file_path, 38);
+      const slot = slotMap.get(lock.held_by_slot);
+      const holder = truncate(slot?.display_name ?? `Slot ${lock.held_by_slot}`, 20);
+      lines.push(` ${file.padEnd(40)}${holder.padEnd(22)}${DIM}${lock.lock_type}${RESET}`);
+    }
+  }
 
-  for (const lock of state.fileLocks) {
-    const file = truncate(lock.file_path, 43);
-    const slot = slotMap.get(lock.held_by_slot);
-    const holder = truncate(slot?.display_name ?? `Slot ${lock.held_by_slot}`, 18);
-    const type = lock.lock_type;
-    lines.push(` ${file.padEnd(45)}${holder.padEnd(20)}${DIM}${type}${RESET}`);
+  if (!hasContent) {
+    lines.push("");
+    lines.push(`${DIM}  No file ownership or active locks${RESET}`);
+    lines.push(`${DIM}  Assign file_ownership in create_team to see ownership zones here${RESET}`);
   }
 }

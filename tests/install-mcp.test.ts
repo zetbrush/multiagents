@@ -91,10 +91,14 @@ describe("install-mcp / preuninstall", () => {
     const codexToml = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf-8");
     expect(codexToml).toContain("[mcp_servers.multiagents]");
     expect(codexToml).toContain('default_approval_mode = "approve"');
-    expect(codexToml).toContain('args = ["--agent-type", "codex"]');
+    // Args now include server.ts path + agent type (self-resolving paths)
+    expect(codexToml).toContain('"--agent-type", "codex"');
+    expect(codexToml).toContain("server.ts");
 
     const geminiSettings = JSON.parse(fs.readFileSync(path.join(home, ".gemini", "settings.json"), "utf-8"));
-    expect(geminiSettings.mcpServers.multiagents.args).toEqual(["--agent-type", "gemini"]);
+    // Gemini args: [server.ts path, "--agent-type", "gemini"]
+    expect(geminiSettings.mcpServers.multiagents.args).toContain("--agent-type");
+    expect(geminiSettings.mcpServers.multiagents.args).toContain("gemini");
     expect(geminiSettings.mcpServers.multiagents.timeout).toBe(30000);
     expect(geminiSettings.mcpServers.multiagents.trust).toBe(true);
 
@@ -103,7 +107,7 @@ describe("install-mcp / preuninstall", () => {
 
     const cleanedCodex = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf-8");
     expect(cleanedCodex).not.toContain("[mcp_servers.multiagents]");
-    expect(cleanedCodex).not.toContain('args = ["--agent-type", "codex"]');
+    expect(cleanedCodex).not.toContain("--agent-type");
   });
 
   test("does not overwrite malformed ~/.claude.json when Claude CLI add fails", () => {

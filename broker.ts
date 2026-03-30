@@ -360,20 +360,29 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   }
 
   // Explicit slot targeting — when orchestrator passes a specific slot_id
-  if (body.slot_id && body.session_id) {
+  // Resolve session_id: explicit > inferred from the slot's own record.
+  // This fallback covers sandboxed agents (Codex, Gemini) that may lose
+  // MULTIAGENTS_SESSION env var but still have MULTIAGENTS_SLOT.
+  let effectiveSessionId = body.session_id;
+  if (body.slot_id && !effectiveSessionId) {
+    const slotRow = db.query("SELECT session_id FROM slots WHERE id = ?").get(body.slot_id) as { session_id: string } | null;
+    if (slotRow) effectiveSessionId = slotRow.session_id;
+  }
+
+  if (body.slot_id && effectiveSessionId) {
     const targetSlot = db.query(
       "SELECT * FROM slots WHERE id = ? AND session_id = ?"
-    ).get(body.slot_id, body.session_id) as Slot | null;
+    ).get(body.slot_id, effectiveSessionId) as Slot | null;
 
     if (targetSlot) {
-      insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, body.session_id, targetSlot.id, agentType, "idle");
+      insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, effectiveSessionId, targetSlot.id, agentType, "idle");
       db.run(
         "UPDATE slots SET peer_id = ?, status = 'connected', last_connected = ?, last_peer_pid = ? WHERE id = ?",
         [id, nowMs, body.pid, targetSlot.id]
       );
       const recap = db.query(
         "SELECT * FROM messages WHERE session_id = ? AND to_slot_id = ? ORDER BY sent_at DESC LIMIT ?"
-      ).all(body.session_id, targetSlot.id, RECONNECT_RECAP_LIMIT) as Message[];
+      ).all(effectiveSessionId, targetSlot.id, RECONNECT_RECAP_LIMIT) as Message[];
       recap.reverse();
       const updatedSlot = db.query("SELECT * FROM slots WHERE id = ?").get(targetSlot.id) as Slot;
       return { id, slot: updatedSlot, recap };
@@ -721,7 +730,10 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
 
   if (body.paused !== undefined) { fields.push("paused = ?"); values.push(body.paused ? 1 : 0); }
   if (body.paused_at !== undefined) { fields.push("paused_at = ?"); values.push(body.paused_at); }
-  if (body.status !== undefined) { fields.push("status = ?"); values.push(body.status); }
+  // Only accept valid slot statuses — reject "archived" or other ghost values
+  if (body.status !== undefined && (body.status === "connected" || body.status === "disconnected")) {
+    fields.push("status = ?"); values.push(body.status);
+  }
   if (body.context_snapshot !== undefined) { fields.push("context_snapshot = ?"); values.push(body.context_snapshot); }
   if (body.display_name !== undefined) { fields.push("display_name = ?"); values.push(body.display_name); }
   if (body.role !== undefined) { fields.push("role = ?"); values.push(body.role); }
@@ -736,6 +748,22 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
     db.run(`UPDATE slots SET ${fields.join(", ")} WHERE id = ?`, values);
   }
   return (db.query("SELECT * FROM slots WHERE id = ?").get(body.id) as Slot) ?? null;
+}
+
+/** Delete a slot and its associated file locks, ownership, and orphaned peer. */
+function handleDeleteSlot(body: { id: number }): { ok: boolean; deleted: boolean } {
+  const existing = db.query("SELECT id, peer_id FROM slots WHERE id = ?").get(body.id) as { id: number; peer_id: string | null } | null;
+  if (!existing) return { ok: true, deleted: false };
+
+  // Clean up associated data (file_locks uses "held_by_slot", not "slot_id")
+  db.run("DELETE FROM file_locks WHERE held_by_slot = ?", [body.id]);
+  db.run("DELETE FROM file_ownership WHERE slot_id = ?", [body.id]);
+  // Remove the orphaned peer record if any
+  if (existing.peer_id) {
+    db.run("DELETE FROM peers WHERE id = ?", [existing.peer_id]);
+  }
+  db.run("DELETE FROM slots WHERE id = ?", [body.id]);
+  return { ok: true, deleted: true };
 }
 
 // --- File locks & ownership ---
@@ -1176,6 +1204,8 @@ Bun.serve({
           const updatedSlot = handleUpdateSlot(body as UpdateSlotRequest);
           return updatedSlot ? Response.json(updatedSlot) : Response.json({ error: "Slot not found" }, { status: 404 });
         }
+        case "/slots/delete":
+          return Response.json(handleDeleteSlot(body as { id: number }));
 
         // --- File coordination ---
         case "/files/acquire":

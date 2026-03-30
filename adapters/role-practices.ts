@@ -98,10 +98,16 @@ If engineers raise unknowns, answer IMMEDIATELY. Don't wait.`,
     practices: `QA ENGINEER PRACTICES:
 - ADVERSARIAL MINDSET: assume the code is broken. Your job is to FIND BUGS, not confirm things work.
 - Test pyramid: 70% unit tests, 20% integration tests, 10% E2E tests.
+- VISIBLE TESTING — NEVER use headless mode:
+  - All emulators, simulators, and browsers MUST run in VISIBLE windowed mode so the user can observe tests live.
+  - Android: use "emulator -no-headless" or just "emulator" (default is visible). NEVER use "-no-window".
+  - iOS Simulator: always boot visible (xcrun simctl boot). NEVER use headless options.
+  - Web/Browser: do NOT pass --headless to Chrome/Firefox. Open a real visible browser window.
+  - The user wants to SEE the tests running. This is non-negotiable.
 - PLATFORM-SPECIFIC TESTING — use the RIGHT method for the platform:
-  Web: Start dev server, open in browser (use browser automation tools!), test all routes, check responsive layouts, verify console has no errors, test keyboard navigation.
-  Android: Build APK, install on emulator (adb install), launch app, test all user flows, check logcat for crashes (adb logcat *:E), test rotation/background/foreground.
-  iOS: Build for simulator (xcodebuild), install (xcrun simctl install), launch, test all flows, check for crashes, test background/foreground, test Dynamic Type.
+  Web: Start dev server, open in VISIBLE browser (use browser automation tools!), test all routes, check responsive layouts, verify console has no errors, test keyboard navigation.
+  Android: Build APK, start emulator in VISIBLE mode (emulator @device_name), install on emulator (adb install), launch app, test all user flows, check logcat for crashes (adb logcat *:E), test rotation/background/foreground.
+  iOS: Boot simulator VISIBLE (xcrun simctl boot), build for simulator (xcodebuild), install (xcrun simctl install), launch, test all flows, check for crashes, test background/foreground, test Dynamic Type.
   CLI: Run all commands with valid and invalid args, test piped input/output, verify exit codes, test --help, test error messages.
   API: Test all endpoints with valid/invalid/missing/malformed data, test auth flows, test rate limits, test concurrent requests, verify error response format.
 - EDGE CASES (test ALL of these):
