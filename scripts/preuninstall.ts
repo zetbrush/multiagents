@@ -10,6 +10,12 @@ import * as path from "node:path";
 import * as os from "node:os";
 
 const HOME = os.homedir();
+const CLAUDE_PERMISSION_ENTRIES = [
+  "mcp__multiagents",
+  "mcp__multiagents-orch",
+  "mcp__multiagents__*",
+  "mcp__multiagents-orch__*",
+] as const;
 
 function findAgentCli(name: string): string | null {
   try {
@@ -19,6 +25,12 @@ function findAgentCli(name: string): string | null {
   return null;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
 // --- Claude Code ---
 function removeClaude(): void {
   const claudePath = findAgentCli("claude");
@@ -26,20 +38,39 @@ function removeClaude(): void {
     Bun.spawnSync([claudePath, "mcp", "remove", "multiagents", "-s", "user"], { stderr: "ignore", stdout: "ignore" });
     Bun.spawnSync([claudePath, "mcp", "remove", "multiagents-orch", "-s", "user"], { stderr: "ignore", stdout: "ignore" });
     console.log("[multiagents] Removed MCP servers from Claude Code (via claude mcp remove)");
-    return;
   }
 
-  // Fallback: edit ~/.claude.json directly
+  // Always also clean the persisted user config file.
   const configPath = path.join(HOME, ".claude.json");
   if (fs.existsSync(configPath)) {
     try {
       const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      const mcpServers = config.mcpServers;
-      if (mcpServers) {
+      const mcpServers = asRecord(config.mcpServers);
+      const hadEntry = Boolean(mcpServers?.["multiagents"] || mcpServers?.["multiagents-orch"]);
+      if (mcpServers && hadEntry) {
         delete mcpServers["multiagents"];
         delete mcpServers["multiagents-orch"];
         fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
         console.log("[multiagents] Removed MCP servers from ~/.claude.json");
+      }
+    } catch { /* ok */ }
+  }
+
+  // Always remove tool-level permissions from ~/.claude/settings.json
+  const settingsPath = path.join(HOME, ".claude", "settings.json");
+  if (fs.existsSync(settingsPath)) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+      const permissions = settings.permissions;
+      if (permissions?.allow && Array.isArray(permissions.allow)) {
+        const before = permissions.allow.length;
+        permissions.allow = permissions.allow.filter(
+          (e: string) => !CLAUDE_PERMISSION_ENTRIES.includes(e as typeof CLAUDE_PERMISSION_ENTRIES[number]),
+        );
+        if (permissions.allow.length !== before) {
+          fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+          console.log("[multiagents] Removed MCP permissions from ~/.claude/settings.json");
+        }
       }
     } catch { /* ok */ }
   }
@@ -51,30 +82,37 @@ function removeCodex(): void {
   if (codexPath) {
     Bun.spawnSync([codexPath, "mcp", "remove", "multiagents"], { stderr: "ignore", stdout: "ignore" });
     console.log("[multiagents] Removed MCP server from Codex CLI (via codex mcp remove)");
-    return;
   }
 
-  // Fallback: edit ~/.codex/config.toml directly
+  // Always also remove the persisted config block for idempotent cleanup.
   const configPath = path.join(HOME, ".codex", "config.toml");
   if (fs.existsSync(configPath)) {
     try {
-      let content = fs.readFileSync(configPath, "utf-8");
-      // Remove [mcp_servers.multiagents] block
-      content = content.replace(/\[mcp_servers\.multiagents\][^\[]*/s, "");
-      fs.writeFileSync(configPath, content.trim() + "\n");
-      console.log("[multiagents] Removed MCP server from ~/.codex/config.toml");
+      const content = fs.readFileSync(configPath, "utf-8");
+      // Remove only the multiagents section, not TOML arrays inside it.
+      const updated = content.replace(/(^|\n)\[mcp_servers\.multiagents\]\n[\s\S]*?(?=\n\[|$)/, "$1");
+      if (updated !== content) {
+        fs.writeFileSync(configPath, updated.trim() + "\n");
+        console.log("[multiagents] Removed MCP server from ~/.codex/config.toml");
+      }
     } catch { /* ok */ }
   }
 }
 
 // --- Gemini CLI ---
 function removeGemini(): void {
+  const geminiPath = findAgentCli("gemini");
+  if (geminiPath) {
+    Bun.spawnSync([geminiPath, "mcp", "remove", "-s", "user", "multiagents"], { stderr: "ignore", stdout: "ignore" });
+    console.log("[multiagents] Removed MCP server from Gemini CLI (via gemini mcp remove -s user)");
+  }
+
   const configPath = path.join(HOME, ".gemini", "settings.json");
   if (fs.existsSync(configPath)) {
     try {
       const settings = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      const mcpServers = settings.mcpServers;
-      if (mcpServers) {
+      const mcpServers = asRecord(settings.mcpServers);
+      if (mcpServers && mcpServers["multiagents"]) {
         delete mcpServers["multiagents"];
         fs.writeFileSync(configPath, JSON.stringify(settings, null, 2) + "\n");
         console.log("[multiagents] Removed MCP server from ~/.gemini/settings.json");
