@@ -14,7 +14,11 @@ import { DEFAULT_GUARDRAILS } from "../shared/constants.ts";
 // ---------------------------------------------------------------------------
 
 function makeGuardrail(overrides: Partial<GuardrailState> & { id: string }): GuardrailState {
-  const base = DEFAULT_GUARDRAILS.find((g) => g.id === overrides.id) ?? DEFAULT_GUARDRAILS[0];
+  const fallback = DEFAULT_GUARDRAILS[0];
+  if (!fallback) {
+    throw new Error("DEFAULT_GUARDRAILS must not be empty");
+  }
+  const base = DEFAULT_GUARDRAILS.find((g) => g.id === overrides.id) ?? fallback;
   return {
     ...base,
     is_overridden: false,
@@ -61,6 +65,10 @@ function makeSession(overrides: Partial<Session> = {}): Session {
     config: "{}",
     ...overrides,
   } as Session;
+}
+
+function isActiveSessionStatus(status: Session["status"]): boolean {
+  return status === "active";
 }
 
 // ---------------------------------------------------------------------------
@@ -110,8 +118,11 @@ describe("DEFAULT_GUARDRAILS", () => {
   test("has max_restarts as the only enforced guardrail", () => {
     const enforced = DEFAULT_GUARDRAILS.filter((g) => g.action !== "monitor");
     expect(enforced.length).toBe(1);
-    expect(enforced[0].id).toBe("max_restarts");
-    expect(enforced[0].action).toBe("stop");
+    const guardrail = enforced[0];
+    expect(guardrail).toBeDefined();
+    if (!guardrail) throw new Error("Expected an enforced guardrail");
+    expect(guardrail.id).toBe("max_restarts");
+    expect(guardrail.action).toBe("stop");
   });
 
   test("max_restarts has sensible defaults", () => {
@@ -221,21 +232,21 @@ describe("auto-switch to stats tab", () => {
     });
 
     const shouldSwitch = session.status === "paused"
-      && prevStatus === "active"
+      && isActiveSessionStatus(prevStatus)
       && session.pause_reason?.includes("Guardrail");
 
     expect(shouldSwitch).toBe(true);
   });
 
   test("does not trigger if already paused", () => {
-    const prevStatus = "paused";
+    const prevStatus: Session["status"] = "paused";
     const session = makeSession({
       status: "paused",
       pause_reason: "Guardrail triggered: Restart Limit (max_restarts)",
     });
 
     const shouldSwitch = session.status === "paused"
-      && prevStatus === "active"
+      && isActiveSessionStatus(prevStatus)
       && session.pause_reason?.includes("Guardrail");
 
     expect(shouldSwitch).toBe(false);
@@ -398,9 +409,11 @@ describe("interaction summary", () => {
     ]);
 
     const sorted = [...interactions.entries()].sort((a, b) => b[1] - a[1]);
-    expect(sorted[0][0]).toBe("Charlie → Alice");
-    expect(sorted[1][0]).toBe("Alice → Bob");
-    expect(sorted[2][0]).toBe("Bob → Alice");
+    expect(sorted.map(([label]) => label)).toEqual([
+      "Charlie → Alice",
+      "Alice → Bob",
+      "Bob → Alice",
+    ]);
   });
 });
 
@@ -467,7 +480,7 @@ describe("slot resume after guardrail adjustment", () => {
 
     expect(toResume.length).toBe(2);
     expect(toNotify.length).toBe(1);
-    expect(toNotify[0].id).toBe(2);
+    expect(toNotify.map((slot) => slot.id)).toEqual([2]);
   });
 });
 

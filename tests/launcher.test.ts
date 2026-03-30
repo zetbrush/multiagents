@@ -18,6 +18,32 @@ import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 // Temp directory for file-system tests
 let tmpDir: string;
 
+function expectDefined<T>(value: T | undefined, message: string): T {
+  expect(value).toBeDefined();
+  if (value === undefined) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function getFlagValue(args: string[], flag: string): string {
+  const idx = args.indexOf(flag);
+  expect(idx).toBeGreaterThan(-1);
+  return expectDefined(args[idx + 1], `Missing value for ${flag}`);
+}
+
+function collectFlagValues(args: string[], flag: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== flag) continue;
+    const value = args[i + 1];
+    if (value !== undefined) {
+      values.push(value);
+    }
+  }
+  return values;
+}
+
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join("/tmp", "launcher-test-"));
 });
@@ -53,12 +79,12 @@ describe("mcpServerCommand", () => {
 
   test("cli.ts path is absolute", () => {
     const result = mcpServerCommand("claude");
-    expect(path.isAbsolute(result.args[0])).toBe(true);
+    expect(path.isAbsolute(expectDefined(result.args[0], "Missing cli.ts path"))).toBe(true);
   });
 
   test("cli.ts path points to a real file", () => {
     const result = mcpServerCommand("claude");
-    expect(fs.existsSync(result.args[0])).toBe(true);
+    expect(fs.existsSync(expectDefined(result.args[0], "Missing cli.ts path"))).toBe(true);
   });
 });
 
@@ -99,10 +125,7 @@ describe("buildCliArgs — claude", () => {
 
   test("includes --mcp-config with valid JSON containing multiagents", () => {
     const args = buildCliArgs("claude", task);
-    const idx = args.indexOf("--mcp-config");
-    expect(idx).toBeGreaterThan(-1);
-
-    const mcpJson = args[idx + 1];
+    const mcpJson = getFlagValue(args, "--mcp-config");
     const parsed = JSON.parse(mcpJson);
     expect(parsed.mcpServers).toBeDefined();
     expect(parsed.mcpServers["multiagents-peer"]).toBeDefined();
@@ -113,7 +136,7 @@ describe("buildCliArgs — claude", () => {
 
   test("--mcp-config JSON points to correct agent type", () => {
     const args = buildCliArgs("claude", task);
-    const mcpJson = JSON.parse(args[args.indexOf("--mcp-config") + 1]);
+    const mcpJson = JSON.parse(getFlagValue(args, "--mcp-config"));
     expect(mcpJson.mcpServers["multiagents-peer"].args).toContain("claude");
   });
 
@@ -161,11 +184,7 @@ describe("buildCliArgs — codex", () => {
 
   test("injects multiagents MCP via dotted-path -c overrides", () => {
     const args = buildCliArgs("codex", task);
-    // Find the -c flags
-    const cFlags: string[] = [];
-    for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-c") cFlags.push(args[i + 1]);
-    }
+    const cFlags = collectFlagValues(args, "-c");
 
     const commandFlag = cFlags.find((f) => f.startsWith('mcp_servers."multiagents-peer".command='));
     expect(commandFlag).toBeDefined();
@@ -183,10 +202,7 @@ describe("buildCliArgs — codex", () => {
 
   test("does NOT touch other user MCP servers", () => {
     const args = buildCliArgs("codex", task);
-    const cFlags: string[] = [];
-    for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-c") cFlags.push(args[i + 1]);
-    }
+    const cFlags = collectFlagValues(args, "-c");
 
     // Should only have multiagents and model_reasoning_effort overrides
     const nonMultiagent = cFlags.filter(
@@ -197,10 +213,7 @@ describe("buildCliArgs — codex", () => {
 
   test("overrides model_reasoning_effort to high", () => {
     const args = buildCliArgs("codex", task);
-    const cFlags: string[] = [];
-    for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-c") cFlags.push(args[i + 1]);
-    }
+    const cFlags = collectFlagValues(args, "-c");
 
     expect(cFlags).toContain('model_reasoning_effort="high"');
   });
@@ -235,23 +248,17 @@ describe("buildCliArgs — gemini", () => {
 
   test("includes --approval-mode yolo for autonomous operation", () => {
     const args = buildCliArgs("gemini", task);
-    const idx = args.indexOf("--approval-mode");
-    expect(idx).toBeGreaterThan(-1);
-    expect(args[idx + 1]).toBe("yolo");
+    expect(getFlagValue(args, "--approval-mode")).toBe("yolo");
   });
 
   test("includes --output-format stream-json", () => {
     const args = buildCliArgs("gemini", task);
-    const idx = args.indexOf("--output-format");
-    expect(idx).toBeGreaterThan(-1);
-    expect(args[idx + 1]).toBe("stream-json");
+    expect(getFlagValue(args, "--output-format")).toBe("stream-json");
   });
 
   test("restricts MCP to multiagents only via --allowed-mcp-server-names", () => {
     const args = buildCliArgs("gemini", task);
-    const idx = args.indexOf("--allowed-mcp-server-names");
-    expect(idx).toBeGreaterThan(-1);
-    expect(args[idx + 1]).toBe("multiagents-peer");
+    expect(getFlagValue(args, "--allowed-mcp-server-names")).toBe("multiagents-peer");
   });
 
   test("ends with -p and the task", () => {
@@ -502,7 +509,7 @@ describe("MCP config consistency across agent types", () => {
     const codexArgs = mcpServerCommand("codex").args;
     const geminiArgs = mcpServerCommand("gemini").args;
 
-    const getAgentType = (args: string[]) => args[args.indexOf("--agent-type") + 1];
+    const getAgentType = (args: string[]) => getFlagValue(args, "--agent-type");
 
     expect(getAgentType(claudeArgs)).toBe("claude");
     expect(getAgentType(codexArgs)).toBe("codex");
@@ -514,16 +521,11 @@ describe("MCP config consistency across agent types", () => {
     const codexCliArgs = buildCliArgs("codex", "test");
 
     // Extract Claude's MCP config
-    const claudeMcpJson = JSON.parse(
-      claudeCliArgs[claudeCliArgs.indexOf("--mcp-config") + 1],
-    );
+    const claudeMcpJson = JSON.parse(getFlagValue(claudeCliArgs, "--mcp-config"));
     const claudeMcpArgs = claudeMcpJson.mcpServers["multiagents-peer"].args;
 
     // Extract Codex's MCP args from -c flag
-    const cFlags: string[] = [];
-    for (let i = 0; i < codexCliArgs.length; i++) {
-      if (codexCliArgs[i] === "-c") cFlags.push(codexCliArgs[i + 1]);
-    }
+    const cFlags = collectFlagValues(codexCliArgs, "-c");
     const codexArgsFlag = cFlags.find((f) => f.startsWith('mcp_servers."multiagents-peer".args='))!;
     const codexMcpArgs = JSON.parse(codexArgsFlag.split("=").slice(1).join("="));
 

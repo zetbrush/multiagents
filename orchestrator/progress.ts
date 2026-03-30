@@ -15,13 +15,16 @@ import { formatDuration, formatTime, safeJsonParse } from "../shared/utils.ts";
 /** Health state for a single agent. */
 export type HealthState = "healthy" | "slow" | "stuck" | "crashed";
 
+/** Additional health state for slots that haven't connected yet. */
+export type ExtendedHealthState = HealthState | "starting";
+
 /** Status for a single agent in the team. */
 export interface AgentStatus {
   slot_id: number;
   name: string;
   role: string;
   agent_type: string;
-  health: HealthState;
+  health: ExtendedHealthState;
   task_state: string;
   status: string;
   paused: boolean;
@@ -52,9 +55,6 @@ export interface TeamStatus {
 
 /** Grace period for agents to start up and register with the broker. */
 const STARTUP_GRACE_MS = 90_000; // 90 seconds — covers MCP init, broker registration, first tool call
-
-/** Additional health state for slots that haven't connected yet. */
-export type ExtendedHealthState = HealthState | "starting";
 
 /**
  * Assess the health of a single slot based on timing thresholds.

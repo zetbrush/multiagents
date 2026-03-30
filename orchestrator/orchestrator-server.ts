@@ -23,6 +23,7 @@ import {
   BROKER_HOSTNAME,
   GUARDRAIL_CHECK_INTERVAL,
   CONFLICT_CHECK_INTERVAL,
+  FLAP_WINDOW_MS,
 } from "../shared/constants.ts";
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext } from "./launcher.ts";
@@ -1006,7 +1007,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
           if (shouldRemove) {
             // Delete the slot from the broker DB
-            await brokerClient.post("/slots/delete", { id: slot.id });
+            await brokerClient.deleteSlot(slot.id);
             removedNames.push(slot.display_name || slot.role || `slot-${slot.id}`);
             removed++;
 
@@ -1361,14 +1362,20 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
         const slots = await brokerClient.listSlots(sessionId);
         for (const slot of slots) {
           if (slot.status !== "disconnected") continue;
-          // Skip if recently disconnected (might be restarting)
-          const disconnectedAt = slot.last_disconnected ?? 0;
+
+          // CRITICAL: Skip slots that have NEVER connected — they're still starting up.
+          // Without this check, last_disconnected is null → defaults to 0 → deadFor = now
+          // (billions of ms) → the slot looks dead for "54 years" → gets deleted immediately.
+          // This was THE bug that caused all starting agents to vanish from the dashboard.
+          if (!slot.last_connected) continue;
+
+          const disconnectedAt = slot.last_disconnected ?? slot.last_connected ?? now;
           const deadFor = now - disconnectedAt;
           if (deadFor < 5 * 60 * 1000) continue; // <5 min, might reconnect
 
           // Auto-cleanup: delete the dead slot
           try {
-            await brokerClient.post("/slots/delete", { id: slot.id });
+            await brokerClient.deleteSlot(slot.id);
             log(LOG_PREFIX, `Auto-deleted dead slot ${slot.id} (${slot.display_name || slot.role}) — disconnected for ${Math.round(deadFor / 60000)}m`);
           } catch { /* best effort */ }
         }
@@ -1497,8 +1504,9 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
         // Prune old escalation keys (keep set from growing unbounded)
         if (seenEscalations.size > 500) {
-          const entries = [...seenEscalations];
-          for (let i = 0; i < 250; i++) seenEscalations.delete(entries[i]);
+          for (const escalationKey of [...seenEscalations].slice(0, 250)) {
+            seenEscalations.delete(escalationKey);
+          }
         }
       } catch { /* ok */ }
     }

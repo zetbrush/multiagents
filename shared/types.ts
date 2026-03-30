@@ -317,6 +317,7 @@ export interface CreateSlotRequest {
 
 export interface UpdateSlotRequest {
   id: number;
+  peer_id?: PeerId | null;
   paused?: boolean;
   paused_at?: number | null;
   status?: SlotStatus;

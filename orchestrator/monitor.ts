@@ -10,9 +10,16 @@ import type { BrokerClient } from "../shared/broker-client.ts";
 import { log } from "../shared/utils.ts";
 
 const LOG_PREFIX = "monitor";
+type ProcessReadableStream = Exclude<Subprocess["stdout"], number | null | undefined>;
 
 // Track last-seen cumulative tokens per slot (Codex sends cumulative totals)
 const lastTokenTotals = new Map<number, { input: number; output: number; cacheRead: number }>();
+
+function isReadableStream(
+  stream: Subprocess["stdout"] | Subprocess["stderr"],
+): stream is ProcessReadableStream {
+  return stream !== undefined && stream !== null && typeof stream !== "number";
+}
 
 /** Update token usage for a slot — handles both delta and cumulative formats. */
 async function updateTokenUsage(
@@ -69,12 +76,12 @@ export function monitorProcess(
   onEvent: (event: AgentEvent) => void,
 ): void {
   // Read stdout for JSON progress lines
-  if (proc.stdout) {
+  if (isReadableStream(proc.stdout)) {
     readStream(proc.stdout, slotId, sessionId, brokerClient, onEvent);
   }
 
   // Read stderr for error output
-  if (proc.stderr) {
+  if (isReadableStream(proc.stderr)) {
     readStderr(proc.stderr, slotId, sessionId, onEvent);
   }
 
@@ -86,7 +93,7 @@ export function monitorProcess(
 
 /** Read stdout stream, parse JSON lines for progress signals. */
 async function readStream(
-  stdout: ReadableStream<Uint8Array>,
+  stdout: ProcessReadableStream,
   slotId: number,
   sessionId: string,
   brokerClient: BrokerClient,
@@ -204,7 +211,7 @@ async function processLine(
 
 /** Read stderr for error messages. */
 async function readStderr(
-  stderr: ReadableStream<Uint8Array>,
+  stderr: ProcessReadableStream,
   slotId: number,
   sessionId: string,
   onEvent: (event: AgentEvent) => void,

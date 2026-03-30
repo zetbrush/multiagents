@@ -44,6 +44,10 @@ import type {
   AssignOwnershipRequest,
   UpdateGuardrailRequest,
   MessageLogOptions,
+  SignalDoneRequest,
+  SubmitFeedbackRequest,
+  ApproveRequest,
+  ReleaseAgentRequest,
   Peer,
   Message,
   Session,
@@ -406,6 +410,9 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     if (disconnectedSlots.length >= 1) {
       // Pick the first match (exact role match preferred, or only candidate)
       const slot = disconnectedSlots[0];
+      if (!slot) {
+        return { id };
+      }
       insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, body.session_id, slot.id, agentType, "idle");
       db.run(
         "UPDATE slots SET peer_id = ?, status = 'connected', last_connected = ?, last_peer_pid = ? WHERE id = ?",
@@ -728,11 +735,21 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
   const fields: string[] = [];
   const values: any[] = [];
 
+  if (body.peer_id !== undefined) { fields.push("peer_id = ?"); values.push(body.peer_id); }
   if (body.paused !== undefined) { fields.push("paused = ?"); values.push(body.paused ? 1 : 0); }
   if (body.paused_at !== undefined) { fields.push("paused_at = ?"); values.push(body.paused_at); }
   // Only accept valid slot statuses — reject "archived" or other ghost values
   if (body.status !== undefined && (body.status === "connected" || body.status === "disconnected")) {
     fields.push("status = ?"); values.push(body.status);
+    // Auto-set last_disconnected when transitioning to disconnected.
+    // Without this, the auto-cleanup loop uses last_connected as fallback,
+    // which makes slots that ran for >5 min look like they've been dead
+    // for >5 min and get deleted immediately.
+    if (body.status === "disconnected") {
+      fields.push("last_disconnected = ?"); values.push(Date.now());
+    } else {
+      fields.push("last_connected = ?"); values.push(Date.now());
+    }
   }
   if (body.context_snapshot !== undefined) { fields.push("context_snapshot = ?"); values.push(body.context_snapshot); }
   if (body.display_name !== undefined) { fields.push("display_name = ?"); values.push(body.display_name); }
@@ -746,6 +763,12 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
   if (fields.length > 0) {
     values.push(body.id);
     db.run(`UPDATE slots SET ${fields.join(", ")} WHERE id = ?`, values);
+  }
+  if (body.peer_id !== undefined && body.peer_id !== null) {
+    const slot = db.query("SELECT session_id FROM slots WHERE id = ?").get(body.id) as { session_id: string } | null;
+    if (slot) {
+      db.run("UPDATE peers SET slot_id = ?, session_id = ? WHERE id = ?", [body.id, slot.session_id, body.peer_id]);
+    }
   }
   return (db.query("SELECT * FROM slots WHERE id = ?").get(body.id) as Slot) ?? null;
 }
@@ -1008,6 +1031,7 @@ function handleCreatePlan(body: CreatePlanRequest) {
 
   for (let i = 0; i < body.items.length; i++) {
     const item = body.items[i];
+    if (!item) continue;
     db.run(
       "INSERT INTO plan_items (plan_id, parent_id, label, status, assigned_to_slot, sort_order) VALUES (?, ?, ?, 'pending', ?, ?)",
       [plan.id, item.parent_id ?? null, item.label, item.assigned_to_slot ?? null, i],
@@ -1123,10 +1147,11 @@ function handleReleaseHeld(body: { session_id: string; slot_id: number }) {
 
 // --- Agent event ---
 
-function handleAgentEvent(body: { session_id: string; event_type: string; slot_id?: number; metadata?: any }) {
+function handleAgentEvent(body: { session_id: string; event_type: string; slot_id?: number; metadata?: unknown; data?: unknown }) {
+  const metadata = body.metadata ?? body.data;
   db.run(
     "INSERT INTO guardrail_events (session_id, guardrail_id, event_type, slot_id, timestamp, metadata) VALUES (?, '', ?, ?, ?, ?)",
-    [body.session_id, body.event_type, body.slot_id ?? null, Date.now(), body.metadata ? JSON.stringify(body.metadata) : null]
+    [body.session_id, body.event_type, body.slot_id ?? null, Date.now(), metadata ? JSON.stringify(metadata) : null]
   );
   return { ok: true };
 }
@@ -1227,15 +1252,15 @@ Bun.serve({
 
         // --- Plans ---
         case "/plan/create":
-          return Response.json(handleCreatePlan(body as any));
+          return Response.json(handleCreatePlan(body as CreatePlanRequest));
         case "/plan/get":
           return Response.json(handleGetPlan(body as { session_id: string }));
         case "/plan/update-item":
-          return Response.json(handleUpdatePlanItem(body as any));
+          return Response.json(handleUpdatePlanItem(body as { item_id: number; status: string; session_id?: string }));
 
         // --- Message log ---
         case "/message-log":
-          return Response.json(handleMessageLog(body));
+          return Response.json(handleMessageLog(body as { session_id: string } & MessageLogOptions));
 
         // --- Hold / release ---
         case "/hold-messages":
@@ -1245,11 +1270,11 @@ Bun.serve({
 
         // --- Agent events ---
         case "/agent-event":
-          return Response.json(handleAgentEvent(body));
+          return Response.json(handleAgentEvent(body as { session_id: string; event_type: string; slot_id?: number; metadata?: unknown; data?: unknown }));
 
         // --- Lifecycle ---
         case "/lifecycle/signal-done": {
-          const { peer_id, session_id, summary } = body;
+          const { peer_id, session_id, summary } = body as SignalDoneRequest;
           const peer = db.query("SELECT * FROM peers WHERE id = ?").get(peer_id) as any;
           if (!peer || !peer.slot_id) return Response.json({ error: "Peer not found or no slot" }, { status: 404 });
 
@@ -1276,7 +1301,7 @@ Bun.serve({
         }
 
         case "/lifecycle/submit-feedback": {
-          const { peer_id, session_id, target_slot_id, feedback, actionable } = body;
+          const { peer_id, session_id, target_slot_id, feedback, actionable } = body as SubmitFeedbackRequest;
           const peer = db.query("SELECT * FROM peers WHERE id = ?").get(peer_id) as any;
           const targetSlot = db.query("SELECT * FROM slots WHERE id = ?").get(target_slot_id) as any;
           if (!targetSlot) return Response.json({ error: "Target slot not found" }, { status: 404 });
@@ -1295,7 +1320,7 @@ Bun.serve({
         }
 
         case "/lifecycle/approve": {
-          const { peer_id, session_id, target_slot_id, message } = body;
+          const { peer_id, session_id, target_slot_id, message } = body as ApproveRequest;
           const peer = db.query("SELECT * FROM peers WHERE id = ?").get(peer_id) as any;
           const targetSlot = db.query("SELECT * FROM slots WHERE id = ?").get(target_slot_id) as any;
           if (!targetSlot) return Response.json({ error: "Target slot not found" }, { status: 404 });
@@ -1358,7 +1383,7 @@ Bun.serve({
         }
 
         case "/lifecycle/release": {
-          const { session_id, target_slot_id, released_by, message } = body;
+          const { session_id, target_slot_id, released_by, message } = body as ReleaseAgentRequest;
           const targetSlot = db.query("SELECT * FROM slots WHERE id = ?").get(target_slot_id) as any;
           if (!targetSlot) return Response.json({ error: "Target slot not found" }, { status: 404 });
 
@@ -1377,7 +1402,7 @@ Bun.serve({
         }
 
         case "/lifecycle/get-task-state": {
-          const { slot_id } = body;
+          const { slot_id } = body as { slot_id: number };
           const slot = db.query("SELECT id, task_state, display_name, role FROM slots WHERE id = ?").get(slot_id) as any;
           if (!slot) return Response.json({ error: "Slot not found" }, { status: 404 });
           return Response.json(slot);

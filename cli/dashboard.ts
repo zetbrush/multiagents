@@ -46,6 +46,8 @@ const HIDE_CURSOR = `${ESC}[?25l`;
 const SHOW_CURSOR = `${ESC}[?25h`;
 const INVERSE = `${ESC}[7m`;
 
+type ResolvedSlotStatus = Slot["status"] | "starting";
+
 function colorStatus(status: string): string {
   switch (status) {
     case "connected": case "active": case "ok": return `${GREEN}${status}${RESET}`;
@@ -193,7 +195,10 @@ export async function dashboard(sessionId?: string): Promise<void> {
       if (active.length > 0) {
         // Pick the most recently active session
         active.sort((a: any, b: any) => (b.last_active_at ?? 0) - (a.last_active_at ?? 0));
-        sid = active[0].id;
+        const latestActive = active[0];
+        if (latestActive) {
+          sid = latestActive.id;
+        }
       }
     } catch { /* broker doesn't support listSessions or no sessions */ }
   }
@@ -250,7 +255,10 @@ export async function dashboard(sessionId?: string): Promise<void> {
     // Tab cycling: Tab key
     if (key === "\t") {
       const idx = TABS.findIndex((t) => t.id === state.activeTab);
-      state.activeTab = TABS[(idx + 1) % TABS.length].id;
+      const nextTab = TABS[(idx + 1) % TABS.length];
+      if (nextTab) {
+        state.activeTab = nextTab.id;
+      }
       state.scrollOffset = 0;
       state.selectedRow = 0;
       return;
@@ -343,6 +351,9 @@ export async function dashboard(sessionId?: string): Promise<void> {
           if (g && g.adjustable && g.suggested_increases?.length > 0) {
             const nextValue = g.suggested_increases.find((v) => v > g.current_value)
               ?? g.suggested_increases[g.suggested_increases.length - 1];
+            if (nextValue === undefined) {
+              break;
+            }
             try {
               await client.updateGuardrail({
                 session_id: sid,
@@ -453,7 +464,11 @@ async function fetchState(client: BrokerClient, sessionId: string | null, state:
       return;
     }
 
-    const allPeers = await client.listPeers({ scope: "machine" }).catch(() => [] as Peer[]);
+    const allPeers = await client.listPeers({
+      scope: "machine",
+      cwd: process.cwd(),
+      git_root: null,
+    }).catch(() => [] as Peer[]);
     state.allPeers = allPeers;
 
     if (sessionId) {
@@ -491,11 +506,11 @@ async function fetchState(client: BrokerClient, sessionId: string | null, state:
 }
 
 // --- Slot status resolution (shared between tabs) ---
-function resolveSlots(state: DashboardState, sid: string | null): Map<number, { status: string; peer: Peer | null }> {
+function resolveSlots(state: DashboardState, sid: string | null): Map<number, { status: ResolvedSlotStatus; peer: Peer | null }> {
   const peerById = new Map(state.allPeers.map((p) => [p.id, p]));
   const sessionPeers = state.allPeers.filter((p) => p.session_id === sid);
   const matchedPeerIds = new Set<string>();
-  const result = new Map<number, { status: string; peer: Peer | null }>();
+  const result = new Map<number, { status: ResolvedSlotStatus; peer: Peer | null }>();
 
   for (const slot of state.slots) {
     if (slot.peer_id && peerById.has(slot.peer_id)) {
@@ -510,7 +525,7 @@ function resolveSlots(state: DashboardState, sid: string | null): Map<number, { 
         result.set(slot.id, { status: "connected", peer: slotMatch });
       } else {
         // Distinguish "starting" (never connected) from "disconnected" (was connected, now gone)
-        let displayStatus = slot.status;
+        let displayStatus: ResolvedSlotStatus = slot.status;
         if (slot.status === "disconnected" && !slot.last_connected) {
           displayStatus = "starting";
         }
@@ -682,8 +697,7 @@ function renderAgentsTab(state: DashboardState, sid: string | null, cols: number
     ];
     lines.push(`${DIM}${hdrParts.join("")}${RESET}`);
 
-    for (let i = 0; i < state.slots.length; i++) {
-      const slot = state.slots[i];
+    for (const [i, slot] of state.slots.entries()) {
       const r = resolved.get(slot.id) ?? { status: slot.status, peer: null };
       const isSelected = i === state.selectedRow;
       const prefix = isSelected ? `${CYAN}▸${RESET}` : " ";
@@ -881,8 +895,9 @@ function renderStatsTab(state: DashboardState, cols: number, maxRows: number, li
       .sort((a, b) => b[1] - a[1])
       .slice(0, 6);
 
+    const topSenderCount = topSenders[0]?.[1] ?? 1;
     for (const [name, count] of topSenders) {
-      const bar = "█".repeat(Math.min(20, Math.round(count / Math.max(1, topSenders[0][1]) * 20)));
+      const bar = "█".repeat(Math.min(20, Math.round(count / Math.max(1, topSenderCount) * 20)));
       lines.push(`  ${name.padEnd(18)} ${CYAN}${bar}${RESET} ${DIM}${count}${RESET}`);
     }
 
@@ -906,8 +921,7 @@ function renderStatsTab(state: DashboardState, cols: number, maxRows: number, li
     lines.push(`${BOLD} Guardrails${RESET}`);
     lines.push("");
 
-    for (let i = 0; i < enforced.length; i++) {
-      const g = enforced[i];
+    for (const g of enforced) {
       // Adjust selectedRow to only count enforced items
       const enforcedIdx = state.guardrails.indexOf(g);
       const isSelected = enforcedIdx === state.selectedRow;

@@ -226,6 +226,12 @@ export class BrokerClient {
   updatePlanItem(req: { item_id: number; status: string; session_id?: string }): Promise<PlanState | { ok: boolean }> {
     return this.post("/plan/update-item", req);
   }
+
+  // --- Slot management ---
+
+  deleteSlot(slotId: number): Promise<{ ok: boolean; deleted: boolean }> {
+    return this.post("/slots/delete", { id: slotId });
+  }
 }
 
 export interface PlanItem {

@@ -135,7 +135,8 @@ function upsertTomlLine(lines: string[], key: string, value: string): boolean {
     return true;
   }
 
-  if (lines[index].trim() === target) {
+  const currentLine = lines[index];
+  if (currentLine !== undefined && currentLine.trim() === target) {
     return false;
   }
 
@@ -163,7 +164,7 @@ function upsertCodexMultiagentsSection(content: string, serverCmd: string, serve
     };
   }
 
-  const bodyLines = match[2].split("\n");
+  const bodyLines = (match[2] ?? "").split("\n");
   if (bodyLines.at(-1) === "") bodyLines.pop();
 
   let changed = false;
