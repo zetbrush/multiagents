@@ -21,6 +21,9 @@
 import type { Subprocess } from "bun";
 import { log } from "../shared/utils.ts";
 
+/** Subprocess type with all stdio set to "pipe" — gives concrete types for stdin/stdout/stderr. */
+type PipedSubprocess = Subprocess<"pipe", "pipe", "pipe">;
+
 const LOG_PREFIX = "codex-driver";
 
 /** Result from a Codex turn (start or reply). */
@@ -49,7 +52,7 @@ export interface CodexSessionOptions {
  *   4. driver.kill() — graceful shutdown
  */
 export class CodexDriver {
-  private proc: Subprocess;
+  private proc: PipedSubprocess;
   private nextId = 1;
   private pendingRequests = new Map<number, {
     resolve: (value: unknown) => void;
@@ -70,9 +73,9 @@ export class CodexDriver {
   get pid(): number { return this.proc.pid; }
 
   /** The underlying Subprocess (for process tracking by the orchestrator). */
-  get process(): Subprocess { return this.proc; }
+  get process(): PipedSubprocess { return this.proc; }
 
-  private constructor(proc: Subprocess) {
+  private constructor(proc: PipedSubprocess) {
     this.proc = proc;
     this.startReader();
     this.proc.exited.then((code) => {
@@ -212,9 +215,10 @@ export class CodexDriver {
         reject: (e) => { clearTimeout(timer); origReject(e); },
       });
 
-      // Write to stdin
+      // Write to stdin (proc.stdin is FileSink when spawned with stdin: "pipe")
       try {
         this.proc.stdin.write(msg);
+        this.proc.stdin.flush();
       } catch (err) {
         this.pendingRequests.delete(id);
         clearTimeout(timer);
@@ -254,10 +258,8 @@ export class CodexDriver {
 
   /** Read stdout and dispatch JSON-RPC responses. */
   private async startReader(): Promise<void> {
-    if (!this.proc.stdout || typeof this.proc.stdout === "number") return;
-
     const decoder = new TextDecoder();
-    const reader = (this.proc.stdout as ReadableStream<Uint8Array>).getReader();
+    const reader = this.proc.stdout.getReader();
 
     try {
       while (true) {
@@ -314,10 +316,8 @@ export class CodexDriver {
 
   /** Read stderr for diagnostic logging. */
   private async readStderr(): Promise<void> {
-    if (!this.proc.stderr || typeof this.proc.stderr === "number") return;
-
     const decoder = new TextDecoder();
-    const reader = (this.proc.stderr as ReadableStream<Uint8Array>).getReader();
+    const reader = this.proc.stderr.getReader();
     let buf = "";
 
     try {

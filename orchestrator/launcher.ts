@@ -363,7 +363,6 @@ export async function launchAgent(
     await brokerClient.updateSlot({
       id: slot.id,
       status: "connected",
-      last_connected: Date.now(),
     });
 
     // Build developer instructions with team communication rules
