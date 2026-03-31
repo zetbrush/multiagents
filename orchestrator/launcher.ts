@@ -144,10 +144,12 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string): P
   const removeTomlSection = (toml: string, header: RegExp): string =>
     toml.replace(new RegExp(header.source + "\\n(?:(?!^\\[).)*", "ms"), "");
 
-  // Remove stale "multiagents" entries that point to wrong paths (e.g.
-  // /usr/local/lib/... when the package was installed via Bun at ~/.bun/...)
-  if (codexToml.includes("[mcp_servers.multiagents]")) {
-    codexToml = removeTomlSection(codexToml, /^\[mcp_servers\.multiagents\]\s*$/m);
+  // Remove stale "multiagents" entries AND their nested subsections (e.g.
+  // [mcp_servers.multiagents.tools.check_messages] with approval_mode).
+  // Without removing subsections, Codex sees tool configs for a server
+  // with no command/url and fails with "invalid transport".
+  while (codexToml.match(/^\[mcp_servers\.multiagents[.\]]/m)) {
+    codexToml = removeTomlSection(codexToml, /^\[mcp_servers\.multiagents[^\-][^\]]*\]\s*$/m);
   }
 
   // Remove existing multiagents-peer section (will be re-added below with fresh path)
@@ -394,31 +396,58 @@ export async function launchAgent(
       "Respond to them using the multiagents-peer MCP tools.",
     ].join("\n");
 
-    // Start the first turn (non-blocking — runs in background)
-    // The orchestrator will push follow-up turns via driver.reply()
-    const startPromise = driver.startSession({
-      prompt: taskPrompt,
-      cwd: projectDir,
-      sandbox: "workspace-write",
-      developerInstructions,
-    }).then((result) => {
-      log(LOG_PREFIX, `${config.name} first turn complete: thread=${result.threadId}`);
-      // Store threadId in slot context for persistence
-      brokerClient.updateSlot({
-        id: slot.id,
-        context_snapshot: JSON.stringify({
-          codex_thread_id: result.threadId,
-          last_summary: result.content.slice(0, 200),
-          last_status: "working",
-          updated_at: Date.now(),
-        }),
-      }).catch(() => {});
-    }).catch((err) => {
-      log(LOG_PREFIX, `${config.name} first turn failed: ${err}`);
-    });
+    // --- Two-phase startup for fast threadId acquisition ---
+    // Phase 1: Fast bootstrap turn (~5-9s) to get a threadId.
+    //   Codex creates the thread and returns immediately.
+    // Phase 2: Push the real task as a reply turn.
+    //   This runs in the background. The orchestrator can forward
+    //   teammate messages between turns because we have the threadId.
+    //
+    // Without this split, the entire task runs as turn 1 (can take
+    // minutes for complex tasks), blocking message forwarding.
+    const bootstrapPrompt = `You are "${config.name}" (${config.role}). Acknowledge by replying: "Ready."`;
 
-    // Don't await startPromise — let the turn run in background
-    // The driver process is the "process" for tracking purposes
+    const startPromise = (async () => {
+      try {
+        // Phase 1: fast bootstrap (~5-9s)
+        const bootstrap = await driver.startSession({
+          prompt: bootstrapPrompt,
+          cwd: projectDir,
+          sandbox: "workspace-write",
+          developerInstructions,
+        });
+        log(LOG_PREFIX, `${config.name} bootstrap complete: thread=${bootstrap.threadId} (${bootstrap.content.slice(0, 50)})`);
+
+        // Store threadId immediately — enables message forwarding
+        await brokerClient.updateSlot({
+          id: slot.id,
+          context_snapshot: JSON.stringify({
+            codex_thread_id: bootstrap.threadId,
+            last_summary: `Starting: ${config.initial_task.slice(0, 100)}`,
+            last_status: "working",
+            updated_at: Date.now(),
+          }),
+        });
+
+        // Phase 2: push real task as a reply turn (runs in background)
+        const taskResult = await driver.reply(bootstrap.threadId, taskPrompt);
+        log(LOG_PREFIX, `${config.name} task turn complete: ${taskResult.content.slice(0, 100)}`);
+
+        await brokerClient.updateSlot({
+          id: slot.id,
+          context_snapshot: JSON.stringify({
+            codex_thread_id: taskResult.threadId,
+            last_summary: taskResult.content.slice(0, 200),
+            last_status: "working",
+            updated_at: Date.now(),
+          }),
+        });
+      } catch (err) {
+        log(LOG_PREFIX, `${config.name} startup failed: ${err}`);
+      }
+    })();
+
+    // Don't await — let both phases run in background
     return {
       slotId: slot.id,
       pid: driver.pid,
