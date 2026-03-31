@@ -237,13 +237,26 @@ async function autoRestartIfIncomplete(
       const { respawnAgent } = await import("./recovery.ts");
       const result = await respawnAgent(sessionId, slotId, brokerClient, sessionMeta.projectDir);
 
-      // CRITICAL: Track + monitor the new process
+      // CRITICAL: Track the new process and CodexDriver
       const sessionProcesses = activeProcesses.get(sessionId);
       if (sessionProcesses && result.process) {
         sessionProcesses.set(slotId, result.process);
+      }
+      if (result.codexDriver) {
+        let drivers = activeCodexDrivers.get(sessionId);
+        if (!drivers) { drivers = new Map(); activeCodexDrivers.set(sessionId, drivers); }
+        drivers.set(slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId });
+        result.codexDriver.onExit(() => {
+          handleEvent({
+            type: "agent_crashed", severity: "critical", slotId, sessionId,
+            message: `Codex driver for slot ${slotId} exited after code-0 respawn`,
+            data: { exit_code: -1 },
+          });
+        });
+      } else if (sessionProcesses && result.process) {
         monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent);
       }
-      log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid})`);
+      log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : ""})`);
 
       pendingEvents.push({
         type: "agent_restarted",
@@ -1454,6 +1467,10 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           const disconnectedAt = slot.last_disconnected ?? slot.last_connected ?? now;
           const deadFor = now - disconnectedAt;
           if (deadFor < 5 * 60 * 1000) continue; // <5 min, might reconnect
+
+          // Skip driver-managed Codex slots — orchestrator controls their lifecycle
+          const sessionDrivers = activeCodexDrivers.get(sessionId);
+          if (sessionDrivers?.has(slot.id)) continue;
 
           // Auto-cleanup: delete the dead slot
           try {
