@@ -523,17 +523,18 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResult {
   if (!toId && toSlotId) {
     const slot = db.query("SELECT peer_id FROM slots WHERE id = ?").get(toSlotId) as { peer_id: string | null } | null;
     if (!slot) return { ok: false, error: `Slot ${toSlotId} not found` };
-    if (!slot.peer_id) return { ok: false, error: `Slot ${toSlotId} has no connected peer` };
-    toId = slot.peer_id;
+    // Slot may have no peer_id if managed by CodexDriver — message is stored
+    // with to_slot_id and picked up by pollBySlot endpoint.
+    toId = slot.peer_id ?? `__slot_${toSlotId}__`;
   }
 
   if (!toId) return { ok: false, error: "No target specified" };
 
-  // Allow messages to "orchestrator" — these are escalation messages read by the orchestrator's monitoring loop
-  const isOrchestratorTarget = toId === "orchestrator" || toId === "__orchestrator__";
+  // Allow messages to "orchestrator" and driver-managed slots (no real peer_id)
+  const isSpecialTarget = toId === "orchestrator" || toId === "__orchestrator__" || toId.startsWith("__slot_");
 
-  // Verify target exists (unless targeting orchestrator)
-  if (!isOrchestratorTarget) {
+  // Verify target exists (unless targeting orchestrator or driver-managed slot)
+  if (!isSpecialTarget) {
     const target = db.query("SELECT id FROM peers WHERE id = ?").get(toId) as { id: string } | null;
     if (!target) return { ok: false, error: `Peer ${toId} not found` };
   }
@@ -575,6 +576,23 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   }
 
   const messages = selectUndelivered.all(body.id) as Message[];
+  const now = new Date().toISOString();
+  for (const msg of messages) {
+    markDelivered.run(now, msg.id);
+  }
+
+  return { messages };
+}
+
+/** Poll undelivered messages by slot_id (for driver-managed agents without peer_id). */
+function handlePollBySlot(body: { slot_id: number; session_id?: string }): PollMessagesResponse {
+  const slot = db.query("SELECT paused FROM slots WHERE id = ?").get(body.slot_id) as { paused: number } | null;
+  if (slot?.paused) return { messages: [], paused: true };
+
+  const messages = db.query(
+    "SELECT * FROM messages WHERE to_slot_id = ? AND delivered = 0 AND held = 0 ORDER BY sent_at ASC"
+  ).all(body.slot_id) as Message[];
+
   const now = new Date().toISOString();
   for (const msg of messages) {
     markDelivered.run(now, msg.id);
@@ -1191,6 +1209,8 @@ Bun.serve({
           return Response.json(handleSendMessage(body as SendMessageRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
+        case "/poll-by-slot":
+          return Response.json(handlePollBySlot(body as { slot_id: number; session_id?: string }));
         case "/unregister":
           return Response.json(handleUnregister(body as { id: string }));
 

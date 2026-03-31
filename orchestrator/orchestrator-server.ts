@@ -1430,12 +1430,9 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
         if (!threadId) continue; // First turn hasn't completed yet
 
         try {
-          // Get the slot to find the peer_id for message polling
-          const slot = await brokerClient.getSlot(slotId);
-          if (!slot?.peer_id) continue;
-
-          // Poll undelivered messages for this peer
-          const pollResult = await brokerClient.pollMessages(slot.peer_id);
+          // Poll undelivered messages by slot_id (driver-managed agents have no peer_id).
+          // This uses to_slot_id matching instead of to_id (peer_id) matching.
+          const pollResult = await brokerClient.pollBySlot(slotId);
           if (!pollResult.messages || pollResult.messages.length === 0) continue;
 
           // Format messages for Codex

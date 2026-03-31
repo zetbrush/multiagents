@@ -99,6 +99,11 @@ export class BrokerClient {
     return this.post("/poll-messages", { id });
   }
 
+  /** Poll undelivered messages by slot_id (for driver-managed agents without peer_id). */
+  pollBySlot(slotId: number): Promise<PollMessagesResponse> {
+    return this.post("/poll-by-slot", { slot_id: slotId });
+  }
+
   unregister(id: PeerId): Promise<UnregisterResult> {
     return this.post("/unregister", { id });
   }
