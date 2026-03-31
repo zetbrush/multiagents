@@ -356,6 +356,11 @@ export async function launchAgent(
   if (config.agent_type === "codex") {
     const { CodexDriver } = await import("./codex-driver.ts");
 
+    // MULTIAGENTS_DRIVER_MODE tells the internal multiagents-peer adapter
+    // (spawned by codex mcp-server) to skip broker registration — the driver
+    // manages the slot directly. Without this, the adapter creates ghost slots.
+    spawnEnv.MULTIAGENTS_DRIVER_MODE = "1";
+
     const driver = await CodexDriver.spawn(projectDir, spawnEnv);
     log(LOG_PREFIX, `CodexDriver spawned for ${config.name} in slot ${slot.id}`);
 

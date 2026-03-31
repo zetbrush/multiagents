@@ -392,6 +392,11 @@ export abstract class BaseAdapter {
 
     this.myCwd = process.cwd();
 
+    // Skip broker registration when running inside CodexDriver's `codex mcp-server`.
+    // The driver handles all communication — the internal multiagents-peer adapter
+    // would create ghost slots if it registered independently.
+    const driverMode = process.env.MULTIAGENTS_DRIVER_MODE === "1";
+
     // 1. Resolve session/slot info eagerly (before any async work)
     const envSession = process.env.MULTIAGENTS_SESSION;
     if (envSession && !this.sessionId) {
@@ -418,7 +423,8 @@ export abstract class BaseAdapter {
     this.registerTools();
 
     // 4. Start broker registration in the BACKGROUND — don't block on MCP handshake
-    const brokerPromise = this.registerWithBroker();
+    //    Skip entirely in driver mode (CodexDriver manages the slot directly).
+    const brokerPromise = driverMode ? Promise.resolve() : this.registerWithBroker();
 
     // 5. Connect MCP over stdio — blocks until parent sends `initialize`
     //    Broker registration runs concurrently with this wait.
@@ -427,6 +433,11 @@ export abstract class BaseAdapter {
 
     // 6. Ensure broker registration completed (it likely already did, but wait to be sure)
     await brokerPromise;
+
+    if (driverMode) {
+      this.log("Driver mode — skipping poll loop and heartbeat (CodexDriver manages communication)");
+      return; // Tools are available but no broker registration/polling
+    }
 
     // === PHASE 3: START BACKGROUND LOOPS ===
 
