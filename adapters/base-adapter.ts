@@ -395,7 +395,14 @@ export abstract class BaseAdapter {
     // Skip broker registration when running inside CodexDriver's `codex mcp-server`.
     // The driver handles all communication — the internal multiagents-peer adapter
     // would create ghost slots if it registered independently.
-    const driverMode = process.env.MULTIAGENTS_DRIVER_MODE === "1";
+    // Check both env var (may be stripped by Codex sandbox) and sentinel file.
+    const driverModeFile = (() => {
+      try {
+        const p = require("node:path").join(process.cwd(), ".multiagents", ".driver-mode");
+        return require("node:fs").existsSync(p);
+      } catch { return false; }
+    })();
+    const driverMode = process.env.MULTIAGENTS_DRIVER_MODE === "1" || driverModeFile;
 
     // 1. Resolve session/slot info eagerly (before any async work)
     const envSession = process.env.MULTIAGENTS_SESSION;

@@ -356,10 +356,13 @@ export async function launchAgent(
   if (config.agent_type === "codex") {
     const { CodexDriver } = await import("./codex-driver.ts");
 
-    // MULTIAGENTS_DRIVER_MODE tells the internal multiagents-peer adapter
-    // (spawned by codex mcp-server) to skip broker registration — the driver
-    // manages the slot directly. Without this, the adapter creates ghost slots.
-    spawnEnv.MULTIAGENTS_DRIVER_MODE = "1";
+    // Write a sentinel file that tells the internal multiagents-peer adapter
+    // (spawned by codex mcp-server) to skip broker registration. The driver
+    // manages the slot directly — without this, the adapter creates ghost slots.
+    // We use a file because Codex sandbox strips custom env vars.
+    const driverModeFile = path.join(projectDir, ".multiagents", ".driver-mode");
+    try { fs.writeFileSync(driverModeFile, "1"); } catch { /* best effort */ }
+    spawnEnv.MULTIAGENTS_DRIVER_MODE = "1"; // Also set env var as secondary signal
 
     const driver = await CodexDriver.spawn(projectDir, spawnEnv);
     log(LOG_PREFIX, `CodexDriver spawned for ${config.name} in slot ${slot.id}`);
