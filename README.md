@@ -9,50 +9,95 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │ Claude Code  │     │  Codex CLI  │     │ Gemini CLI  │
-│ (Architect)  │     │  (Builder)  │     │ (Reviewer)  │
+│ (Engineer)   │     │ (Reviewer)  │     │ (Designer)  │
 └──────┬───────┘     └──────┬──────┘     └──────┬──────┘
-       │   MCP (stdio)      │                    │
+       │   MCP (stdio)      │  CodexDriver       │
        └────────────┬───────┴────────────────────┘
                     │
             ┌───────▼────────┐
-            │  Broker Daemon  │  SQLite + HTTP on localhost
-            │  (one per machine)
-            └────────────────┘
+            │  Broker Daemon  │  SQLite + HTTP on localhost:7899
+            │  (singleton)    │
+            └───────┬────────┘
+                    │
+            ┌───────▼────────┐
+            │  Orchestrator   │  MCP server for Claude Desktop
+            │  (team manager) │  Spawns agents, forwards messages,
+            └────────────────┘  monitors progress, auto-restarts
 ```
 
-- Agents discover each other via `list_peers`
-- Send messages with `send_message` (instant for Claude, 1-3s for Codex/Gemini)
-- Assign roles at runtime: `assign_role`, `rename_peer`
-- Coordinate file edits with locks and ownership zones
-- Persistent sessions that survive agent restarts
-- TUI dashboard for real-time monitoring
-- Orchestration from Claude Desktop (spawn teams, monitor progress, control sessions)
+- **Peer discovery**: agents find each other via `list_peers`
+- **Real-time messaging**: instant for Claude (channel push), 3-5s for Codex/Gemini (orchestrator-driven turns)
+- **Role assignment**: `assign_role`, `rename_peer` at runtime
+- **File coordination**: exclusive locks + ownership zones prevent conflicts
+- **Task lifecycle**: `idle → working → done_pending_review → addressing_feedback → approved → released`
+- **Review loops**: `signal_done → submit_feedback → fix → re-review → approve`
+- **Persistent sessions**: survive agent restarts, full message history
+- **TUI dashboard**: real-time monitoring with 5 tabs (agents, messages, stats, plan, files)
+- **Auto-restart**: crashed agents respawn with handoff context
+- **Graceful shutdown**: broker and orchestrator kill all managed processes on exit
 
 ## Quick Start
 
 ```bash
-# Install
-bun install
+# Install globally
+bun install -g multiagents
 
-# Setup (detects installed CLIs, configures MCP, starts broker)
-bun cli.ts setup
+# Setup (detects CLIs, configures MCP servers, starts broker)
+multiagents setup
 
-# Start agents in separate terminals
-claude    # auto-connects via MCP
-codex     # auto-connects via MCP
-gemini    # auto-connects via MCP
+# Restart your Claude Code / Codex / Gemini sessions to load MCP tools
 
 # Monitor
-bun cli.ts dashboard
+multiagents dashboard
 ```
+
+### From Claude Desktop (Orchestrator)
+
+Ask Claude to create a team:
+
+> "Create a team of 3 agents: a Claude engineer, a Codex reviewer, and a Gemini designer.
+> Build a calculator web app in TypeScript."
+
+The orchestrator handles everything: spawning agents, assigning roles, creating slots, launching the dashboard, and forwarding messages between agents.
 
 ## Agent Support
 
-| Agent | Push Delivery | Effective Latency | Config Location |
-|-------|--------------|-------------------|-----------------|
-| Claude Code | `notifications/claude/channel` | Instant | `~/.claude/settings.json` |
-| Codex CLI | Piggyback on tool responses | 1-3 seconds | `~/.codex/config.toml` |
-| Gemini CLI | Piggyback on tool responses | 1-3 seconds | `~/.gemini/settings.json` |
+| Agent | Delivery Mechanism | Latency | Config |
+|-------|-------------------|---------|--------|
+| Claude Code | Channel push notifications | Instant | `~/.claude/settings.json` |
+| Codex CLI | CodexDriver (`codex mcp-server`) | 3-9s per turn | `~/.codex/config.toml` |
+| Gemini CLI | Piggyback on MCP tool responses | 1-3s | `~/.gemini/settings.json` |
+
+### Codex Integration (CodexDriver)
+
+Codex CLI is single-shot (`codex exec` exits after one turn). The orchestrator uses a **CodexDriver** that:
+
+1. Spawns a persistent `codex mcp-server` process
+2. Uses MCP tools `codex` (start session) and `codex-reply` (continue conversation)
+3. Maintains thread continuity across turns (full conversation history)
+4. Two-phase startup: fast bootstrap (~9s) for threadId, then task push as reply
+
+The orchestrator **drives Codex turns**: when teammates send messages, the forwarding loop polls the broker every 3s and pushes new turns via `driver.reply()`.
+
+## Task State Machine
+
+Every agent slot has a `task_state` that governs the review/approval workflow:
+
+```
+idle ──► working ──► done_pending_review ──► addressing_feedback ──► done_pending_review
+                         │                                              │
+                         ▼                                              ▼
+                      approved ──► released (can disconnect)
+```
+
+- **idle → working**: Auto-transitions when agent calls `set_summary` or produces first output
+- **working → done_pending_review**: Agent calls `signal_done`
+- **done_pending_review → addressing_feedback**: Reviewer calls `submit_feedback(actionable=true)`
+- **addressing_feedback → done_pending_review**: Agent fixes issues and calls `signal_done` again
+- **done_pending_review → approved**: Reviewer calls `approve`
+- **approved → released**: Orchestrator calls `release_agent`
+
+Agents **cannot disconnect** until explicitly released. This ensures the review loop completes.
 
 ## MCP Tools (Available to All Agents)
 
@@ -60,12 +105,15 @@ bun cli.ts dashboard
 |------|-------------|
 | `list_peers` | Discover agents (filter by scope, type) |
 | `send_message` | Send text message to a peer |
-| `check_messages` | Manually poll for messages |
-| `set_summary` | Update your status/summary |
-| `assign_role` | Assign/change a peer's role |
-| `rename_peer` | Give a peer a friendly name |
-| `acquire_file` | Request exclusive edit access to a file |
-| `release_file` | Release your lock on a file |
+| `check_messages` | Poll for new messages |
+| `set_summary` | Update your status (visible to peers and dashboard) |
+| `check_team_status` | See all agents: roles, states, summaries |
+| `get_plan` / `update_plan` | Track team progress against the plan |
+| `signal_done` | Signal task completion (triggers review) |
+| `submit_feedback` | Send review feedback (actionable or informational) |
+| `approve` | Approve a teammate's work |
+| `assign_role` / `rename_peer` | Assign roles and names |
+| `acquire_file` / `release_file` | File lock management |
 | `view_file_locks` | See active locks and ownership zones |
 | `get_history` | Query session message history |
 
@@ -73,110 +121,153 @@ bun cli.ts dashboard
 
 | Tool | Description |
 |------|-------------|
-| `create_team` | Spawn a team of agents with roles |
-| `get_team_status` | Live status of all agents |
+| `create_team` | Spawn a team with roles, file ownership, and a plan |
+| `get_team_status` | Live status of all agents with completion tracking |
 | `broadcast_to_team` | Message all agents at once |
 | `direct_agent` | Message a specific agent by name/role |
-| `add_agent` | Spawn an additional agent mid-session |
-| `remove_agent` | Gracefully stop an agent |
+| `add_agent` / `remove_agent` | Add or remove agents mid-session |
 | `control_session` | Pause/resume all or individual agents |
 | `adjust_guardrail` | View or change session limits |
+| `release_agent` / `release_all` | Release agents to disconnect |
 | `get_session_log` | Full message history |
-| `end_session` | Stop all agents, archive session |
+| `list_sessions` / `resume_session` | List and resume previous sessions |
+| `end_session` / `delete_session` | Archive or permanently delete |
+| `cleanup_dead_slots` | Remove stale disconnected slots |
+| `get_guide` | Built-in documentation and tutorials |
 
 ## Sessions
 
 Sessions persist across agent restarts:
 
 ```bash
-# Create a session
-bun cli.ts session create "Auth Implementation"
-
-# List sessions
-bun cli.ts session list
-
-# Resume a previous session (reconnects agents to their slots)
-bun cli.ts session resume auth-implementation
-
-# Export transcript
-bun cli.ts session export auth-implementation
+multiagents session create "Auth Feature"    # Create session
+multiagents session list                     # List all sessions
+multiagents session resume auth-feature      # Resume (respawns agents)
+multiagents session pause                    # Pause all agents
+multiagents session delete auth-feature      # Permanently delete
 ```
 
 ## File Coordination
 
-Two mechanisms prevent agents from stepping on each other:
-
 **Ownership Zones** (static, zero overhead):
 ```
-Architect assigns: Builder-1 owns src/auth/*, Builder-2 owns src/email/*
+create_team assigns: Engineer owns src/**, Reviewer owns tests/**
 ```
 
 **File Locks** (dynamic, for shared files):
 ```
-Builder-1: acquire_file("package.json", "adding dependency")
--> Lock acquired, auto-expires in 5 minutes
+Engineer: acquire_file("package.json", "adding dependency")
+→ Lock acquired, auto-expires in 5 minutes
 ```
 
 ## Guardrails
 
-Dynamic limits that protect against runaway sessions:
+Session monitoring stats and enforced limits:
 
-| Guardrail | Default | Action |
-|-----------|---------|--------|
-| Session Duration | 30 min | Pause |
-| Messages Per Agent | 200 | Pause |
-| Max Agents | 6 | Stop |
-| Restarts Per Agent | 3 | Stop |
-| Files Changed | 50 | Warn |
-| Agent Idle Timeout | 3 min | Warn |
+| Guardrail | Default | Scope | Action |
+|-----------|---------|-------|--------|
+| Restart Limit | 5 | Per agent | Stop (prevents flapping) |
+| Session Duration | Monitor | Session | Observe |
+| Total Messages | Monitor | Session | Observe |
+| Active Agents | Monitor | Session | Observe |
+| Longest Idle | Monitor | Per agent | Observe |
 
-All adjustable at runtime. When triggered, agents pause and the user can increase the limit to resume.
+Adjustable from the TUI dashboard (+/- keys) or via `adjust_guardrail` tool.
+
+## TUI Dashboard
+
+```bash
+multiagents dashboard [session-id]
+```
+
+5-tab interface:
+- **[1] Agents**: connection status, task state, summaries
+- **[2] Messages**: auto-scrolling message log with filtering
+- **[3] Stats**: guardrail monitoring and adjustment
+- **[4] Plan**: progress tracking with completion percentage
+- **[5] Files**: file locks and ownership zones
+
+Keys: `1-5` switch tabs, `j/k` scroll, `p` pause all, `r` resume all, `+/-` adjust guardrails, `q` quit.
 
 ## CLI Commands
 
 ```
 multiagents setup                     Interactive setup wizard
-multiagents dashboard                 Live TUI dashboard
-multiagents session create <name>     Create session
-multiagents session list              List all sessions
-multiagents session resume [id]       Resume a session
-multiagents session pause [id]        Pause all agents
-multiagents session archive <id>      Archive session
-multiagents session export <id>       Export transcript
-multiagents send <target> <msg>       Send message
-multiagents peers                     List active peers
+multiagents dashboard [session-id]    TUI dashboard
+multiagents session <sub>             Session management (create/list/resume/pause/delete)
+multiagents send <target> <msg>       Send message to agent
+multiagents peers                     List connected agents
 multiagents status                    Broker health + peers
-multiagents broker start|stop|status  Manage broker
+multiagents broker start|stop|status  Manage broker daemon
+multiagents install-mcp               Configure MCP servers
+multiagents help [command]            Detailed help
 ```
 
 ## Architecture
 
 ```
 multiagents/
-├── shared/           Type definitions, broker client, constants, utils
-├── adapters/         Agent-specific MCP servers (Claude, Codex, Gemini)
-├── orchestrator/     Claude Desktop orchestration (team management)
-├── cli/              CLI tools (setup, dashboard, session management)
-├── broker.ts         SQLite broker daemon (sessions, slots, locks, guardrails)
-├── server.ts         Thin entry point (dispatches to adapter by --agent-type)
-└── cli.ts            CLI entry point
+├── broker.ts               SQLite broker daemon (sessions, slots, locks, messages, guardrails)
+├── server.ts               MCP server entry point (dispatches to adapter by --agent-type)
+├── cli.ts                  CLI entry point
+├── shared/
+│   ├── types.ts            Type definitions (Peer, Slot, Session, Message, TaskState...)
+│   ├── broker-client.ts    HTTP client for broker API
+│   ├── constants.ts        Ports, intervals, thresholds
+│   ├── summarize.ts        Auto-summary generation
+│   └── utils.ts            Shared utilities
+├── adapters/
+│   ├── base-adapter.ts     Abstract MCP adapter (tools, registration, polling)
+│   ├── claude-adapter.ts   Claude Code adapter (channel push delivery)
+│   ├── codex-adapter.ts    Codex adapter (piggyback + file inbox delivery)
+│   ├── gemini-adapter.ts   Gemini adapter (piggyback + file inbox delivery)
+│   └── role-practices.ts   Role-specific best practices injection
+├── orchestrator/
+│   ├── orchestrator-server.ts  Orchestrator MCP server (team management)
+│   ├── codex-driver.ts     CodexDriver: persistent codex mcp-server via MCP JSON-RPC
+│   ├── launcher.ts         Agent spawning (CLI args, MCP configs, CodexDriver)
+│   ├── monitor.ts          Process monitoring (stdout parsing, token tracking)
+│   ├── recovery.ts         Crash recovery (flap detection, respawn with context)
+│   ├── progress.ts         Team status aggregation
+│   ├── session-control.ts  Pause/resume/broadcast
+│   ├── guardrails.ts       Guardrail enforcement
+│   └── guide.ts            Built-in documentation
+└── cli/
+    ├── commands.ts         CLI command router
+    ├── dashboard.ts        TUI dashboard (ANSI, no dependencies)
+    ├── session.ts          Session management commands
+    ├── setup.ts            Interactive setup wizard
+    └── install-mcp.ts      MCP server configuration
 ```
+
+## Process Lifecycle
+
+### Graceful Shutdown
+- **Broker** (`SIGINT`/`SIGTERM`): kills all registered peer processes, closes SQLite cleanly
+- **Orchestrator** (`SIGINT`/`SIGTERM`): kills all managed agent processes and CodexDriver instances
+- **Adapters** (`SIGINT`/`SIGTERM`): unregister from broker, release file locks
+
+### Orphan Prevention
+- Broker's `cleanStalePeers` runs every 30s: removes dead peer records, kills orphan processes without sessions
+- CodexDriver uses `.multiagents/.driver-mode` sentinel file to prevent internal MCP adapters from creating ghost slots
+- Session delete/end handlers kill both regular processes and CodexDriver instances
+- Flap detection stops auto-restart after 3 crashes in 5 minutes
 
 ## Environment Variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MULTIAGENTS_PORT` | 7899 | Broker HTTP port |
+| `MULTIAGENTS_PORT` | `7899` | Broker HTTP port |
 | `MULTIAGENTS_DB` | `~/.multiagents/peers.db` | SQLite database path |
-| `ANTHROPIC_API_KEY` | - | Auto-summary via Claude |
-| `OPENAI_API_KEY` | - | Auto-summary via OpenAI (fallback) |
 | `MULTIAGENTS_SESSION` | - | Session ID (set by orchestrator) |
+| `MULTIAGENTS_SLOT` | - | Slot ID (set by orchestrator) |
 | `MULTIAGENTS_ROLE` | - | Agent role (set by orchestrator) |
 | `MULTIAGENTS_NAME` | - | Agent display name (set by orchestrator) |
+| `MULTIAGENTS_DRIVER_MODE` | - | Skip adapter registration (set by CodexDriver) |
 
 ## Requirements
 
-- [Bun](https://bun.sh/) runtime
+- [Bun](https://bun.sh/) runtime (v1.1+)
 - At least one of: Claude Code, Codex CLI, or Gemini CLI
 
 ## License
