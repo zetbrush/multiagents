@@ -1319,20 +1319,24 @@ Bun.serve({
           const allSlots = db.query("SELECT * FROM slots WHERE session_id = ? AND id != ?").all(session_id, peer.slot_id) as any[];
           const thisSlot = db.query("SELECT * FROM slots WHERE id = ?").get(peer.slot_id) as any;
 
+          let notifiedCount = 0;
           for (const targetSlot of allSlots) {
-            if (targetSlot.status === "connected" && targetSlot.peer_id) {
+            // Notify connected peers AND driver-managed slots (no peer_id but status=connected)
+            if (targetSlot.status === "connected") {
               const isReviewerLike = targetSlot.role && /qa|review|test|lead/i.test(targetSlot.role);
               const msgType = isReviewerLike ? "review_request" : "task_complete";
+              const toId = targetSlot.peer_id ?? `__slot_${targetSlot.id}__`;
               db.run(
                 "INSERT INTO messages (session_id, from_id, from_slot_id, to_id, to_slot_id, text, msg_type, sent_at, delivered, held) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-                [session_id, peer_id, peer.slot_id, targetSlot.peer_id, targetSlot.id,
+                [session_id, peer_id, peer.slot_id, toId, targetSlot.id,
                  `${thisSlot.display_name || peer_id} (${thisSlot.role || "unknown"}) has completed their work: ${summary}`,
                  msgType, new Date().toISOString(), targetSlot.paused ? 1 : 0]
               );
+              notifiedCount++;
             }
           }
 
-          return Response.json({ ok: true, task_state: "done_pending_review" });
+          return Response.json({ ok: true, task_state: "done_pending_review", notified_count: notifiedCount });
         }
 
         case "/lifecycle/submit-feedback": {
@@ -1345,13 +1349,14 @@ Bun.serve({
             db.run("UPDATE slots SET task_state = 'addressing_feedback' WHERE id = ?", [target_slot_id]);
           }
 
+          const feedbackToId = targetSlot.peer_id ?? `__slot_${target_slot_id}__`;
           db.run(
             "INSERT INTO messages (session_id, from_id, from_slot_id, to_id, to_slot_id, text, msg_type, sent_at, delivered, held) VALUES (?, ?, ?, ?, ?, ?, 'feedback', ?, 0, ?)",
-            [session_id, peer_id, peer?.slot_id ?? null, targetSlot.peer_id, target_slot_id,
+            [session_id, peer_id, peer?.slot_id ?? null, feedbackToId, target_slot_id,
              feedback, new Date().toISOString(), targetSlot.paused ? 1 : 0]
           );
 
-          return Response.json({ ok: true, task_state: actionable ? "addressing_feedback" : targetSlot.task_state });
+          return Response.json({ ok: true, task_state: actionable ? "addressing_feedback" : targetSlot.task_state, notified_count: 1 });
         }
 
         case "/lifecycle/approve": {
@@ -1365,9 +1370,10 @@ Bun.serve({
           const approverRole = approverSlot?.role ?? "unknown";
 
           // Record the approval message first
+          const approveToId = targetSlot.peer_id ?? `__slot_${target_slot_id}__`;
           db.run(
             "INSERT INTO messages (session_id, from_id, from_slot_id, to_id, to_slot_id, text, msg_type, sent_at, delivered, held) VALUES (?, ?, ?, ?, ?, ?, 'approval', ?, 0, ?)",
-            [session_id, peer_id, peer?.slot_id ?? null, targetSlot.peer_id, target_slot_id,
+            [session_id, peer_id, peer?.slot_id ?? null, approveToId, target_slot_id,
              `APPROVED by ${approverName} (${approverRole})${message ? ": " + message : ""}`,
              new Date().toISOString(), targetSlot.paused ? 1 : 0]
           );

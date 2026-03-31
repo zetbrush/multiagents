@@ -127,6 +127,18 @@ async function readStream(
 /** Track which slots have already been transitioned to "working" (avoid repeated broker calls). */
 const transitionedToWorking = new Set<number>();
 
+/** Clear all tracking state for a slot (call on release/session end). */
+export function clearSlotTracking(slotId: number): void {
+  lastTokenTotals.delete(slotId);
+  transitionedToWorking.delete(slotId);
+}
+
+/** Clear all tracking state (call on full session cleanup). */
+export function clearAllTracking(): void {
+  lastTokenTotals.clear();
+  transitionedToWorking.clear();
+}
+
 /** Auto-transition task_state from "idle" to "working" on first detected activity. */
 async function autoTransitionToWorking(slotId: number, brokerClient: BrokerClient): Promise<void> {
   if (transitionedToWorking.has(slotId)) return;

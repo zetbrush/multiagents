@@ -17,6 +17,16 @@ const LOG_PREFIX = "recovery";
 /** Track crash timestamps per slot for flap detection. */
 const crashHistory: Map<number, number[]> = new Map();
 
+/** Clear crash history for a slot (call on release/session end). */
+export function clearCrashHistory(slotId: number): void {
+  crashHistory.delete(slotId);
+}
+
+/** Clear all crash history (call on session cleanup). */
+export function clearAllCrashHistory(): void {
+  crashHistory.clear();
+}
+
 /**
  * Handle an agent crash: check for flapping, gather context, and return
  * an event with suggested actions.

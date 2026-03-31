@@ -28,10 +28,10 @@ import {
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
-import { monitorProcess, type AgentEvent } from "./monitor.ts";
+import { monitorProcess, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
-import { handleAgentCrash } from "./recovery.ts";
+import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget } from "./session-control.ts";
 
 const LOG_PREFIX = "orchestrator";
@@ -1152,6 +1152,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           status: "archived",
         });
 
+        // Clean up per-slot tracking state (memory leak prevention)
+        for (const slot of slots) {
+          clearSlotTracking(slot.id);
+          completionRestartHistory.delete(slot.id);
+        }
+        clearAllCrashHistory();
+        activeSessions.delete(session_id);
+
         let prMessage = "";
         if (create_pr) {
           prMessage = "\nNote: PR creation should be done by running `gh pr create` in the project directory.";
@@ -1186,6 +1194,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           activeCodexDrivers.delete(session_id);
         }
         activeSessions.delete(session_id);
+
+        // Clean up per-slot tracking state (memory leak prevention)
+        clearAllTracking();
+        clearAllCrashHistory();
+        completionRestartHistory.clear();
 
         const result = await brokerClient.deleteSession(session_id);
         if (!result.ok) {

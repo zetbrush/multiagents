@@ -1065,10 +1065,14 @@ export abstract class BaseAdapter {
       }
     }
 
+    // Immediate self-poll: pick up any instant responses (acks, auto-feedback)
+    this.pollLoop().catch(() => {});
+
+    const notified = (result as any).notified_count ?? 0;
     return {
       content: [{
         type: "text",
-        text: `Task state: ${result.task_state}. Your team has been notified. Stay active — you may receive feedback that requires changes. Do NOT disconnect.`,
+        text: `Task state: ${result.task_state}. ${notified} teammate(s) notified. Stay active — you may receive feedback that requires changes. Do NOT disconnect.`,
       }],
     };
   }
@@ -1089,6 +1093,8 @@ export abstract class BaseAdapter {
       actionable: args.actionable,
     });
     const action = args.actionable ? "Agent sent back to address feedback." : "Informational feedback sent.";
+    // Immediate self-poll to pick up any responses
+    this.pollLoop().catch(() => {});
     return {
       content: [{ type: "text", text: `Feedback sent to ${targetSlot.display_name || targetSlot.role || targetSlot.id}. ${action} Task state: ${result.task_state}` }],
     };
@@ -1108,6 +1114,8 @@ export abstract class BaseAdapter {
       target_slot_id: targetSlot.id,
       message: args.message,
     });
+    // Immediate self-poll to pick up any responses
+    this.pollLoop().catch(() => {});
     return {
       content: [{ type: "text", text: `Approved ${targetSlot.display_name || targetSlot.role}. Task state: ${result.task_state}` }],
     };
