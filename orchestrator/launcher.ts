@@ -122,24 +122,37 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string): P
   mcpConfig.mcpServers = mcpServers;
   await Bun.write(mcpJsonPath, JSON.stringify(mcpConfig, null, 2));
 
-  // --- Codex: .codex/config.toml ---
-  const codexDir = path.join(projectDir, ".codex");
-  if (!fs.existsSync(codexDir)) fs.mkdirSync(codexDir, { recursive: true });
+  // --- Codex: ~/.codex/config.toml (GLOBAL, not project-level) ---
+  // CRITICAL: Codex CLI only loads MCP servers from the GLOBAL config at
+  // ~/.codex/config.toml. Project-level .codex/config.toml is ignored for
+  // MCP server discovery, and `-c mcp_servers.*` overrides are silently
+  // dropped. The ONLY way to inject MCP servers is the global config file.
+  const codexGlobalDir = path.join(process.env.HOME ?? "", ".codex");
+  if (!fs.existsSync(codexGlobalDir)) fs.mkdirSync(codexGlobalDir, { recursive: true });
 
-  const codexTomlPath = path.join(codexDir, "config.toml");
+  const codexTomlPath = path.join(codexGlobalDir, "config.toml");
   let codexToml = "";
   try { codexToml = await Bun.file(codexTomlPath).text(); } catch { /* ok */ }
 
-  // Add multiagents-peer section if not present (avoids collision with global "multiagents")
-  // Remove stale "multiagents" entries from older versions
-  if (codexToml.includes("[mcp_servers.multiagents]") && !codexToml.includes("[mcp_servers.multiagents-peer]") && !codexToml.includes('[mcp_servers."multiagents-peer"]')) {
-    codexToml = codexToml.replace(/\[mcp_servers\.multiagents\][^\[]*/s, "");
+  // Helper: remove a TOML section by header. Matches from the header line
+  // up to (but not including) the next section header or end of file.
+  // Uses `^[` anchor to detect next section — handles values containing `[`.
+  const removeTomlSection = (toml: string, header: RegExp): string =>
+    toml.replace(new RegExp(header.source + "\\n(?:(?!^\\[).)*", "ms"), "");
+
+  // Remove stale "multiagents" entries that point to wrong paths (e.g.
+  // /usr/local/lib/... when the package was installed via Bun at ~/.bun/...)
+  if (codexToml.includes("[mcp_servers.multiagents]")) {
+    codexToml = removeTomlSection(codexToml, /^\[mcp_servers\.multiagents\]\s*$/m);
   }
-  if (!codexToml.includes("multiagents-peer")) {
-    const codexMcp = mcpServerCommand("codex");
-    const entry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\n`;
-    await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + entry);
+
+  // Remove existing multiagents-peer section (will be re-added below with fresh path)
+  if (codexToml.includes("multiagents-peer")) {
+    codexToml = removeTomlSection(codexToml, /^\[mcp_servers[.]"?multiagents-peer"?\]\s*$/m);
   }
+  const codexMcp = mcpServerCommand("codex");
+  const codexEntry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\n`;
+  await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + codexEntry);
 
   // --- Gemini: ~/.gemini/settings.json ---
   const geminiSettingsPath = path.join(process.env.HOME ?? "", ".gemini", "settings.json");
@@ -257,22 +270,56 @@ export async function launchAgent(
   // because agents read the -p flag first and may start working before MCP tools load.
   // Without explicit enforcement here, agents execute their task using native tools only
   // and never call check_messages, set_summary, or signal_done.
+  // Codex/Gemini agents get file-based inbox instructions since they lack push notifications
+  const isNonPushAgent = config.agent_type === "codex" || config.agent_type === "gemini";
+
   const taskPrompt = [
     `You are "${config.name}", role: ${config.role}.`,
     enrichedDescription,
     "",
     `Your task: ${config.initial_task}`,
     "",
-    "MANDATORY STARTUP SEQUENCE (do these FIRST, before any other work):",
-    "1. Call the multiagents MCP tool set_summary with a brief description of your task",
-    "2. Call check_team_status to see your teammates and their roles",
-    "3. Call get_plan to see the team plan and your assigned items",
-    "4. Call check_messages to read any messages from teammates",
-    "5. ONLY THEN begin your work",
+    "╔══════════════════════════════════════════════════════════════╗",
+    "║  MANDATORY: USE multiagents-peer MCP TOOLS — NOT OPTIONAL  ║",
+    "╚══════════════════════════════════════════════════════════════╝",
     "",
-    "MANDATORY ONGOING: Call check_messages after every major action (file write, build, test run).",
-    "When your work is complete: call signal_done with a summary of what you did and test results.",
-    "NEVER work silently — your teammates depend on your status updates via set_summary and messages.",
+    "You have an MCP server called 'multiagents-peer' with tools for team communication.",
+    "These are NOT optional. You MUST call them. Your team is BLOCKED until you do.",
+    "",
+    "STEP 1 — DO THESE FIRST (before ANY other work, before reading files, before running commands):",
+    "  → Call set_summary with a 1-line description of your task",
+    "  → Call check_team_status to see your teammates",
+    "  → Call get_plan to see the team plan",
+    "  → Call check_messages to read messages from teammates",
+    "",
+    "STEP 2 — WHILE WORKING (after EVERY file write, EVERY shell command, EVERY build):",
+    "  → Call check_messages — teammates may have sent you critical info",
+    "  → Call set_summary with what you're currently doing",
+    "  → Call update_plan when you start or finish a plan item",
+    ...(isNonPushAgent ? [
+      `  → Read .multiagents/inbox/${config.name}.md — messages arrive here in real-time`,
+    ] : []),
+    "",
+    "STEP 3 — WHEN DONE:",
+    "  → Call signal_done with: what you built, what you tested, what the results were",
+    "  → Stay active — call check_messages every 10 seconds waiting for review feedback",
+    "  → If you get feedback: fix issues, then call signal_done again",
+    "",
+    "STEP 4 — WHEN TEAMMATES MESSAGE YOU:",
+    "  → Reply IMMEDIATELY via send_message. They are waiting on you.",
+    "  → If you need time, reply 'Working on it, will respond in ~N minutes'",
+    "",
+    "FAILURE MODES (your team will be stuck if you do these):",
+    "  ✗ Working for 1+ minute without calling check_messages",
+    "  ✗ Finishing work without calling signal_done",
+    "  ✗ Receiving a message and not replying via send_message",
+    "  ✗ Not calling set_summary — teammates can't see what you're doing",
+    "  ✗ Using shell commands to read broker state instead of MCP tools",
+    "",
+    "The multiagents-peer MCP tools are: set_summary, check_messages, send_message,",
+    "check_team_status, get_plan, update_plan, signal_done, submit_feedback, approve,",
+    "list_peers, acquire_file, release_file, view_file_locks, get_history.",
+    "Use THESE tools. Do NOT try to call the broker via CLI or HTTP — use the MCP tools.",
   ].join("\n");
 
   // Build CLI args based on agent type
@@ -352,13 +399,22 @@ export async function relaunchIntoSlot(
   }, projectDir);
 
   // Build the task prompt with mandatory MCP enforcement
+  const agentName = slot.display_name ?? `Agent #${slot.id}`;
+  const isNonPush = slot.agent_type === "codex" || slot.agent_type === "gemini";
   const taskPrompt = [
-    `You are "${slot.display_name ?? `Agent #${slot.id}`}", role: ${slot.role ?? "general"}.`,
+    `You are "${agentName}", role: ${slot.role ?? "general"}.`,
     enrichedDescription,
     "",
     handoffTask,
     "",
-    "MANDATORY: Call check_messages after every major action. Call signal_done when your work is complete. NEVER work silently.",
+    "═══ MANDATORY: USE multiagents-peer MCP TOOLS ═══",
+    "BEFORE any work: call set_summary, check_team_status, get_plan, check_messages (in that order).",
+    "AFTER every file write/shell command: call check_messages + set_summary.",
+    "WHEN done: call signal_done with proof of what you did and tested.",
+    "WHEN messaged: reply via send_message IMMEDIATELY — teammates are blocked on you.",
+    ...(isNonPush ? [`Also read .multiagents/inbox/${agentName}.md for real-time messages.`] : []),
+    "NEVER work 1+ minute without calling check_messages. NEVER finish without signal_done.",
+    "Your team CANNOT see your work unless you use these MCP tools.",
   ].join("\n");
 
   const args = buildCliArgs(slot.agent_type, taskPrompt);
@@ -431,28 +487,18 @@ export function buildCliArgs(agentType: AgentType, task: string): string[] {
       ];
     }
     case "codex": {
-      // Inject multiagents MCP via dotted-path config overrides.
-      // Use "multiagents-peer" to avoid collision with globally-installed
-      // "multiagents" server (same reason as Claude — see comment above).
-      const codexMcp = mcpServerCommand("codex");
-      const argsJson = JSON.stringify(codexMcp.args);
-      const overrides: string[] = [
-        `mcp_servers."multiagents-peer".command="${codexMcp.command}"`,
-        `mcp_servers."multiagents-peer".args=${argsJson}`,
-        'model_reasoning_effort="high"',
-      ];
-
-      const args: string[] = [
+      // IMPORTANT: Codex CLI's `-c` flag does NOT support injecting MCP servers.
+      // MCP servers are loaded exclusively from ~/.codex/config.toml (global).
+      // The `-c mcp_servers.*` overrides are silently ignored.
+      // MCP injection is handled by ensureMcpConfigs() writing to the global config.
+      return [
         "exec",
         "--sandbox", "workspace-write",
         "--full-auto",
         "--json",
+        "-c", 'model_reasoning_effort="high"',
+        task,
       ];
-      for (const override of overrides) {
-        args.push("-c", override);
-      }
-      args.push(task);
-      return args;
     }
     case "gemini": {
       // Gemini CLI is invoked via npx. MCP is configured at user level

@@ -167,6 +167,97 @@ async function processLine(
       }, brokerClient);
     }
 
+    // Codex JSONL activity events — update context_snapshot so the
+    // orchestrator knows the agent is active (prevents false "silent" nudges).
+    // Codex `--json` emits JSONL with this structure:
+    //   {type:"item.completed", item:{type:"agent_message", text:"..."}}
+    //   {type:"item.completed", item:{type:"command_execution", command:"...", aggregated_output:"..."}}
+    //   {type:"item.completed", item:{type:"mcp_tool_call", server:"...", tool:"...", result:{...}}}
+    // Also handles legacy format: {msg:{type:"message"|"exec_command_output"|"mcp_tool_call",...}}
+    const codexItem = parsed.item ?? parsed.msg;
+    if (parsed.type === "item.completed" && codexItem) {
+      const itemType = codexItem.type;
+
+      if (itemType === "agent_message" && codexItem.text) {
+        try {
+          const summary = codexItem.text.slice(0, 200);
+          await brokerClient.updateSlot({
+            id: slotId,
+            context_snapshot: JSON.stringify({
+              last_summary: summary,
+              last_status: "working",
+              updated_at: Date.now(),
+            }),
+          });
+        } catch {
+          // Best-effort snapshot update
+        }
+      }
+
+      if (itemType === "command_execution") {
+        try {
+          await brokerClient.updateSlot({
+            id: slotId,
+            context_snapshot: JSON.stringify({
+              last_summary: `Running: ${(codexItem.command ?? "shell command").slice(0, 100)}`,
+              last_status: "working",
+              updated_at: Date.now(),
+            }),
+          });
+        } catch { /* best-effort */ }
+      }
+
+      if (itemType === "mcp_tool_call") {
+        try {
+          await brokerClient.updateSlot({
+            id: slotId,
+            context_snapshot: JSON.stringify({
+              last_summary: `MCP: ${codexItem.server ?? ""}/${codexItem.tool ?? "unknown"}`.slice(0, 100),
+              last_status: "working",
+              updated_at: Date.now(),
+            }),
+          });
+        } catch { /* best-effort */ }
+      }
+    }
+
+    // Legacy Codex format (older versions): {msg:{type:"message"|"exec_command_output",...}}
+    if (parsed.msg?.type === "message" && parsed.msg?.role === "assistant") {
+      try {
+        const content = parsed.msg.content;
+        const contentText = Array.isArray(content)
+          ? content
+              .filter((c: any) => c.type === "output_text")
+              .map((c: any) => c.text)
+              .join("")
+          : typeof content === "string" ? content : "";
+        if (contentText) {
+          await brokerClient.updateSlot({
+            id: slotId,
+            context_snapshot: JSON.stringify({
+              last_summary: contentText.slice(0, 200),
+              last_status: "working",
+              updated_at: Date.now(),
+            }),
+          });
+        }
+      } catch { /* best-effort */ }
+    }
+    if (parsed.msg?.type === "exec_command_output" || parsed.msg?.type === "mcp_tool_call") {
+      try {
+        await brokerClient.updateSlot({
+          id: slotId,
+          context_snapshot: JSON.stringify({
+            last_summary: parsed.msg.type === "exec_command_output"
+              ? `Running: ${(parsed.msg.info?.command ?? "shell command").slice(0, 100)}`
+              : `MCP tool: ${(parsed.msg.info?.tool_name ?? "unknown").slice(0, 100)}`,
+            last_status: "working",
+            updated_at: Date.now(),
+          }),
+        });
+      } catch { /* best-effort */ }
+    }
+
     // Claude stream-json assistant message with content
     if (parsed.type === "assistant" && parsed.message?.content) {
       // Update the slot's context snapshot with latest output

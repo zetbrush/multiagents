@@ -1383,7 +1383,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     }
   }, 60_000);
 
-  // Stuck agent nudge loop — every 45s, nudge agents silent for >2 min
+  // Stuck agent nudge loop — every 45s, nudge agents silent for >1 min
   setInterval(async () => {
     for (const sessionId of activeProcesses.keys()) {
       try {
@@ -1404,7 +1404,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           })();
 
           const silentMs = Date.now() - lastActivity;
-          if (silentMs > 2 * 60 * 1000) {
+          if (silentMs > 1 * 60 * 1000) {
             const agentName = slot.display_name || `slot ${slot.id}`;
             const silentMin = Math.round(silentMs / 60000);
 
