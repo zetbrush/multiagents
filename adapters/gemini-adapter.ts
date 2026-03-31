@@ -102,7 +102,8 @@ QUALITY: Production-grade code. Plan before coding. Verify before signaling done
       return null;
     }
 
-    this.inboxPath = path.join(inboxDir, `${name}.md`);
+    const safeName = path.basename(name).replace(/[^a-zA-Z0-9_\-. ]/g, "_");
+    this.inboxPath = path.join(inboxDir, `${safeName}.md`);
 
     try {
       fs.writeFileSync(this.inboxPath, `# Inbox for ${name}\n\nMessages from teammates appear below. Newest at bottom.\n\n---\n\n`);

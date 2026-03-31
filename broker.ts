@@ -300,6 +300,21 @@ function cleanStalePeers() {
 
   // Clean expired file locks
   db.run("DELETE FROM file_locks WHERE expires_at < ?", [now]);
+
+  // Clean orphan peers: alive processes with no session that have been idle for >5 min.
+  // These are typically multiagents-peer adapters spawned by codex mcp-server
+  // that outlived their parent process.
+  const orphans = db.query(
+    "SELECT id, pid, last_seen FROM peers WHERE session_id IS NULL"
+  ).all() as { id: string; pid: number; last_seen: string }[];
+  for (const orphan of orphans) {
+    const idleMs = now - new Date(orphan.last_seen).getTime();
+    if (idleMs > 5 * 60 * 1000) {
+      // Kill the orphan process
+      try { process.kill(orphan.pid, "SIGTERM"); } catch { /* already dead */ }
+      db.run("DELETE FROM peers WHERE id = ?", [orphan.id]);
+    }
+  }
 }
 
 cleanStalePeers();
@@ -1439,3 +1454,21 @@ Bun.serve({
 });
 
 console.error(`[multiagents broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+
+// --- Graceful shutdown: kill all registered peers and close DB ---
+function shutdownBroker() {
+  console.error("[multiagents broker] shutting down...");
+  // Kill all registered peer processes so they don't become orphans
+  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  for (const peer of peers) {
+    try {
+      process.kill(peer.pid, "SIGTERM");
+    } catch { /* already dead */ }
+  }
+  // Close DB cleanly (flushes WAL)
+  try { db.close(); } catch {}
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdownBroker);
+process.on("SIGTERM", shutdownBroker);

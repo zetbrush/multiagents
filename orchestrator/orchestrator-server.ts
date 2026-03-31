@@ -124,14 +124,35 @@ function handleEvent(event: AgentEvent): void {
               const { respawnAgent } = await import("./recovery.ts");
               const result = await respawnAgent(event.sessionId, event.slotId, brokerClient, sessionMeta.projectDir);
 
-              // CRITICAL: Track + monitor the new process — without this the
-              // respawned process runs orphaned (nobody reads its stdout/exit)
+              // CRITICAL: Track the new process and CodexDriver
               const sessionProcs = activeProcesses.get(event.sessionId);
               if (sessionProcs && result.process) {
                 sessionProcs.set(event.slotId, result.process);
-                monitorProcess(result.process, event.slotId, event.sessionId, brokerClient, handleEvent);
               }
-              log(LOG_PREFIX, `Auto-respawned crashed agent slot ${event.slotId} (PID ${result.pid})`);
+
+              // If respawned as CodexDriver, track in activeCodexDrivers (not monitorProcess)
+              if (result.codexDriver) {
+                let drivers = activeCodexDrivers.get(event.sessionId);
+                if (!drivers) {
+                  drivers = new Map();
+                  activeCodexDrivers.set(event.sessionId, drivers);
+                }
+                drivers.set(event.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId });
+                result.codexDriver.onExit(() => {
+                  handleEvent({
+                    type: "agent_crashed", severity: "critical",
+                    slotId: event.slotId, sessionId: event.sessionId,
+                    message: `Codex driver for slot ${event.slotId} exited after respawn`,
+                    data: { exit_code: -1 },
+                  });
+                });
+              } else {
+                // Non-Codex: traditional process monitoring
+                if (sessionProcs && result.process) {
+                  monitorProcess(result.process, event.slotId, event.sessionId, brokerClient, handleEvent);
+                }
+              }
+              log(LOG_PREFIX, `Auto-respawned slot ${event.slotId} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : ""})`);
 
               pendingEvents.push({
                 type: "agent_restarted",
@@ -1080,11 +1101,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionProcs) {
           for (const [slotId, proc] of sessionProcs) {
             log(LOG_PREFIX, `Stopping agent in slot ${slotId}`);
-            proc.kill();
+            try { proc.kill(); } catch { /* already dead */ }
           }
           sessionProcs.clear();
           activeProcesses.delete(session_id);
         }
+
+        // Kill CodexDriver processes
+        const sessionDrivers = activeCodexDrivers.get(session_id);
+        if (sessionDrivers) {
+          for (const [slotId, state] of sessionDrivers) {
+            log(LOG_PREFIX, `Stopping Codex driver in slot ${slotId}`);
+            try { state.driver.kill(); } catch { /* already dead */ }
+          }
+          sessionDrivers.clear();
+          activeCodexDrivers.delete(session_id);
+        }
+
+        // Clean driver-mode sentinel file
+        try {
+          const session = await brokerClient.getSession(session_id);
+          const sentinelPath = require("node:path").join(session.project_dir, ".multiagents", ".driver-mode");
+          require("node:fs").unlinkSync(sentinelPath);
+        } catch { /* ok */ }
 
         // Mark all slots as disconnected
         const slots = await brokerClient.listSlots(session_id);
@@ -1124,6 +1163,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             try { proc.kill(); } catch { /* already dead */ }
           }
           activeProcesses.delete(session_id);
+        }
+        // Kill CodexDriver processes
+        const delDrivers = activeCodexDrivers.get(session_id);
+        if (delDrivers) {
+          for (const [, state] of delDrivers) {
+            try { state.driver.kill(); } catch { /* already dead */ }
+          }
+          activeCodexDrivers.delete(session_id);
         }
         activeSessions.delete(session_id);
 
@@ -1638,3 +1685,23 @@ main().catch((err) => {
   console.error(`[orchestrator] Fatal: ${err}`);
   process.exit(1);
 });
+
+// --- Graceful shutdown: kill all managed agent processes ---
+function shutdownOrchestrator() {
+  log(LOG_PREFIX, "Shutting down — killing all managed agent processes");
+  for (const [sessionId, procs] of activeProcesses) {
+    for (const [slotId, proc] of procs) {
+      try { proc.kill(); } catch { /* already dead */ }
+    }
+  }
+  // Kill CodexDriver processes
+  for (const [sessionId, drivers] of activeCodexDrivers) {
+    for (const [slotId, state] of drivers) {
+      try { state.driver.kill(); } catch { /* already dead */ }
+    }
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdownOrchestrator);
+process.on("SIGTERM", shutdownOrchestrator);

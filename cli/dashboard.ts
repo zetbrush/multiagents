@@ -524,7 +524,10 @@ function resolveSlots(state: DashboardState, sid: string | null): Map<number, { 
         matchedPeerIds.add(slotMatch.id);
         result.set(slot.id, { status: "connected", peer: slotMatch });
       } else {
-        // Distinguish "starting" (never connected) from "disconnected" (was connected, now gone)
+        // Distinguish statuses for slots without a matching peer:
+        // - "connected" with no peer = CodexDriver-managed (trust slot.status)
+        // - "disconnected" with no last_connected = still starting up
+        // - "disconnected" with last_connected = was connected, now gone
         let displayStatus: ResolvedSlotStatus = slot.status;
         if (slot.status === "disconnected" && !slot.last_connected) {
           displayStatus = "starting";

@@ -7,6 +7,7 @@
 
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentEvent } from "./monitor.ts";
+import type { CodexDriver } from "./codex-driver.ts";
 import { FLAP_THRESHOLD, FLAP_WINDOW_MS } from "../shared/constants.ts";
 import { log, safeJsonParse, formatDuration } from "../shared/utils.ts";
 import { relaunchIntoSlot, buildTeamContext } from "./launcher.ts";
@@ -121,7 +122,7 @@ export async function respawnAgent(
   slotId: number,
   brokerClient: BrokerClient,
   projectDir: string,
-): Promise<{ pid: number; process: import("bun").Subprocess }> {
+): Promise<{ pid: number; process: import("bun").Subprocess; codexDriver?: CodexDriver }> {
   // Get the crashed slot's info
   const slot = await brokerClient.getSlot(slotId);
   const snapshot = safeJsonParse<{ last_summary?: string; last_status?: string }>(
@@ -161,8 +162,59 @@ export async function respawnAgent(
     .filter(Boolean)
     .join("\n");
 
-  // Relaunch into the EXISTING slot (not a new one) to preserve plan items,
-  // file ownership, message history, and task-state continuity (review finding #3).
+  // For Codex agents, use CodexDriver for respawn (same as initial launch).
+  // Without this, respawned Codex agents run as single-shot `codex exec` and
+  // lose the multi-turn driver, making them unable to receive messages.
+  if (slot.agent_type === "codex") {
+    const { CodexDriver: CD } = await import("./codex-driver.ts");
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+
+    // Write driver-mode sentinel
+    const driverModeFile = path.join(projectDir, ".multiagents", ".driver-mode");
+    try { fs.writeFileSync(driverModeFile, "1"); } catch {}
+
+    const spawnEnv: Record<string, string | undefined> = {
+      ...process.env,
+      MULTIAGENTS_SESSION: sessionId,
+      MULTIAGENTS_SLOT: String(slotId),
+      MULTIAGENTS_ROLE: slot.role ?? undefined,
+      MULTIAGENTS_NAME: slot.display_name ?? undefined,
+      MULTIAGENTS_DRIVER_MODE: "1",
+    };
+    delete spawnEnv.CLAUDECODE;
+
+    const driver = await CD.spawn(projectDir, spawnEnv);
+
+    // Mark slot as connected
+    await brokerClient.updateSlot({ id: slotId, status: "connected" });
+
+    // Two-phase: fast bootstrap then task
+    const bootstrap = await driver.startSession({
+      prompt: `You are "${slot.display_name ?? `Agent #${slotId}`}" (${slot.role ?? "agent"}). You are being restarted. Reply: "Ready."`,
+      cwd: projectDir,
+      sandbox: "workspace-write",
+      developerInstructions: slot.role_description ?? "",
+    });
+
+    // Push handoff task as reply
+    driver.reply(bootstrap.threadId, handoffTask).then(async (result) => {
+      await brokerClient.updateSlot({
+        id: slotId,
+        context_snapshot: JSON.stringify({
+          codex_thread_id: result.threadId,
+          last_summary: result.content.slice(0, 200),
+          last_status: "working",
+          updated_at: Date.now(),
+        }),
+      });
+    }).catch((err) => log(LOG_PREFIX, `Codex respawn task failed: ${err}`));
+
+    log(LOG_PREFIX, `Respawned Codex into slot ${slotId} via CodexDriver (PID ${driver.pid})`);
+    return { pid: driver.pid, process: driver.process, codexDriver: driver };
+  }
+
+  // Non-Codex agents: use traditional relaunch
   const result = await relaunchIntoSlot(sessionId, projectDir, slot, handoffTask, brokerClient);
 
   log(LOG_PREFIX, `Respawned into existing slot ${slotId} (PID ${result.pid})`);
