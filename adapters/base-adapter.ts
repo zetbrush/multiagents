@@ -769,6 +769,8 @@ export abstract class BaseAdapter {
         from_id: this.myId,
         to_id: args.to_id,
         text: args.message,
+        session_id: this.sessionId ?? undefined,
+        from_slot_id: this.mySlot?.id ?? undefined,
       });
       if (!result.ok) {
         return this.errorResult(`Failed to send: ${result.error}`);
@@ -783,12 +785,27 @@ export abstract class BaseAdapter {
     }
   }
 
+  /** Auto-transition slot task_state from "idle" to "working" on first real activity. */
+  private async autoTransitionToWorking(): Promise<void> {
+    if (!this.mySlot || !this.sessionId) return;
+    // Only transition from idle — don't overwrite done_pending_review, addressing_feedback, etc.
+    if (this.mySlot.task_state !== "idle") return;
+    try {
+      this.mySlot = await this.broker.updateSlot({
+        id: this.mySlot.id,
+        task_state: "working",
+      });
+    } catch { /* best effort */ }
+  }
+
   protected async handleSetSummary(args: { summary: string }) {
     if (!this.myId) {
       return this.errorResult("Not registered with broker yet");
     }
     try {
       await this.broker.setSummary(this.myId, args.summary);
+      // Auto-transition to "working" on first summary update
+      await this.autoTransitionToWorking();
       return this.textResult(`Summary updated: "${args.summary}"`);
     } catch (e) {
       return this.errorResult(

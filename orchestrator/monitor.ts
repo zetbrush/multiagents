@@ -124,6 +124,22 @@ async function readStream(
 }
 
 /** Process a single stdout line, attempting JSON parse for structured signals. */
+/** Track which slots have already been transitioned to "working" (avoid repeated broker calls). */
+const transitionedToWorking = new Set<number>();
+
+/** Auto-transition task_state from "idle" to "working" on first detected activity. */
+async function autoTransitionToWorking(slotId: number, brokerClient: BrokerClient): Promise<void> {
+  if (transitionedToWorking.has(slotId)) return;
+  transitionedToWorking.add(slotId);
+  try {
+    const slot = await brokerClient.getSlot(slotId);
+    if (slot.task_state === "idle") {
+      await brokerClient.updateSlot({ id: slotId, task_state: "working" });
+      log(LOG_PREFIX, `Slot ${slotId} auto-transitioned to "working"`);
+    }
+  } catch { /* best effort */ }
+}
+
 async function processLine(
   line: string,
   slotId: number,
@@ -176,6 +192,8 @@ async function processLine(
     // Also handles legacy format: {msg:{type:"message"|"exec_command_output"|"mcp_tool_call",...}}
     const codexItem = parsed.item ?? parsed.msg;
     if (parsed.type === "item.completed" && codexItem) {
+      // Auto-transition to "working" on first Codex activity
+      await autoTransitionToWorking(slotId, brokerClient);
       const itemType = codexItem.type;
 
       if (itemType === "agent_message" && codexItem.text) {
@@ -260,6 +278,8 @@ async function processLine(
 
     // Claude stream-json assistant message with content
     if (parsed.type === "assistant" && parsed.message?.content) {
+      // Auto-transition to "working" on first Claude output
+      await autoTransitionToWorking(slotId, brokerClient);
       // Update the slot's context snapshot with latest output
       try {
         const contentText = Array.isArray(parsed.message.content)
@@ -283,8 +303,9 @@ async function processLine(
       }
     }
 
-    // Tool use signals progress
+    // Tool use signals progress — auto-transition to "working"
     if (parsed.type === "assistant" && parsed.message?.stop_reason === "tool_use") {
+      await autoTransitionToWorking(slotId, brokerClient);
       onEvent({
         type: "agent_progress",
         severity: "info",
