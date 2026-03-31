@@ -51,8 +51,7 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
-    "multiagents": "^0.2.0"
+    "@modelcontextprotocol/sdk": "^1.27.1"
   },
   "repository": {
     "type": "git",

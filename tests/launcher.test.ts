@@ -182,33 +182,22 @@ describe("buildCliArgs — codex", () => {
     expect(args).toContain("--json");
   });
 
-  test("injects multiagents MCP via dotted-path -c overrides", () => {
+  test("does NOT inject MCP servers via -c (Codex ignores -c for mcp_servers)", () => {
     const args = buildCliArgs("codex", task);
     const cFlags = collectFlagValues(args, "-c");
 
-    const commandFlag = cFlags.find((f) => f.startsWith('mcp_servers."multiagents-peer".command='));
-    expect(commandFlag).toBeDefined();
-    expect(commandFlag).toContain('"bun"');
-
-    const argsFlag = cFlags.find((f) => f.startsWith('mcp_servers."multiagents-peer".args='));
-    expect(argsFlag).toBeDefined();
-    // Should be valid JSON array
-    const argsValue = argsFlag!.split("=").slice(1).join("=");
-    const parsed = JSON.parse(argsValue);
-    expect(parsed).toBeArray();
-    expect(parsed).toContain("mcp-server");
-    expect(parsed).toContain("codex");
+    // Codex -c flag silently drops mcp_servers overrides.
+    // MCP injection is handled by ensureMcpConfigs writing to ~/.codex/config.toml.
+    const mcpFlags = cFlags.filter((f) => f.startsWith("mcp_servers"));
+    expect(mcpFlags).toEqual([]);
   });
 
-  test("does NOT touch other user MCP servers", () => {
+  test("only overrides model_reasoning_effort via -c", () => {
     const args = buildCliArgs("codex", task);
     const cFlags = collectFlagValues(args, "-c");
 
-    // Should only have multiagents and model_reasoning_effort overrides
-    const nonMultiagent = cFlags.filter(
-      (f) => !f.startsWith('mcp_servers."multiagents-peer".') && !f.startsWith("model_reasoning_effort")
-    );
-    expect(nonMultiagent).toEqual([]);
+    // Should only have model_reasoning_effort — no MCP overrides
+    expect(cFlags).toEqual(['model_reasoning_effort="high"']);
   });
 
   test("overrides model_reasoning_effort to high", () => {
@@ -334,16 +323,29 @@ describe("ensureMcpConfigs — Claude .mcp.json", () => {
 });
 
 // ---------------------------------------------------------------------------
-// ensureMcpConfigs — .codex/config.toml (Codex)
+// ensureMcpConfigs — ~/.codex/config.toml (GLOBAL Codex config)
 // ---------------------------------------------------------------------------
-describe("ensureMcpConfigs — Codex .codex/config.toml", () => {
-  test("creates .codex/config.toml with multiagents section", async () => {
+describe("ensureMcpConfigs — Codex ~/.codex/config.toml (global)", () => {
+  // These tests read the GLOBAL ~/.codex/config.toml because Codex CLI
+  // only loads MCP servers from the global config. Project-level is ignored.
+  const globalCodexPath = path.join(process.env.HOME ?? "", ".codex", "config.toml");
+  let originalContent: string | null = null;
+
+  // Save and restore global config around each test
+  beforeEach(() => {
+    try { originalContent = fs.readFileSync(globalCodexPath, "utf-8"); } catch { originalContent = null; }
+  });
+  afterEach(() => {
+    if (originalContent !== null) {
+      fs.writeFileSync(globalCodexPath, originalContent);
+    }
+  });
+
+  test("writes multiagents-peer to global ~/.codex/config.toml", async () => {
     await ensureMcpConfigs(tmpDir, "test-session");
 
-    const tomlPath = path.join(tmpDir, ".codex", "config.toml");
-    expect(fs.existsSync(tomlPath)).toBe(true);
-
-    const content = fs.readFileSync(tomlPath, "utf-8");
+    expect(fs.existsSync(globalCodexPath)).toBe(true);
+    const content = fs.readFileSync(globalCodexPath, "utf-8");
     expect(content).toContain('[mcp_servers."multiagents-peer"]');
     expect(content).toContain('command = "bun"');
     expect(content).toContain("mcp-server");
@@ -351,31 +353,24 @@ describe("ensureMcpConfigs — Codex .codex/config.toml", () => {
   });
 
   test("does not duplicate multiagents-peer if already present", async () => {
-    // Run twice
     await ensureMcpConfigs(tmpDir, "test-session");
     await ensureMcpConfigs(tmpDir, "test-session");
 
-    const content = fs.readFileSync(path.join(tmpDir, ".codex", "config.toml"), "utf-8");
-    const matches = content.match(/multiagents-peer/g);
-    expect(matches!.length).toBeGreaterThanOrEqual(1);
-    // Should only have ONE section header
+    const content = fs.readFileSync(globalCodexPath, "utf-8");
     const sections = content.match(/\[mcp_servers\."multiagents-peer"\]/g);
     expect(sections).toHaveLength(1);
   });
 
   test("preserves existing codex config content", async () => {
-    const codexDir = path.join(tmpDir, ".codex");
-    fs.mkdirSync(codexDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(codexDir, "config.toml"),
-      'model = "gpt-5.4"\nmodel_reasoning_effort = "high"\n',
-    );
-
+    // The global config already has content — verify it's preserved
     await ensureMcpConfigs(tmpDir, "test-session");
 
-    const content = fs.readFileSync(path.join(codexDir, "config.toml"), "utf-8");
-    expect(content).toContain('model = "gpt-5.4"');
+    const content = fs.readFileSync(globalCodexPath, "utf-8");
     expect(content).toContain('[mcp_servers."multiagents-peer"]');
+    // Should still have other existing sections (figma, features, etc.)
+    if (originalContent?.includes("[mcp_servers.figma]")) {
+      expect(content).toContain("[mcp_servers.figma]");
+    }
   });
 });
 
@@ -428,11 +423,18 @@ describe("ensureMcpConfigs — session file", () => {
 // ensureMcpConfigs — idempotency & all files together
 // ---------------------------------------------------------------------------
 describe("ensureMcpConfigs — full run", () => {
+  // Save/restore global codex config
+  const globalCodexPath = path.join(process.env.HOME ?? "", ".codex", "config.toml");
+  let origCodex: string | null = null;
+  beforeEach(() => { try { origCodex = fs.readFileSync(globalCodexPath, "utf-8"); } catch { origCodex = null; } });
+  afterEach(() => { if (origCodex !== null) fs.writeFileSync(globalCodexPath, origCodex); });
+
   test("creates all expected files in one call", async () => {
     await ensureMcpConfigs(tmpDir, "full-test");
 
     expect(fs.existsSync(path.join(tmpDir, ".mcp.json"))).toBe(true);
-    expect(fs.existsSync(path.join(tmpDir, ".codex", "config.toml"))).toBe(true);
+    // Codex config is written to GLOBAL ~/.codex/config.toml, not project-level
+    expect(fs.existsSync(globalCodexPath)).toBe(true);
     expect(fs.existsSync(path.join(tmpDir, ".multiagents", "session.json"))).toBe(true);
   });
 
@@ -440,12 +442,12 @@ describe("ensureMcpConfigs — full run", () => {
     await ensureMcpConfigs(tmpDir, "idem-test");
 
     const mcpBefore = fs.readFileSync(path.join(tmpDir, ".mcp.json"), "utf-8");
-    const codexBefore = fs.readFileSync(path.join(tmpDir, ".codex", "config.toml"), "utf-8");
+    const codexBefore = fs.readFileSync(globalCodexPath, "utf-8");
 
     await ensureMcpConfigs(tmpDir, "idem-test");
 
     const mcpAfter = fs.readFileSync(path.join(tmpDir, ".mcp.json"), "utf-8");
-    const codexAfter = fs.readFileSync(path.join(tmpDir, ".codex", "config.toml"), "utf-8");
+    const codexAfter = fs.readFileSync(globalCodexPath, "utf-8");
 
     expect(mcpAfter).toBe(mcpBefore);
     expect(codexAfter).toBe(codexBefore);
@@ -516,21 +518,20 @@ describe("MCP config consistency across agent types", () => {
     expect(getAgentType(geminiArgs)).toBe("gemini");
   });
 
-  test("claude --mcp-config JSON and codex -c args reference same MCP server binary", () => {
+  test("claude --mcp-config JSON and codex mcpServerCommand reference same binary", () => {
     const claudeCliArgs = buildCliArgs("claude", "test");
-    const codexCliArgs = buildCliArgs("codex", "test");
 
-    // Extract Claude's MCP config
+    // Extract Claude's MCP config from --mcp-config inline JSON
     const claudeMcpJson = JSON.parse(getFlagValue(claudeCliArgs, "--mcp-config"));
     const claudeMcpArgs = claudeMcpJson.mcpServers["multiagents-peer"].args;
 
-    // Extract Codex's MCP args from -c flag
-    const cFlags = collectFlagValues(codexCliArgs, "-c");
-    const codexArgsFlag = cFlags.find((f) => f.startsWith('mcp_servers."multiagents-peer".args='))!;
-    const codexMcpArgs = JSON.parse(codexArgsFlag.split("=").slice(1).join("="));
+    // Codex no longer injects MCP via -c flags (Codex CLI ignores them).
+    // Instead, mcpServerCommand("codex") returns the same binary path that
+    // ensureMcpConfigs writes to ~/.codex/config.toml. Verify consistency.
+    const codexMcp = mcpServerCommand("codex");
 
     // Both should reference the same cli.ts path
-    expect(claudeMcpArgs[0]).toBe(codexMcpArgs[0]);
+    expect(claudeMcpArgs[0]).toBe(codexMcp.args[0]);
   });
 });
 

@@ -41,6 +41,9 @@ const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
 const activeProcesses: Map<string, Map<number, Subprocess>> = new Map();
 // Track pending events to push as notifications
 const pendingEvents: AgentEvent[] = [];
+// Track active CodexDriver instances: Map<sessionId, Map<slotId, {driver, threadId}>>
+import type { CodexDriver } from "./codex-driver.ts";
+const activeCodexDrivers: Map<string, Map<number, { driver: CodexDriver; threadId: string | null }>> = new Map();
 
 // --- Dashboard auto-launch ---
 
@@ -609,8 +612,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const result = await launchAgent(sessionId, project_dir, agentCfg, brokerClient);
           sessionProcs.set(result.slotId, result.process);
 
-          // Start monitoring
-          monitorProcess(result.process, result.slotId, sessionId, brokerClient, handleEvent);
+          // Track CodexDriver instances for message forwarding
+          if (result.codexDriver) {
+            let sessionDrivers = activeCodexDrivers.get(sessionId);
+            if (!sessionDrivers) {
+              sessionDrivers = new Map();
+              activeCodexDrivers.set(sessionId, sessionDrivers);
+            }
+            sessionDrivers.set(result.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId });
+
+            // Monitor driver process exit for auto-restart
+            result.codexDriver.onExit(() => {
+              handleEvent({
+                type: "agent_crashed",
+                severity: "critical",
+                slotId: result.slotId,
+                sessionId,
+                message: `Codex driver for slot ${result.slotId} exited unexpectedly`,
+                data: { exit_code: -1 },
+              });
+            });
+          } else {
+            // Start process monitoring for non-Codex agents (Claude, Gemini)
+            monitorProcess(result.process, result.slotId, sessionId, brokerClient, handleEvent);
+          }
 
           // Announce to previously launched agents
           const slot = await brokerClient.getSlot(result.slotId);
@@ -812,7 +837,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           activeSessions.set(session_id, { projectDir: session.project_dir });
         }
 
-        monitorProcess(result.process, result.slotId, session_id, brokerClient, handleEvent);
+        // Track CodexDriver for message forwarding (same pattern as create_team)
+        if (result.codexDriver) {
+          let sessionDrivers = activeCodexDrivers.get(session_id);
+          if (!sessionDrivers) {
+            sessionDrivers = new Map();
+            activeCodexDrivers.set(session_id, sessionDrivers);
+          }
+          sessionDrivers.set(result.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId });
+        } else {
+          monitorProcess(result.process, result.slotId, session_id, brokerClient, handleEvent);
+        }
 
         const slot = await brokerClient.getSlot(result.slotId);
         await announceNewMember(session_id, slot, config, brokerClient);
@@ -1383,6 +1418,72 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     }
   }, 60_000);
 
+  // --- Codex message forwarding loop ---
+  // For CodexDriver-managed agents, poll the broker for undelivered messages
+  // and push them as new turns. This is what makes Codex reactive to teammates.
+  const codexLastPoll: Map<number, number> = new Map(); // slotId → last poll timestamp
+  setInterval(async () => {
+    for (const [sessionId, drivers] of activeCodexDrivers) {
+      for (const [slotId, state] of drivers) {
+        if (!state.driver.alive) continue;
+        const threadId = state.threadId ?? state.driver.threadId;
+        if (!threadId) continue; // First turn hasn't completed yet
+
+        try {
+          // Get the slot to find the peer_id for message polling
+          const slot = await brokerClient.getSlot(slotId);
+          if (!slot?.peer_id) continue;
+
+          // Poll undelivered messages for this peer
+          const pollResult = await brokerClient.pollMessages(slot.peer_id);
+          if (!pollResult.messages || pollResult.messages.length === 0) continue;
+
+          // Format messages for Codex
+          const formatted = pollResult.messages.map((m: any) => {
+            const from = m.from_slot_id !== null
+              ? `slot ${m.from_slot_id}`
+              : m.from_id;
+            return `[${m.msg_type}] From ${from}: ${m.text}`;
+          }).join("\n\n---\n\n");
+
+          const turnPrompt = [
+            "NEW MESSAGES FROM TEAMMATES:",
+            "",
+            formatted,
+            "",
+            "RESPOND to these messages using the multiagents-peer MCP tools:",
+            "- Use send_message to reply to teammates",
+            "- Use submit_feedback to send review feedback (set actionable=true if changes needed)",
+            "- Use approve to approve a teammate's work",
+            "- Use signal_done when your task is complete",
+            "- Use set_summary to update your status",
+          ].join("\n");
+
+          log(LOG_PREFIX, `Forwarding ${pollResult.messages.length} message(s) to Codex slot ${slotId}`);
+
+          // Push a new turn — this blocks until Codex processes the messages
+          const result = await state.driver.reply(threadId, turnPrompt);
+
+          // Update stored threadId (should be the same, but be safe)
+          state.threadId = result.threadId;
+
+          // Update context snapshot with latest activity
+          await brokerClient.updateSlot({
+            id: slotId,
+            context_snapshot: JSON.stringify({
+              codex_thread_id: result.threadId,
+              last_summary: result.content.slice(0, 200),
+              last_status: "working",
+              updated_at: Date.now(),
+            }),
+          });
+        } catch (err) {
+          log(LOG_PREFIX, `Codex message forwarding error for slot ${slotId}: ${err}`);
+        }
+      }
+    }
+  }, 3_000); // Check every 3 seconds
+
   // Stuck agent nudge loop — every 45s, nudge agents silent for >1 min
   setInterval(async () => {
     for (const sessionId of activeProcesses.keys()) {
@@ -1391,6 +1492,11 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
         for (const slot of slots) {
           if (slot.status !== "connected" || !slot.peer_id) continue;
           if (slot.paused === true || (slot.paused as unknown as number) === 1) continue;
+
+          // Skip Codex driver-managed agents — they don't self-poll,
+          // the orchestrator pushes turns to them via the message forwarding loop.
+          const sessionDrivers = activeCodexDrivers.get(sessionId);
+          if (sessionDrivers?.has(slot.id)) continue;
 
           // Check last_connected or context_snapshot for activity
           const lastActivity = (() => {

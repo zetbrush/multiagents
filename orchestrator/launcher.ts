@@ -31,6 +31,10 @@ interface LaunchResult {
   slotId: number;
   pid: number;
   process: Subprocess;
+  /** Present only for Codex agents launched via `codex mcp-server` driver. */
+  codexDriver?: import("./codex-driver.ts").CodexDriver;
+  /** Codex thread ID for multi-turn continuation. */
+  codexThreadId?: string;
 }
 
 /** CLI binary name for each agent type. */
@@ -322,14 +326,6 @@ export async function launchAgent(
     "Use THESE tools. Do NOT try to call the broker via CLI or HTTP — use the MCP tools.",
   ].join("\n");
 
-  // Build CLI args based on agent type
-  const args = buildCliArgs(config.agent_type, taskPrompt);
-  const cmd = AGENT_COMMANDS[config.agent_type];
-
-  if (!cmd) {
-    throw new Error(`No CLI command configured for agent type: ${config.agent_type}`);
-  }
-
   // Build env — unset CLAUDECODE to allow nested Claude sessions
   const spawnEnv: Record<string, string | undefined> = {
     ...process.env,
@@ -348,14 +344,90 @@ export async function launchAgent(
   try {
     let sessionFile: Record<string, unknown> = {};
     try { sessionFile = JSON.parse(fs.readFileSync(sessionFilePath, "utf-8")); } catch { /* ok */ }
-    // Store the latest slot_id — each agent reads this, but env vars take priority
     sessionFile.last_slot_id = slot.id;
     sessionFile.last_slot_name = config.name;
     fs.writeFileSync(sessionFilePath, JSON.stringify(sessionFile, null, 2));
   } catch { /* best effort — env vars are the primary mechanism */ }
 
-  // Spawn the agent process
-  // stdin MUST be "pipe" for MCP stdio transport (bidirectional JSON-RPC)
+  // --- Codex: use long-running `codex mcp-server` driver ---
+  // Instead of single-shot `codex exec`, the driver keeps a persistent process
+  // alive and uses `codex` / `codex-reply` MCP tools for multi-turn conversations.
+  // The orchestrator pushes teammate messages via driver.reply().
+  if (config.agent_type === "codex") {
+    const { CodexDriver } = await import("./codex-driver.ts");
+
+    const driver = await CodexDriver.spawn(projectDir, spawnEnv);
+    log(LOG_PREFIX, `CodexDriver spawned for ${config.name} in slot ${slot.id}`);
+
+    // Mark slot as connected immediately (the driver is alive)
+    await brokerClient.updateSlot({
+      id: slot.id,
+      status: "connected",
+      last_connected: Date.now(),
+    });
+
+    // Build developer instructions with team communication rules
+    const developerInstructions = [
+      `You are "${config.name}", role: ${config.role} on the multiagents team.`,
+      enrichedDescription,
+      "",
+      "You have an MCP server called 'multiagents-peer' with team communication tools.",
+      "MANDATORY — call these tools during your work:",
+      "  → set_summary: broadcast what you're doing (call after every major action)",
+      "  → check_messages: read teammate messages (call frequently)",
+      "  → send_message: reply to teammates (they are waiting on you)",
+      "  → signal_done: when your task is complete (include proof/test results)",
+      "  → submit_feedback: send actionable review feedback to a teammate",
+      "  → approve: approve a teammate's work when it meets quality standards",
+      "  → check_team_status / get_plan / update_plan: track team progress",
+      "",
+      "BEFORE starting work: call set_summary, check_team_status, get_plan, check_messages.",
+      "AFTER completing work: call signal_done with what you did and test results.",
+      "When you receive messages from the orchestrator, they contain teammate updates.",
+      "Respond to them using the multiagents-peer MCP tools.",
+    ].join("\n");
+
+    // Start the first turn (non-blocking — runs in background)
+    // The orchestrator will push follow-up turns via driver.reply()
+    const startPromise = driver.startSession({
+      prompt: taskPrompt,
+      cwd: projectDir,
+      sandbox: "workspace-write",
+      developerInstructions,
+    }).then((result) => {
+      log(LOG_PREFIX, `${config.name} first turn complete: thread=${result.threadId}`);
+      // Store threadId in slot context for persistence
+      brokerClient.updateSlot({
+        id: slot.id,
+        context_snapshot: JSON.stringify({
+          codex_thread_id: result.threadId,
+          last_summary: result.content.slice(0, 200),
+          last_status: "working",
+          updated_at: Date.now(),
+        }),
+      }).catch(() => {});
+    }).catch((err) => {
+      log(LOG_PREFIX, `${config.name} first turn failed: ${err}`);
+    });
+
+    // Don't await startPromise — let the turn run in background
+    // The driver process is the "process" for tracking purposes
+    return {
+      slotId: slot.id,
+      pid: driver.pid,
+      process: driver.process,
+      codexDriver: driver,
+    };
+  }
+
+  // --- Claude / Gemini / Custom: traditional process spawn ---
+  const args = buildCliArgs(config.agent_type, taskPrompt);
+  const cmd = AGENT_COMMANDS[config.agent_type];
+
+  if (!cmd) {
+    throw new Error(`No CLI command configured for agent type: ${config.agent_type}`);
+  }
+
   const proc = Bun.spawn([cmd, ...args], {
     cwd: projectDir,
     stdin: "pipe",
