@@ -53,9 +53,13 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1"
   },
+  "homepage": "https://github.com/zetbrush/multiagents#readme",
+  "bugs": {
+    "url": "https://github.com/zetbrush/multiagents/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/zetbrush/multiagents"
+    "url": "git+https://github.com/zetbrush/multiagents.git"
   },
   "keywords": [
     "mcp",
