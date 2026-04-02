@@ -1313,11 +1313,15 @@ Bun.serve({
           const peer = db.query("SELECT * FROM peers WHERE id = ?").get(peer_id) as any;
           if (!peer || !peer.slot_id) return Response.json({ error: "Peer not found or no slot" }, { status: 404 });
 
-          db.run("UPDATE slots SET task_state = 'done_pending_review' WHERE id = ?", [peer.slot_id]);
           db.run("UPDATE peers SET summary = ? WHERE id = ?", [summary, peer_id]);
 
           const allSlots = db.query("SELECT * FROM slots WHERE session_id = ? AND id != ?").all(session_id, peer.slot_id) as any[];
           const thisSlot = db.query("SELECT * FROM slots WHERE id = ?").get(peer.slot_id) as any;
+
+          // Reviewers/QA auto-approve on signal_done — they don't need external review.
+          const isReviewerRole = thisSlot.role && /qa|review|test|lead/i.test(thisSlot.role);
+          const newTaskState = isReviewerRole ? "approved" : "done_pending_review";
+          db.run("UPDATE slots SET task_state = ? WHERE id = ?", [newTaskState, peer.slot_id]);
 
           let notifiedCount = 0;
           for (const targetSlot of allSlots) {
@@ -1336,7 +1340,7 @@ Bun.serve({
             }
           }
 
-          return Response.json({ ok: true, task_state: "done_pending_review", notified_count: notifiedCount });
+          return Response.json({ ok: true, task_state: newTaskState, notified_count: notifiedCount });
         }
 
         case "/lifecycle/submit-feedback": {

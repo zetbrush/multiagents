@@ -1630,6 +1630,10 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           if (slot.status !== "connected" || !slot.peer_id) continue;
           if (slot.paused === true || (slot.paused as unknown as number) === 1) continue;
 
+          // Skip agents in terminal task states — no point nudging them
+          const taskState = (slot as any).task_state;
+          if (taskState === "done_pending_review" || taskState === "approved" || taskState === "released") continue;
+
           // Codex driver-managed agents get nudges delivered via the
           // forwarding loop (steer or reply). Don't skip them — they need
           // nudges too, especially to prompt signal_done after long turns.
