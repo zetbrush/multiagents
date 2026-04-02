@@ -26,7 +26,7 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 ```
 
 - **Peer discovery**: agents find each other via `list_peers`
-- **Real-time messaging**: instant for Claude (channel push), 3-5s for Codex/Gemini (orchestrator-driven turns)
+- **Real-time messaging**: instant for Claude (channel push), <3s for Codex (mid-turn steer), 1-3s for Gemini (piggyback)
 - **Role assignment**: `assign_role`, `rename_peer` at runtime
 - **File coordination**: exclusive locks + ownership zones prevent conflicts
 - **Task lifecycle**: `idle → working → done_pending_review → addressing_feedback → approved → released`
@@ -65,33 +65,38 @@ The orchestrator handles everything: spawning agents, assigning roles, creating 
 | Agent | Delivery Mechanism | Latency | Config |
 |-------|-------------------|---------|--------|
 | Claude Code | Channel push notifications | Instant | `~/.claude/settings.json` |
-| Codex CLI | CodexDriver (`codex mcp-server`) | 3-9s per turn | `~/.codex/config.toml` |
+| Codex CLI | CodexDriver (`codex app-server`) | <3s mid-turn, 3-9s between turns | `~/.codex/config.toml` |
 | Gemini CLI | Piggyback on MCP tool responses | 1-3s | `~/.gemini/settings.json` |
 
 ### Codex Integration (CodexDriver)
 
-Codex CLI is single-shot (`codex exec` exits after one turn). The orchestrator uses a **CodexDriver** that:
+Codex CLI uses the **app-server protocol** — a JSON-RPC stdio interface with threads, turns, and rich notifications. The orchestrator uses a **CodexDriver** that:
 
-1. Spawns a persistent `codex mcp-server` process
-2. Uses MCP tools `codex` (start session) and `codex-reply` (continue conversation)
-3. Maintains thread continuity across turns (full conversation history)
-4. Two-phase startup: fast bootstrap (~9s) for threadId, then task push as reply
+1. Spawns a persistent `codex app-server` process with JSON-RPC handshake
+2. Creates a thread (`thread/start`) and drives turns (`turn/start`) for task execution
+3. Injects messages mid-turn via `turn/steer` — no waiting for the current turn to finish
+4. Interrupts stuck turns via `turn/interrupt` when agents go idle for >60s
+5. Auto-approves all server-initiated requests (command execution, file changes, MCP elicitations)
+6. Tracks token usage from `turn/completed` notifications
 
-The orchestrator **drives Codex turns**: when teammates send messages, the forwarding loop polls the broker every 3s and pushes new turns via `driver.reply()`.
+The orchestrator **drives Codex turns**: the forwarding loop polls the broker every 3s. If Codex has an active turn, messages are steered in instantly. If idle, a new turn is started via `driver.reply()`.
 
 ## Task State Machine
 
 Every agent slot has a `task_state` that governs the review/approval workflow:
 
 ```
-idle ──► working ──► done_pending_review ──► addressing_feedback ──► done_pending_review
-                         │                                              │
-                         ▼                                              ▼
-                      approved ──► released (can disconnect)
+                    ┌──────────── (reviewer/QA roles) ────────────┐
+                    │                                              ▼
+idle ──► working ──► done_pending_review ──► addressing_feedback  approved ──► released
+                         │                         │                ▲
+                         │                         └────────────────┘
+                         └──────────► approved ─────────────────────┘
 ```
 
 - **idle → working**: Auto-transitions when agent calls `set_summary` or produces first output
 - **working → done_pending_review**: Agent calls `signal_done`
+- **working → approved**: Reviewer/QA agents auto-approve on `signal_done` (they don't need external review)
 - **done_pending_review → addressing_feedback**: Reviewer calls `submit_feedback(actionable=true)`
 - **addressing_feedback → done_pending_review**: Agent fixes issues and calls `signal_done` again
 - **done_pending_review → approved**: Reviewer calls `approve`
@@ -224,7 +229,7 @@ multiagents/
 │   └── role-practices.ts   Role-specific best practices injection
 ├── orchestrator/
 │   ├── orchestrator-server.ts  Orchestrator MCP server (team management)
-│   ├── codex-driver.ts     CodexDriver: persistent codex mcp-server via MCP JSON-RPC
+│   ├── codex-driver.ts     CodexDriver: persistent codex app-server via JSON-RPC (steer/interrupt)
 │   ├── launcher.ts         Agent spawning (CLI args, MCP configs, CodexDriver)
 │   ├── monitor.ts          Process monitoring (stdout parsing, token tracking)
 │   ├── recovery.ts         Crash recovery (flap detection, respawn with context)
