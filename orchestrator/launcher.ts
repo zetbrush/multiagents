@@ -358,12 +358,19 @@ export async function launchAgent(
   if (config.agent_type === "codex") {
     const { CodexDriver } = await import("./codex-driver.ts");
 
-    // Write a sentinel file that tells the internal multiagents-peer adapter
-    // (spawned by codex mcp-server) to skip broker registration. The driver
-    // manages the slot directly — without this, the adapter creates ghost slots.
-    // We use a file because Codex sandbox strips custom env vars.
+    // Write sentinel file for driver mode detection AND slot info.
+    // Codex sandbox strips custom env vars, so file-based communication
+    // is the only reliable mechanism for the MCP adapter to discover
+    // its slot/session assignment.
     const driverModeFile = path.join(projectDir, ".multiagents", ".driver-mode");
-    try { fs.writeFileSync(driverModeFile, "1"); } catch { /* best effort */ }
+    try {
+      fs.writeFileSync(driverModeFile, JSON.stringify({
+        slot_id: slot.id,
+        session_id: sessionId,
+        role: config.role,
+        name: config.name,
+      }));
+    } catch { /* best effort */ }
     spawnEnv.MULTIAGENTS_DRIVER_MODE = "1"; // Also set env var as secondary signal
 
     const driver = await CodexDriver.spawn(projectDir, spawnEnv);
@@ -375,25 +382,14 @@ export async function launchAgent(
       status: "connected",
     });
 
-    // Build developer instructions with team communication rules
+    // Build developer instructions — keep brief to minimize Codex context size.
+    // Large developer instructions slow down Codex LLM generation significantly.
     const developerInstructions = [
-      `You are "${config.name}", role: ${config.role} on the multiagents team.`,
+      `You are "${config.name}", role: ${config.role}.`,
       enrichedDescription,
       "",
-      "You have an MCP server called 'multiagents-peer' with team communication tools.",
-      "MANDATORY — call these tools during your work:",
-      "  → set_summary: broadcast what you're doing (call after every major action)",
-      "  → check_messages: read teammate messages (call frequently)",
-      "  → send_message: reply to teammates (they are waiting on you)",
-      "  → signal_done: when your task is complete (include proof/test results)",
-      "  → submit_feedback: send actionable review feedback to a teammate",
-      "  → approve: approve a teammate's work when it meets quality standards",
-      "  → check_team_status / get_plan / update_plan: track team progress",
-      "",
-      "BEFORE starting work: call set_summary, check_team_status, get_plan, check_messages.",
-      "AFTER completing work: call signal_done with what you did and test results.",
-      "When you receive messages from the orchestrator, they contain teammate updates.",
-      "Respond to them using the multiagents-peer MCP tools.",
+      "You have 'multiagents-peer' MCP tools: signal_done, set_summary, send_message, check_messages.",
+      "When done: call signal_done with proof. Use set_summary to show progress.",
     ].join("\n");
 
     // --- Two-phase startup for fast threadId acquisition ---
@@ -406,6 +402,24 @@ export async function launchAgent(
     // Without this split, the entire task runs as turn 1 (can take
     // minutes for complex tasks), blocking message forwarding.
     const bootstrapPrompt = `You are "${config.name}" (${config.role}). Acknowledge by replying: "Ready."`;
+
+    // Codex-specific task prompt: lightweight, action-focused.
+    // Codex is slow per tool call (~10-30s each), so the heavy "MANDATORY MCP"
+    // block causes it to burn minutes on MCP overhead before doing real work.
+    // The developerInstructions already cover MCP tools — keep the task prompt
+    // focused on the actual task with minimal MCP instructions.
+    const codexTaskPrompt = [
+      `You are "${config.name}", role: ${config.role}.`,
+      enrichedDescription,
+      "",
+      config.initial_task,
+      "",
+      "After completing your task:",
+      "  → Call signal_done (multiagents-peer MCP tool) with proof of what you did",
+      "  → Call set_summary with a 1-line status update",
+      "",
+      "Focus on completing the task first. Use multiagents-peer MCP tools for team communication only when needed.",
+    ].join("\n");
 
     const startPromise = (async () => {
       try {
@@ -430,7 +444,7 @@ export async function launchAgent(
         });
 
         // Phase 2: push real task as a reply turn (runs in background)
-        const taskResult = await driver.reply(bootstrap.threadId, taskPrompt);
+        const taskResult = await driver.reply(bootstrap.threadId, codexTaskPrompt);
         log(LOG_PREFIX, `${config.name} task turn complete: ${taskResult.content.slice(0, 100)}`);
 
         await brokerClient.updateSlot({
@@ -457,7 +471,7 @@ export async function launchAgent(
   }
 
   // --- Claude / Gemini / Custom: traditional process spawn ---
-  const args = buildCliArgs(config.agent_type, taskPrompt);
+  const args = buildCliArgs(config.agent_type, taskPrompt, spawnEnv);
   const cmd = AGENT_COMMANDS[config.agent_type];
 
   if (!cmd) {
@@ -471,6 +485,18 @@ export async function launchAgent(
     stderr: "pipe",
     env: spawnEnv,
   });
+
+  // Write per-PID slot assignment file so the MCP server subprocess can
+  // discover its slot even if env vars are stripped by the parent CLI.
+  // The MCP adapter reads .multiagents/slots/<ppid>.json using process.ppid.
+  try {
+    const slotsDir = path.join(projectDir, ".multiagents", "slots");
+    if (!fs.existsSync(slotsDir)) fs.mkdirSync(slotsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(slotsDir, `${proc.pid}.json`),
+      JSON.stringify({ slot_id: slot.id, role: config.role, name: config.name, session_id: sessionId }),
+    );
+  } catch { /* best effort */ }
 
   log(LOG_PREFIX, `Launched ${config.name} (PID ${proc.pid}) in slot ${slot.id}`);
 
@@ -525,13 +551,6 @@ export async function relaunchIntoSlot(
     "Your team CANNOT see your work unless you use these MCP tools.",
   ].join("\n");
 
-  const args = buildCliArgs(slot.agent_type, taskPrompt);
-  const cmd = AGENT_COMMANDS[slot.agent_type];
-
-  if (!cmd) {
-    throw new Error(`No CLI command configured for agent type: ${slot.agent_type}`);
-  }
-
   const spawnEnv: Record<string, string | undefined> = {
     ...process.env,
     MULTIAGENTS_SESSION: sessionId,
@@ -540,6 +559,13 @@ export async function relaunchIntoSlot(
     MULTIAGENTS_SLOT: String(slot.id),
   };
   delete spawnEnv.CLAUDECODE;
+
+  const args = buildCliArgs(slot.agent_type, taskPrompt, spawnEnv);
+  const cmd = AGENT_COMMANDS[slot.agent_type];
+
+  if (!cmd) {
+    throw new Error(`No CLI command configured for agent type: ${slot.agent_type}`);
+  }
 
   const proc = Bun.spawn([cmd, ...args], {
     cwd: projectDir,
@@ -566,7 +592,7 @@ export async function relaunchIntoSlot(
  * --mcp-config (inline JSON); for Codex this uses -c to override the
  * mcp_servers config key (replacing any broken global entries).
  */
-export function buildCliArgs(agentType: AgentType, task: string): string[] {
+export function buildCliArgs(agentType: AgentType, task: string, env?: Record<string, string | undefined>): string[] {
   switch (agentType) {
     case "claude": {
       // Build inline MCP config JSON for --mcp-config.
@@ -575,12 +601,21 @@ export function buildCliArgs(agentType: AgentType, task: string): string[] {
       // ~/.claude.json (registered by install-mcp for standalone use).
       // If both use the same name, Claude Code's global config overrides
       // the inline one, and agents get the wrong MCP server.
+      // Build MCP server command with slot/session info baked into args.
+      // Claude Code spawns MCP servers as child processes — env vars from
+      // the parent are NOT reliably forwarded. Pass them as CLI args instead.
       const claudeMcp = mcpServerCommand("claude");
+      const mcpArgs = [...claudeMcp.args];
+      if (env?.MULTIAGENTS_SESSION) mcpArgs.push("--session", env.MULTIAGENTS_SESSION);
+      if (env?.MULTIAGENTS_SLOT) mcpArgs.push("--slot", env.MULTIAGENTS_SLOT);
+      if (env?.MULTIAGENTS_ROLE) mcpArgs.push("--role", env.MULTIAGENTS_ROLE);
+      if (env?.MULTIAGENTS_NAME) mcpArgs.push("--name", env.MULTIAGENTS_NAME);
+
       const mcpConfigJson = JSON.stringify({
         mcpServers: {
           "multiagents-peer": {
             command: claudeMcp.command,
-            args: claudeMcp.args,
+            args: mcpArgs,
           },
         },
       });

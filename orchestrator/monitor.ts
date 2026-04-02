@@ -417,12 +417,12 @@ async function handleExit(
 }
 
 /**
- * Monitor a CodexDriver via its notification stream.
+ * Monitor a CodexDriver via its app-server notification stream.
  *
- * In MCP server mode, Codex emits JSON-RPC notifications instead of JSONL
- * on stdout. This bridges the gap: it listens to driver notifications and
- * updates slot state (token tracking, activity detection, auto-transition
- * to "working") using the same logic as the stdout-based monitor.
+ * The app-server emits rich notifications: turn/started, turn/completed,
+ * item/started, item/completed, item/agentMessage/delta, etc. This bridges
+ * those into the slot tracking system (token counts, activity summaries,
+ * health detection, auto-transition to "working").
  */
 export function monitorCodexDriver(
   driver: CodexDriver,
@@ -436,7 +436,7 @@ export function monitorCodexDriver(
   });
 }
 
-/** Process a single Codex MCP notification and update slot state. */
+/** Process a single app-server notification and update slot state. */
 async function handleCodexNotification(
   notification: CodexNotification,
   slotId: number,
@@ -446,39 +446,24 @@ async function handleCodexNotification(
 ): Promise<void> {
   const { method, params } = notification;
 
-  // MCP logging notifications — extract error-level logs
-  if (method === "notifications/message" || method === "notifications/logging/message") {
-    const level = params.level as string | undefined;
-    const data = params.data as string | undefined;
-    if (level === "error" && data) {
-      onEvent({
-        type: "agent_error",
-        severity: "warning",
-        slotId,
-        sessionId,
-        message: `Codex MCP log: ${String(data).slice(0, 200)}`,
-      });
-    }
-    return;
-  }
+  // --- Turn lifecycle ---
 
-  // MCP progress notifications
-  if (method === "notifications/progress") {
-    // Activity detected — auto-transition to working
+  if (method === "turn/started") {
     await autoTransitionToWorking(slotId, brokerClient);
+    onEvent({
+      type: "agent_progress",
+      severity: "info",
+      slotId,
+      sessionId,
+      message: `Codex turn started in slot ${slotId}`,
+    });
     return;
   }
 
-  // Codex-specific event notifications (codex/event or similar)
-  // These carry item completions, token counts, and activity signals
-  const data = params.data as Record<string, unknown> | undefined;
-  const eventType = (params.type ?? data?.type) as string | undefined;
-
-  if (!eventType) return;
-
-  // Token usage from turn.completed events
-  if (eventType === "turn.completed") {
-    const usage = (params.usage ?? data?.usage) as Record<string, number> | undefined;
+  if (method === "turn/completed") {
+    // Extract token usage from turn completion
+    const turn = params.turn as Record<string, unknown> | undefined;
+    const usage = (params.usage ?? turn?.usage) as Record<string, number> | undefined;
     if (usage) {
       await updateTokenUsage(slotId, {
         input: usage.input_tokens ?? 0,
@@ -486,18 +471,28 @@ async function handleCodexNotification(
         cacheRead: usage.cached_input_tokens ?? 0,
       }, brokerClient);
     }
+
+    onEvent({
+      type: "agent_output",
+      severity: "info",
+      slotId,
+      sessionId,
+      message: `Codex turn completed in slot ${slotId}`,
+      data: usage ? { usage } : undefined,
+    });
     return;
   }
 
-  // Item completions (agent_message, command_execution, mcp_tool_call)
-  if (eventType === "item.completed") {
+  // --- Item lifecycle ---
+
+  if (method === "item/completed") {
     await autoTransitionToWorking(slotId, brokerClient);
-    const item = (params.item ?? data?.item) as Record<string, unknown> | undefined;
+    const item = params.item as Record<string, unknown> | undefined;
     if (!item) return;
 
     const itemType = item.type as string | undefined;
 
-    if (itemType === "agent_message" && item.text) {
+    if (itemType === "agentMessage" && item.text) {
       try {
         await brokerClient.updateSlot({
           id: slotId,
@@ -510,7 +505,7 @@ async function handleCodexNotification(
       } catch { /* best-effort */ }
     }
 
-    if (itemType === "command_execution") {
+    if (itemType === "commandExecution") {
       try {
         await brokerClient.updateSlot({
           id: slotId,
@@ -523,12 +518,25 @@ async function handleCodexNotification(
       } catch { /* best-effort */ }
     }
 
-    if (itemType === "mcp_tool_call") {
+    if (itemType === "mcpToolCall") {
       try {
         await brokerClient.updateSlot({
           id: slotId,
           context_snapshot: JSON.stringify({
-            last_summary: `MCP: ${String(item.server ?? "")}/${String(item.tool ?? "unknown")}`.slice(0, 100),
+            last_summary: `MCP: ${String(item.serverLabel ?? "")}/${String(item.toolName ?? "unknown")}`.slice(0, 100),
+            last_status: "working",
+            updated_at: Date.now(),
+          }),
+        });
+      } catch { /* best-effort */ }
+    }
+
+    if (itemType === "fileChange") {
+      try {
+        await brokerClient.updateSlot({
+          id: slotId,
+          context_snapshot: JSON.stringify({
+            last_summary: `File: ${String(item.filePath ?? "unknown file").slice(0, 100)}`,
             last_status: "working",
             updated_at: Date.now(),
           }),
@@ -543,5 +551,23 @@ async function handleCodexNotification(
       sessionId,
       message: `Codex ${itemType ?? "activity"} in slot ${slotId}`,
     });
+    return;
+  }
+
+  // --- Streaming deltas → activity heartbeat ---
+
+  if (method === "item/agentMessage/delta" ||
+      method === "item/commandExecution/outputDelta" ||
+      method === "item/fileChange/outputDelta") {
+    // Don't flood slot updates with every delta, but auto-transition
+    await autoTransitionToWorking(slotId, brokerClient);
+    return;
+  }
+
+  // --- Item started → activity signal ---
+
+  if (method === "item/started") {
+    await autoTransitionToWorking(slotId, brokerClient);
+    return;
   }
 }

@@ -280,6 +280,17 @@ export async function runCli(args: string[]): Promise<void> {
       const typeIdx = args.indexOf("--agent-type");
       const agentType = typeIdx !== -1 ? args[typeIdx + 1] : undefined;
       if (agentType) process.env.AGENT_TYPE = agentType;
+      // Forward orchestrator-assigned slot/session info to env vars.
+      // These are passed as CLI args because Claude Code doesn't reliably
+      // forward parent env vars to MCP server subprocesses.
+      const sessionIdx = args.indexOf("--session");
+      if (sessionIdx !== -1 && args[sessionIdx + 1]) process.env.MULTIAGENTS_SESSION = args[sessionIdx + 1];
+      const slotIdx = args.indexOf("--slot");
+      if (slotIdx !== -1 && args[slotIdx + 1]) process.env.MULTIAGENTS_SLOT = args[slotIdx + 1];
+      const roleIdx = args.indexOf("--role");
+      if (roleIdx !== -1 && args[roleIdx + 1]) process.env.MULTIAGENTS_ROLE = args[roleIdx + 1];
+      const nameIdx = args.indexOf("--name");
+      if (nameIdx !== -1 && args[nameIdx + 1]) process.env.MULTIAGENTS_NAME = args[nameIdx + 1];
       await import("../server.ts");
       break;
     }

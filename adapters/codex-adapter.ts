@@ -50,11 +50,15 @@ BEFORE ANY OTHER WORK — call these MCP tools in this exact order:
   4. check_messages → read pending messages from teammates
 
 AFTER EVERY SHELL COMMAND OR FILE WRITE:
-  → Call check_messages (teammates may have sent critical updates)
+  → Call check_messages (teammates may have sent critical updates — THIS IS MANDATORY)
   → Call set_summary with what you just did
-
-AFTER EVERY 2-3 TOOL CALLS:
   → Read your inbox file for real-time messages from teammates${inboxHint}
+
+DURING LONG-RUNNING OPERATIONS (builds, tests, installs that take >1 minute):
+  → Before starting: call set_summary with "Starting <operation>"
+  → After completion: call check_messages IMMEDIATELY — messages queue while you work
+  → The orchestrator will deliver queued messages as a "NEW MESSAGES FROM TEAMMATES" prompt
+  → When you receive that prompt: process it FULLY (reply to all, set_summary, check_messages again) before resuming
 
 WHEN YOU FINISH YOUR TASK:
   → Call signal_done with what you built, tested, and results
@@ -160,6 +164,19 @@ QUALITY: Production-grade code. Plan before coding. Verify before signaling done
     if (this.hasRunStartup) return "";
     this.hasRunStartup = true;
 
+    // In driver mode, skip heavy auto-startup (4 extra MCP calls at 10-30s each).
+    // The orchestrator already manages the slot and provides context via steer/reply.
+    const driverModeFile = (() => {
+      try {
+        return require("node:fs").existsSync(
+          require("node:path").join(process.cwd(), ".multiagents", ".driver-mode")
+        );
+      } catch { return false; }
+    })();
+    if (driverModeFile || process.env.MULTIAGENTS_DRIVER_MODE === "1") {
+      return "";
+    }
+
     const parts: string[] = [
       "╔══════════════════════════════════════════════════════════╗",
       "║  AUTO-STARTUP: Team context injected on first tool call ║",
@@ -240,84 +257,84 @@ QUALITY: Production-grade code. Plan before coding. Verify before signaling done
 
   protected override async handleListPeers(args: any) {
     const result = await super.handleListPeers(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleSendMessage(args: any) {
     const result = await super.handleSendMessage(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleSetSummary(args: any) {
     const result = await super.handleSetSummary(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleCheckMessages() {
     const result = await super.handleCheckMessages();
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleAssignRole(args: any) {
     const result = await super.handleAssignRole(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleRenamePeer(args: any) {
     const result = await super.handleRenamePeer(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleAcquireFile(args: any) {
     const result = await super.handleAcquireFile(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleReleaseFile(args: any) {
     const result = await super.handleReleaseFile(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleViewFileLocks() {
     const result = await super.handleViewFileLocks();
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleGetHistory(args: any) {
     const result = await super.handleGetHistory(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   // --- Lifecycle tool wrappers (critical for message delivery) ---
 
   protected override async handleSignalDone(args: any) {
     const result = await super.handleSignalDone(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleSubmitFeedback(args: any) {
     const result = await super.handleSubmitFeedback(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleApprove(args: any) {
     const result = await super.handleApprove(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleCheckTeamStatus() {
     const result = await super.handleCheckTeamStatus();
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleGetPlan() {
     const result = await super.handleGetPlan();
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   protected override async handleUpdatePlan(args: any) {
     const result = await super.handleUpdatePlan(args);
-    return this.wrapResult(result);
+    return await this.wrapResult(result);
   }
 
   // --- Helper to wrap a tool result object ---

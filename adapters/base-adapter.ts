@@ -392,17 +392,20 @@ export abstract class BaseAdapter {
 
     this.myCwd = process.cwd();
 
-    // Skip broker registration when running inside CodexDriver's `codex mcp-server`.
+    // Skip broker registration when running inside CodexDriver's `codex app-server`.
     // The driver handles all communication — the internal multiagents-peer adapter
     // would create ghost slots if it registered independently.
-    // Check both env var (may be stripped by Codex sandbox) and sentinel file.
-    const driverModeFile = (() => {
+    // CRITICAL: Only Codex adapters check the .driver-mode file. The file is
+    // shared across the workspace — if Claude's adapter also reads it, Claude
+    // agents skip registration and become invisible to the broker.
+    const driverModeEnv = process.env.MULTIAGENTS_DRIVER_MODE === "1";
+    const driverModeFile = this.agentType === "codex" && (() => {
       try {
         const p = require("node:path").join(process.cwd(), ".multiagents", ".driver-mode");
         return require("node:fs").existsSync(p);
       } catch { return false; }
     })();
-    const driverMode = process.env.MULTIAGENTS_DRIVER_MODE === "1" || driverModeFile;
+    const driverMode = driverModeEnv || driverModeFile;
 
     // 1. Resolve session/slot info eagerly (before any async work)
     const envSession = process.env.MULTIAGENTS_SESSION;
@@ -430,8 +433,11 @@ export abstract class BaseAdapter {
     this.registerTools();
 
     // 4. Start broker registration in the BACKGROUND — don't block on MCP handshake
-    //    Skip entirely in driver mode (CodexDriver manages the slot directly).
-    const brokerPromise = driverMode ? Promise.resolve() : this.registerWithBroker();
+    //    In driver mode, still register with broker but as a lightweight peer
+    //    so MCP tools (set_summary, check_messages, signal_done) work correctly.
+    //    Without registration, this.myId stays null and ALL tool handlers return
+    //    "Not registered with broker yet" — making every MCP call a silent no-op.
+    const brokerPromise = driverMode ? this.registerDriverModePeer() : this.registerWithBroker();
 
     // 5. Connect MCP over stdio — blocks until parent sends `initialize`
     //    Broker registration runs concurrently with this wait.
@@ -442,8 +448,8 @@ export abstract class BaseAdapter {
     await brokerPromise;
 
     if (driverMode) {
-      this.log("Driver mode — skipping poll loop and heartbeat (CodexDriver manages communication)");
-      return; // Tools are available but no broker registration/polling
+      this.log("Driver mode — tools enabled, skipping poll loop and heartbeat (CodexDriver manages communication)");
+      return; // Tools are available, poll loop managed by driver
     }
 
     // === PHASE 3: START BACKGROUND LOOPS ===
@@ -481,6 +487,90 @@ export abstract class BaseAdapter {
   }
 
   // --- Broker registration (runs in parallel with MCP handshake) ---
+
+  /**
+   * Register a peer in driver mode (CodexDriver-managed agents).
+   * The broker's signal_done, set_summary, etc. require a real peer row
+   * in the DB (looked up by peer_id → slot_id). We register normally but
+   * pass the existing slot_id so the broker matches the launcher's slot
+   * instead of creating a ghost one.
+   *
+   * Slot discovery priority:
+   *   1. MULTIAGENTS_SLOT env var (may be stripped by Codex sandbox)
+   *   2. .multiagents/.driver-mode file (JSON with slot_id, session_id)
+   *   3. .multiagents/slots/<ppid>.json (per-PID slot file)
+   */
+  private async registerDriverModePeer(): Promise<void> {
+    try {
+      await this.ensureBroker();
+      this.myGitRoot = await getGitRoot(this.myCwd);
+
+      let slotId: number | undefined;
+      let sessionId = this.sessionId;
+
+      // 1. Try env var
+      const envSlot = process.env.MULTIAGENTS_SLOT;
+      if (envSlot) slotId = parseInt(envSlot, 10);
+
+      // 2. Try driver-mode file (written by launcher with slot/session info)
+      if (!slotId) {
+        try {
+          const driverModePath = require("node:path").join(this.myCwd, ".multiagents", ".driver-mode");
+          const raw = require("node:fs").readFileSync(driverModePath, "utf-8");
+          const data = JSON.parse(raw);
+          if (data.slot_id) slotId = data.slot_id;
+          if (data.session_id && !sessionId) {
+            sessionId = data.session_id;
+            this.sessionId = sessionId;
+          }
+        } catch { /* file might be plain "1" (old format) or missing */ }
+      }
+
+      // 3. Try per-PID slot file
+      if (!slotId) {
+        try {
+          const ppid = process.ppid ?? process.pid;
+          const slotFilePath = require("node:path").join(this.myCwd, ".multiagents", "slots", `${ppid}.json`);
+          const slotData = JSON.parse(require("node:fs").readFileSync(slotFilePath, "utf-8"));
+          if (slotData.slot_id) slotId = slotData.slot_id;
+          if (slotData.session_id && !sessionId) {
+            sessionId = slotData.session_id;
+            this.sessionId = sessionId;
+          }
+        } catch { /* no per-PID file */ }
+      }
+
+      this.log(`Driver mode slot discovery: slot_id=${slotId}, session_id=${sessionId}`);
+
+      const reg = await this.broker.register({
+        agent_type: this.agentType,
+        pid: process.pid,
+        cwd: this.myCwd,
+        git_root: this.myGitRoot ?? undefined,
+        summary: "(driver-mode MCP adapter)",
+        session_id: sessionId ?? undefined,
+        slot_id: slotId,
+      } as any);
+
+      this.myId = reg.id;
+      if (reg.slot) {
+        this.mySlot = reg.slot;
+        this.log(`Driver mode peer registered: ${this.myId}, slot=${reg.slot.id} (${reg.slot.display_name})`);
+      } else if (slotId) {
+        // Registration didn't auto-match — fetch and link manually
+        const slot = await this.broker.getSlot(slotId);
+        if (slot) {
+          this.mySlot = slot;
+          await this.broker.updateSlot({ id: slotId, peer_id: this.myId });
+          this.log(`Driver mode peer registered: ${this.myId}, manually linked to slot=${slot.id}`);
+        }
+      } else {
+        this.log(`Driver mode peer registered: ${this.myId} (no slot match)`);
+      }
+    } catch (err) {
+      this.log(`Driver mode registration failed (tools will have limited function): ${err}`);
+    }
+  }
 
   private async registerWithBroker(): Promise<void> {
     // 1. Ensure broker is running
@@ -537,9 +627,31 @@ export abstract class BaseAdapter {
     // BOTH slot_id AND session_id are required for the broker to match
     // the pre-created slot (broker.ts handleRegister). The broker also
     // has a fallback to infer session_id from the slot's own record.
-    const envSlot = process.env.MULTIAGENTS_SLOT;
+    //
+    // Sources (in priority order):
+    // 1. MULTIAGENTS_SLOT env var (set by orchestrator spawn, may be stripped by sandboxes)
+    // 2. Per-slot file: .multiagents/slots/<pid>.json (written by orchestrator for each agent)
+    // 3. session.json last_slot_id (fallback, may be overwritten by later agents)
+    let envSlot = process.env.MULTIAGENTS_SLOT;
     const envRole = process.env.MULTIAGENTS_ROLE;
     const envName = process.env.MULTIAGENTS_NAME;
+
+    // Fallback: read per-PID slot assignment file. The orchestrator writes
+    // .multiagents/slots/<parent-pid>.json with { slot_id, role, name } for
+    // each agent. The MCP server's parent PID is the agent CLI (claude/codex).
+    if (!envSlot) {
+      try {
+        const ppid = process.ppid ?? process.pid;
+        const slotFilePath = require("node:path").join(process.cwd(), ".multiagents", "slots", `${ppid}.json`);
+        const slotData = JSON.parse(require("node:fs").readFileSync(slotFilePath, "utf-8"));
+        if (slotData.slot_id) {
+          envSlot = String(slotData.slot_id);
+          if (slotData.role && !envRole) process.env.MULTIAGENTS_ROLE = slotData.role;
+          if (slotData.name && !envName) process.env.MULTIAGENTS_NAME = slotData.name;
+          this.log(`Slot info from PID file (ppid=${ppid}): slot=${envSlot}`);
+        }
+      } catch { /* no per-PID file — ok */ }
+    }
     if (envSlot) {
       regBody.slot_id = parseInt(envSlot, 10);
     }

@@ -1,43 +1,45 @@
 // ============================================================================
-// multiagents — Codex MCP Server Driver
+// multiagents — Codex App-Server Driver
 // ============================================================================
-// Manages a long-running `codex mcp-server` child process and drives Codex
-// turns via MCP JSON-RPC protocol over stdio.
+// Manages a long-running `codex app-server` child process and drives Codex
+// turns via the app-server JSON-RPC protocol over stdio.
 //
-// Instead of spawning single-shot `codex exec` processes that exit after one
-// turn, the driver keeps a persistent `codex mcp-server` alive and uses the
-// `codex` (start session) and `codex-reply` (continue session) MCP tools to
-// drive multi-turn conversations.
+// The app-server protocol (unlike the simpler mcp-server) supports:
+//   - thread/start:    create a new conversation thread
+//   - turn/start:      begin a new agent turn (returns immediately, streams via notifications)
+//   - turn/steer:      inject content mid-turn (between agent loop iterations)
+//   - turn/interrupt:  cancel an in-flight turn
 //
-// The `codex mcp-server` exposes exactly 2 tools:
-//   - "codex":       start a new thread  → returns { threadId, content }
-//   - "codex-reply": continue a thread   → returns { threadId, content }
+// This enables mid-turn message injection: when Codex is busy executing a
+// multi-minute task, the orchestrator can push teammate messages via
+// turn/steer without waiting for the turn to complete.
 //
-// This allows Codex to maintain full conversation history across turns,
-// receive teammate messages pushed by the orchestrator, and participate in
-// review loops without process restart overhead.
+// Data flow:
+//   turn/start → turn/started notification (gives turnId)
+//   → item/started → item/*/delta → item/completed (streaming work)
+//   → turn/completed (final result with usage stats)
 // ============================================================================
 
 import type { Subprocess } from "bun";
 import { log } from "../shared/utils.ts";
 
-/** Subprocess type with all stdio set to "pipe" — gives concrete types for stdin/stdout/stderr. */
+/** Subprocess type with all stdio set to "pipe". */
 type PipedSubprocess = Subprocess<"pipe", "pipe", "pipe">;
 
 const LOG_PREFIX = "codex-driver";
 
-/** Result from a Codex turn (start or reply). */
+/** Result from a Codex turn. */
 export interface CodexTurnResult {
   threadId: string;
   content: string;
+  usage?: { input_tokens?: number; output_tokens?: number; cached_input_tokens?: number };
 }
 
-/** Notification event emitted by the Codex MCP server. */
+/** Notification event from the app-server. */
 export interface CodexNotification {
   method: string;
-  /** Thread this notification belongs to (from _meta.threadId). */
   threadId?: string;
-  /** Parsed params from the notification. */
+  turnId?: string;
   params: Record<string, unknown>;
 }
 
@@ -54,14 +56,37 @@ export interface CodexSessionOptions {
   model?: string;
 }
 
+/** Convert a simplified sandbox string to the Codex app-server's serde enum object.
+ *  The app-server uses camelCase variant names: workspaceWrite, readOnly, etc. */
+function sandboxPolicyObject(sandbox: string, cwd?: string): Record<string, unknown> {
+  switch (sandbox) {
+    case "danger-full-access":
+      return { type: "dangerFullAccess" };
+    case "read-only":
+      return { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false };
+    case "workspace-write":
+      return {
+        type: "workspaceWrite",
+        writableRoots: cwd ? [cwd] : [],
+        readOnlyAccess: { type: "fullAccess" },
+        networkAccess: true,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false,
+      };
+    default:
+      return { type: sandbox };
+  }
+}
+
 /**
- * Drives a `codex mcp-server` child process via MCP JSON-RPC over stdio.
+ * Drives a `codex app-server` child process via JSON-RPC over stdio.
  *
  * Lifecycle:
- *   1. CodexDriver.spawn(cwd, env) — starts server, does MCP handshake
+ *   1. CodexDriver.spawn(cwd, env) — starts server, does handshake
  *   2. driver.startSession({prompt, ...}) — creates a thread, runs first turn
- *   3. driver.reply(threadId, message) — pushes a new turn into the thread
- *   4. driver.kill() — graceful shutdown
+ *   3. driver.reply(threadId, message) — starts a new turn on the thread
+ *   4. driver.steer(threadId, text) — injects content mid-turn
+ *   5. driver.kill() — graceful shutdown
  */
 export class CodexDriver {
   private proc: PipedSubprocess;
@@ -72,37 +97,55 @@ export class CodexDriver {
   }>();
   private buffer = "";
   private _threadId: string | null = null;
+  private _activeTurnId: string | null = null;
   private _alive = true;
   private _onExitCallbacks: Array<() => void> = [];
   private _notificationListeners: NotificationListener[] = [];
   private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private _lastActivity = Date.now();
+  /** Tracks last notification activity (item/completed, turn events).
+   *  Unlike _lastActivity, this is NOT updated by heartbeat responses. */
+  private _lastNotificationActivity = Date.now();
 
-  /** The current thread ID (set after startSession). */
+  // Turn completion tracking: when a turn is in flight, we collect content
+  // from streaming notifications and resolve when turn/completed fires.
+  private _turnResolvers = new Map<string, {
+    resolve: (result: CodexTurnResult) => void;
+    reject: (error: Error) => void;
+    content: string[];
+    usage?: CodexTurnResult["usage"];
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+
   get threadId(): string | null { return this._threadId; }
-
-  /** Whether the underlying process is alive. */
   get alive(): boolean { return this._alive; }
-
-  /** The underlying child process PID. */
   get pid(): number { return this.proc.pid; }
-
-  /** The underlying Subprocess (for process tracking by the orchestrator). */
   get process(): PipedSubprocess { return this.proc; }
-
-  /** Timestamp of last successful communication with the MCP server. */
   get lastActivity(): number { return this._lastActivity; }
+  /** Last time a notification (item/completed, turn event) was received.
+   *  Use this for idle detection — not polluted by heartbeat responses. */
+  get lastNotificationActivity(): number { return this._lastNotificationActivity; }
+
+  /** The currently in-flight turn ID, or null if no turn is active. */
+  get activeTurnId(): string | null { return this._activeTurnId; }
 
   private constructor(proc: PipedSubprocess) {
     this.proc = proc;
     this.startReader();
     this.proc.exited.then((code) => {
       this._alive = false;
-      log(LOG_PREFIX, `codex mcp-server exited with code ${code}`);
+      this._activeTurnId = null;
+      log(LOG_PREFIX, `codex app-server exited with code ${code}`);
       // Reject all pending requests
       for (const [id, pending] of this.pendingRequests) {
-        pending.reject(new Error(`codex mcp-server exited (code ${code})`));
+        pending.reject(new Error(`codex app-server exited (code ${code})`));
         this.pendingRequests.delete(id);
+      }
+      // Reject all pending turn completions
+      for (const [turnId, resolver] of this._turnResolvers) {
+        clearTimeout(resolver.timer);
+        resolver.reject(new Error(`codex app-server exited (code ${code}) during turn ${turnId}`));
+        this._turnResolvers.delete(turnId);
       }
       for (const cb of this._onExitCallbacks) {
         try { cb(); } catch { /* don't let one callback break others */ }
@@ -113,22 +156,18 @@ export class CodexDriver {
   /** Register a callback for when the process exits. Multiple callbacks supported. */
   onExit(cb: () => void): void { this._onExitCallbacks.push(cb); }
 
-  /** Register a listener for MCP notifications from the Codex server. */
+  /** Register a listener for notifications from the app-server. */
   onNotification(cb: NotificationListener): void { this._notificationListeners.push(cb); }
 
   /**
-   * Spawn a new `codex mcp-server` process and perform the MCP handshake.
-   *
-   * @param cwd - Working directory for Codex
-   * @param env - Environment variables (should include MULTIAGENTS_* vars)
-   * @param timeoutMs - Handshake timeout (default 30s — MCP init can be slow)
+   * Spawn a new `codex app-server` process and perform the handshake.
    */
   static async spawn(
     cwd: string,
     env: Record<string, string | undefined>,
     timeoutMs = 30_000,
   ): Promise<CodexDriver> {
-    const proc = Bun.spawn(["codex", "mcp-server"], {
+    const proc = Bun.spawn(["codex", "app-server"], {
       cwd,
       stdin: "pipe",
       stdout: "pipe",
@@ -137,79 +176,118 @@ export class CodexDriver {
     });
 
     const driver = new CodexDriver(proc);
-
-    // Read stderr in background (for diagnostics)
     driver.readStderr();
 
-    // MCP initialize handshake
+    // App-server handshake: initialize → response → initialized notification
     const initResult = await driver.sendRequest("initialize", {
-      protocolVersion: "2024-11-05",
-      capabilities: {},
       clientInfo: { name: "multiagents-orchestrator", version: "1.0" },
-    }, timeoutMs) as { serverInfo?: { name: string; version: string } };
+      capabilities: {},
+    }, timeoutMs) as { userAgent?: string };
 
-    // Per MCP spec: client MUST send `initialized` notification after receiving
-    // the initialize response, before making any other requests.
+    // Send initialized notification (required before any other requests)
     try {
-      driver.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+      driver.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "initialized" }) + "\n");
       driver.proc.stdin.flush();
-    } catch { /* best effort — handshake already succeeded */ }
+    } catch { /* best effort */ }
 
-    log(LOG_PREFIX, `Handshake complete: ${initResult.serverInfo?.name} v${initResult.serverInfo?.version}`);
+    log(LOG_PREFIX, `Handshake complete: ${initResult.userAgent ?? "codex app-server"}`);
 
-    // Start periodic liveness heartbeat — detects hung MCP servers faster
-    // than the 10-minute tool call timeout.
     driver.startHeartbeat();
-
     return driver;
   }
 
   /**
-   * Start a new Codex session (thread). Runs the first turn.
+   * Start a new Codex session (thread + first turn).
    *
-   * This calls the MCP "codex" tool which creates a new thread, executes
-   * the prompt, and returns the thread ID + response content. The call
-   * blocks until Codex finishes the entire first turn (can take minutes).
+   * Creates a thread, then starts a turn with the given prompt.
+   * Blocks until the turn completes (can take minutes).
    */
   async startSession(opts: CodexSessionOptions): Promise<CodexTurnResult> {
-    const args: Record<string, unknown> = {
-      prompt: opts.prompt,
-    };
-    if (opts.cwd) args.cwd = opts.cwd;
-    if (opts.sandbox) args.sandbox = opts.sandbox;
-    if (opts.baseInstructions) args["base-instructions"] = opts.baseInstructions;
-    if (opts.developerInstructions) args["developer-instructions"] = opts.developerInstructions;
-    if (opts.model) args.model = opts.model;
-
     log(LOG_PREFIX, `Starting session: ${opts.prompt.slice(0, 100)}...`);
 
-    // Codex turns can take several minutes — use a generous timeout
-    const result = await this.callTool("codex", args, 10 * 60_000) as CodexTurnResult;
-    this._threadId = result.threadId;
+    // Step 1: create a thread
+    // thread/start returns { thread: { id: "..." }, ... }
+    const threadResult = await this.sendRequest("thread/start", {}, 30_000) as { thread: { id: string } };
+    const threadId = threadResult.thread?.id;
+    if (!threadId) throw new Error("thread/start did not return a thread ID");
+    this._threadId = threadId;
+
+    // Step 2: start the first turn
+    const turnInput: Record<string, unknown> = {
+      threadId,
+      input: [{ type: "text", text: opts.prompt }],
+    };
+    if (opts.cwd) turnInput.cwd = opts.cwd;
+    // Codex app-server expects sandboxPolicy as a serde internally-tagged enum.
+    // Convert our simplified string to the full object format.
+    if (opts.sandbox) {
+      turnInput.sandboxPolicy = sandboxPolicyObject(opts.sandbox, opts.cwd);
+    }
+    if (opts.developerInstructions) turnInput.developerInstructions = opts.developerInstructions;
+    if (opts.model) turnInput.model = opts.model;
+    // Enable fully autonomous execution (equivalent to `codex exec -a never`).
+    // Without this, MCP tool calls require interactive approval which hangs in headless mode.
+    // The schema accepts: "untrusted" | "on-failure" | "on-request" | "never"
+    turnInput.approvalPolicy = "never";
+
+    const result = await this.startTurnAndWait(threadId, turnInput);
 
     log(LOG_PREFIX, `Session started: thread=${result.threadId}, content=${result.content.slice(0, 100)}...`);
     return result;
   }
 
   /**
-   * Send a new turn to an existing thread. Continues the conversation.
-   *
-   * @param threadId - Thread ID from startSession or a previous reply
-   * @param prompt - The new input (e.g., teammate message, orchestrator directive)
+   * Send a new turn to an existing thread.
    */
   async reply(threadId: string, prompt: string): Promise<CodexTurnResult> {
     log(LOG_PREFIX, `Reply to thread ${threadId}: ${prompt.slice(0, 100)}...`);
 
-    const result = await this.callTool("codex-reply", {
+    const result = await this.startTurnAndWait(threadId, {
       threadId,
-      prompt,
-    }, 10 * 60_000) as CodexTurnResult;
+      input: [{ type: "text", text: prompt }],
+      approvalPolicy: "never",
+    });
 
     log(LOG_PREFIX, `Reply complete: content=${result.content.slice(0, 100)}...`);
     return result;
   }
 
-  /** Gracefully kill the process. */
+  /**
+   * Inject content into an active turn (mid-turn message delivery).
+   *
+   * This is the key improvement over mcp-server: steer pushes content
+   * between agent loop iterations without waiting for the turn to finish.
+   * Returns immediately — the agent processes the steered input as part
+   * of the ongoing turn.
+   *
+   * Throws if no turn is active or if the turn rejects the steer.
+   */
+  async steer(threadId: string, text: string): Promise<void> {
+    const turnId = this._activeTurnId;
+    if (!turnId) {
+      throw new Error("Cannot steer: no active turn");
+    }
+
+    log(LOG_PREFIX, `Steering turn ${turnId}: ${text.slice(0, 100)}...`);
+
+    await this.sendRequest("turn/steer", {
+      threadId,
+      expectedTurnId: turnId,
+      input: [{ type: "text", text }],
+    }, 30_000);
+  }
+
+  /**
+   * Interrupt an active turn.
+   */
+  async interrupt(threadId: string): Promise<void> {
+    const turnId = this._activeTurnId;
+    if (!turnId) return;
+
+    log(LOG_PREFIX, `Interrupting turn ${turnId}`);
+    await this.sendRequest("turn/interrupt", { threadId, turnId }, 10_000);
+  }
+
   async kill(): Promise<void> {
     if (!this._alive) return;
     this.stopHeartbeat();
@@ -219,25 +297,68 @@ export class CodexDriver {
     this._alive = false;
   }
 
+  // --- Turn lifecycle ---
+
   /**
-   * Start a periodic liveness heartbeat using `tools/list` (lightweight, required by MCP spec).
-   * If the server fails to respond within 30s, mark the driver as unhealthy.
+   * Start a turn and wait for it to complete via notifications.
+   *
+   * Sends turn/start, then collects content from item/agentMessage/delta
+   * and item/completed notifications. Resolves when turn/completed fires.
    */
+  private async startTurnAndWait(
+    threadId: string,
+    params: Record<string, unknown>,
+    timeoutMs = 10 * 60_000,
+  ): Promise<CodexTurnResult> {
+    // Send the turn/start request — returns immediately with turn metadata
+    const turnMeta = await this.sendRequest("turn/start", params, 30_000) as {
+      turn?: { id: string; status: string };
+    };
+
+    const turnId = turnMeta.turn?.id;
+    if (!turnId) {
+      throw new Error("turn/start did not return a turn ID");
+    }
+
+    this._activeTurnId = turnId;
+
+    // Wait for turn/completed notification
+    return new Promise<CodexTurnResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._turnResolvers.delete(turnId);
+        this._activeTurnId = null;
+        reject(new Error(`Turn ${turnId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      this._turnResolvers.set(turnId, {
+        resolve: (result) => {
+          this._activeTurnId = null;
+          resolve(result);
+        },
+        reject: (err) => {
+          this._activeTurnId = null;
+          reject(err);
+        },
+        content: [],
+        timer,
+      });
+    });
+  }
+
+  // --- Heartbeat ---
+
   private startHeartbeat(): void {
     this._heartbeatTimer = setInterval(async () => {
       if (!this._alive) { this.stopHeartbeat(); return; }
-
-      // Skip heartbeat if there was recent activity (within 30s) — no need to ping
       if (Date.now() - this._lastActivity < 30_000) return;
 
       try {
-        await this.sendRequest("tools/list", {}, 30_000);
-        // _lastActivity is updated by handleMessage on successful response
+        // Use thread/list as a lightweight health check
+        await this.sendRequest("thread/list", { limit: 1 }, 30_000);
       } catch (err) {
         log(LOG_PREFIX, `Heartbeat failed: ${err instanceof Error ? err.message : err}`);
-        // Don't kill here — the orchestrator's crash handler will deal with process exit
       }
-    }, 30_000); // Check every 30 seconds
+    }, 30_000);
   }
 
   private stopHeartbeat(): void {
@@ -247,13 +368,12 @@ export class CodexDriver {
     }
   }
 
-  // --- MCP JSON-RPC protocol ---
+  // --- JSON-RPC protocol ---
 
-  /** Send a JSON-RPC request and wait for the response. */
   private sendRequest(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
     return new Promise((resolve, reject) => {
       if (!this._alive) {
-        reject(new Error("codex mcp-server is not alive"));
+        reject(new Error("codex app-server is not alive"));
         return;
       }
 
@@ -262,7 +382,6 @@ export class CodexDriver {
 
       this.pendingRequests.set(id, { resolve, reject });
 
-      // Timeout
       const timer = setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
@@ -270,7 +389,6 @@ export class CodexDriver {
         }
       }, timeoutMs);
 
-      // Wrap resolve/reject to clear timer
       const origResolve = resolve;
       const origReject = reject;
       this.pendingRequests.set(id, {
@@ -278,48 +396,19 @@ export class CodexDriver {
         reject: (e) => { clearTimeout(timer); origReject(e); },
       });
 
-      // Write to stdin (proc.stdin is FileSink when spawned with stdin: "pipe")
       try {
         this.proc.stdin.write(msg);
         this.proc.stdin.flush();
       } catch (err) {
         this.pendingRequests.delete(id);
         clearTimeout(timer);
-        reject(new Error(`Failed to write to codex mcp-server stdin: ${err}`));
+        reject(new Error(`Failed to write to codex app-server stdin: ${err}`));
       }
     });
   }
 
-  /** Call an MCP tool and return the parsed result. */
-  private async callTool(name: string, args: Record<string, unknown>, timeoutMs = 60_000): Promise<unknown> {
-    const result = await this.sendRequest("tools/call", {
-      name,
-      arguments: args,
-    }, timeoutMs) as {
-      content?: Array<{ type: string; text: string }>;
-      structuredContent?: { threadId: string; content: string };
-      isError?: boolean;
-    };
-
-    if (result.isError) {
-      const errorText = result.content?.map(c => c.text).join("\n") ?? "Unknown error";
-      throw new Error(`Codex tool "${name}" failed: ${errorText}`);
-    }
-
-    // Codex returns structured output in `structuredContent` (threadId + content)
-    // and plain text in `content[].text`. Prefer structuredContent for thread management.
-    if (result.structuredContent?.threadId) {
-      return result.structuredContent;
-    }
-
-    // Fallback: extract from text content
-    const textContent = result.content?.find(c => c.type === "text")?.text ?? "";
-    return { threadId: this._threadId ?? "", content: textContent };
-  }
-
   // --- stdio readers ---
 
-  /** Read stdout and dispatch JSON-RPC responses. */
   private async startReader(): Promise<void> {
     const decoder = new TextDecoder();
     const reader = this.proc.stdout.getReader();
@@ -346,12 +435,21 @@ export class CodexDriver {
     }
   }
 
-  /** Parse and dispatch a JSON-RPC message. */
   private handleMessage(line: string): void {
     try {
       const msg = JSON.parse(line);
 
-      // JSON-RPC response (has "id" field)
+      // Server-initiated REQUEST (has both "id" AND "method").
+      // These are approval requests — the server asks us to approve commands,
+      // file changes, MCP tool calls, etc. We must respond or the turn blocks.
+      if (msg.id !== undefined && msg.id !== null && msg.method) {
+        this._lastActivity = Date.now();
+        this._lastNotificationActivity = Date.now();
+        this.handleServerRequest(msg.id, msg.method, msg.params ?? {});
+        return;
+      }
+
+      // JSON-RPC response (has "id" but no "method" — reply to our request)
       if (msg.id !== undefined && msg.id !== null) {
         this._lastActivity = Date.now();
         const pending = this.pendingRequests.get(msg.id);
@@ -366,23 +464,11 @@ export class CodexDriver {
         return;
       }
 
-      // JSON-RPC notification (no "id" — server-initiated)
-      // Codex emits codex/event notifications with progress, token usage,
-      // and activity data. Parse and forward to registered listeners.
+      // JSON-RPC notification (no "id" — server-initiated, no response needed)
       if (msg.method) {
         this._lastActivity = Date.now();
-        if (this._notificationListeners.length > 0) {
-          const params = (msg.params ?? {}) as Record<string, unknown>;
-          const meta = params._meta as Record<string, unknown> | undefined;
-          const notification: CodexNotification = {
-            method: msg.method,
-            threadId: (meta?.threadId as string) ?? undefined,
-            params,
-          };
-          for (const listener of this._notificationListeners) {
-            try { listener(notification); } catch { /* don't let listener errors break the reader */ }
-          }
-        }
+        this._lastNotificationActivity = Date.now();
+        this.handleNotification(msg.method, msg.params ?? {});
         return;
       }
     } catch {
@@ -390,7 +476,144 @@ export class CodexDriver {
     }
   }
 
-  /** Read stderr for diagnostic logging. */
+  /**
+   * Handle an app-server notification. Key events:
+   *
+   * - turn/started:           Active turn ID assigned
+   * - turn/completed:         Turn finished (resolve pending promise)
+   * - item/agentMessage/delta: Streaming content (collect for final result)
+   * - item/completed:         Single item finished (token tracking, activity)
+   */
+  private handleNotification(method: string, params: Record<string, unknown>): void {
+    const turnId = params.turnId as string | undefined;
+
+    // Dispatch to registered external listeners
+    if (this._notificationListeners.length > 0) {
+      const notification: CodexNotification = {
+        method,
+        threadId: (params.threadId as string) ?? undefined,
+        turnId,
+        params,
+      };
+      for (const listener of this._notificationListeners) {
+        try { listener(notification); } catch { /* listener errors shouldn't break the reader */ }
+      }
+    }
+
+    // --- Internal turn lifecycle tracking ---
+
+    if (method === "turn/started") {
+      const id = (params.turn as any)?.id ?? turnId;
+      if (id) this._activeTurnId = id;
+      return;
+    }
+
+    if (method === "turn/completed") {
+      this._activeTurnId = null;
+      const completedTurnId = turnId ?? (params.turn as any)?.id;
+      if (!completedTurnId) return;
+
+      const resolver = this._turnResolvers.get(completedTurnId);
+      if (resolver) {
+        clearTimeout(resolver.timer);
+        this._turnResolvers.delete(completedTurnId);
+
+        // Extract usage from turn/completed params
+        const usage = (params.usage ?? (params.turn as any)?.usage) as CodexTurnResult["usage"] | undefined;
+
+        resolver.resolve({
+          threadId: this._threadId ?? "",
+          content: resolver.content.join(""),
+          usage: usage ?? resolver.usage,
+        });
+      }
+      return;
+    }
+
+    // Collect streaming agent message content
+    if (method === "item/agentMessage/delta") {
+      const delta = params.delta as string | undefined;
+      if (delta && turnId) {
+        const resolver = this._turnResolvers.get(turnId);
+        if (resolver) resolver.content.push(delta);
+      }
+      return;
+    }
+
+    // Item completed — extract any content and usage
+    if (method === "item/completed") {
+      const item = params.item as Record<string, unknown> | undefined;
+      if (item?.type === "agentMessage" && item.text && turnId) {
+        const resolver = this._turnResolvers.get(turnId);
+        if (resolver && resolver.content.length === 0) {
+          // If we missed deltas, use the completed item text as fallback
+          resolver.content.push(item.text as string);
+        }
+      }
+      // Extract token usage from item
+      if (item?.usage && turnId) {
+        const resolver = this._turnResolvers.get(turnId);
+        if (resolver) resolver.usage = item.usage as CodexTurnResult["usage"];
+      }
+      return;
+    }
+  }
+
+  /**
+   * Handle a server-initiated JSON-RPC request (has both id and method).
+   * These are approval requests — auto-approve all of them for headless operation.
+   *
+   * Known request types:
+   *   - item/commandExecution/requestApproval → approve shell commands
+   *   - item/fileChange/requestApproval → approve file writes
+   *   - item/applyPatch/requestApproval → approve patches
+   *   - mcp/server/elicitationRequest → approve MCP interactions
+   *   - item/permissions/requestApproval → approve permission escalations
+   */
+  private handleServerRequest(id: number | string, method: string, params: Record<string, unknown>): void {
+    log(LOG_PREFIX, `Auto-approving server request: ${method} (id=${id})`);
+
+    // Each server request type has its own response schema — must match exactly.
+    let result: Record<string, unknown>;
+
+    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
+      // Schema: { decision: "accept" | "acceptForSession" | "decline" | "cancel" }
+      result = { decision: "acceptForSession" };
+    } else if (method === "item/applyPatch/requestApproval" || method === "execCommand/requestApproval") {
+      // Schema: { decision: "approved" | "approved_for_session" | "denied" | "abort" }
+      result = { decision: "approved_for_session" };
+    } else if (method.includes("elicitation")) {
+      // Schema: { action: "accept" | "decline" | "cancel" }
+      result = { action: "accept" };
+    } else if (method === "permissions/requestApproval") {
+      // Schema: { permissions: { fileSystem: { read: [...], write: [...] }, network: { enabled: true } }, scope: "session" }
+      result = {
+        permissions: {
+          fileSystem: { read: [process.cwd()], write: [process.cwd()] },
+          network: { enabled: true },
+        },
+        scope: "session",
+      };
+    } else if (method.includes("requestUserInput") || method.includes("toolRequestUserInput")) {
+      // Schema: { answers: {} }
+      result = { answers: {} };
+    } else if (method.includes("requestApproval") || method.includes("approval")) {
+      // Fallback for unknown approval types
+      result = { decision: "acceptForSession" };
+    } else {
+      // Unknown server request — try generic approval
+      result = { decision: "acceptForSession" };
+    }
+
+    try {
+      const response = JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n";
+      this.proc.stdin.write(response);
+      this.proc.stdin.flush();
+    } catch (err) {
+      log(LOG_PREFIX, `Failed to respond to server request ${method}: ${err}`);
+    }
+  }
+
   private async readStderr(): Promise<void> {
     const decoder = new TextDecoder();
     const reader = this.proc.stderr.getReader();
