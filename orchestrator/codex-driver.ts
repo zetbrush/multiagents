@@ -32,6 +32,18 @@ export interface CodexTurnResult {
   content: string;
 }
 
+/** Notification event emitted by the Codex MCP server. */
+export interface CodexNotification {
+  method: string;
+  /** Thread this notification belongs to (from _meta.threadId). */
+  threadId?: string;
+  /** Parsed params from the notification. */
+  params: Record<string, unknown>;
+}
+
+/** Callback type for notification listeners. */
+export type NotificationListener = (notification: CodexNotification) => void;
+
 /** Options for starting a new Codex session. */
 export interface CodexSessionOptions {
   prompt: string;
@@ -61,7 +73,10 @@ export class CodexDriver {
   private buffer = "";
   private _threadId: string | null = null;
   private _alive = true;
-  private _onExit: (() => void) | null = null;
+  private _onExitCallbacks: Array<() => void> = [];
+  private _notificationListeners: NotificationListener[] = [];
+  private _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private _lastActivity = Date.now();
 
   /** The current thread ID (set after startSession). */
   get threadId(): string | null { return this._threadId; }
@@ -75,6 +90,9 @@ export class CodexDriver {
   /** The underlying Subprocess (for process tracking by the orchestrator). */
   get process(): PipedSubprocess { return this.proc; }
 
+  /** Timestamp of last successful communication with the MCP server. */
+  get lastActivity(): number { return this._lastActivity; }
+
   private constructor(proc: PipedSubprocess) {
     this.proc = proc;
     this.startReader();
@@ -86,12 +104,17 @@ export class CodexDriver {
         pending.reject(new Error(`codex mcp-server exited (code ${code})`));
         this.pendingRequests.delete(id);
       }
-      this._onExit?.();
+      for (const cb of this._onExitCallbacks) {
+        try { cb(); } catch { /* don't let one callback break others */ }
+      }
     });
   }
 
-  /** Register a callback for when the process exits. */
-  onExit(cb: () => void): void { this._onExit = cb; }
+  /** Register a callback for when the process exits. Multiple callbacks supported. */
+  onExit(cb: () => void): void { this._onExitCallbacks.push(cb); }
+
+  /** Register a listener for MCP notifications from the Codex server. */
+  onNotification(cb: NotificationListener): void { this._notificationListeners.push(cb); }
 
   /**
    * Spawn a new `codex mcp-server` process and perform the MCP handshake.
@@ -125,7 +148,18 @@ export class CodexDriver {
       clientInfo: { name: "multiagents-orchestrator", version: "1.0" },
     }, timeoutMs) as { serverInfo?: { name: string; version: string } };
 
+    // Per MCP spec: client MUST send `initialized` notification after receiving
+    // the initialize response, before making any other requests.
+    try {
+      driver.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+      driver.proc.stdin.flush();
+    } catch { /* best effort — handshake already succeeded */ }
+
     log(LOG_PREFIX, `Handshake complete: ${initResult.serverInfo?.name} v${initResult.serverInfo?.version}`);
+
+    // Start periodic liveness heartbeat — detects hung MCP servers faster
+    // than the 10-minute tool call timeout.
+    driver.startHeartbeat();
 
     return driver;
   }
@@ -178,10 +212,39 @@ export class CodexDriver {
   /** Gracefully kill the process. */
   async kill(): Promise<void> {
     if (!this._alive) return;
+    this.stopHeartbeat();
     try {
       this.proc.kill();
     } catch { /* already dead */ }
     this._alive = false;
+  }
+
+  /**
+   * Start a periodic liveness heartbeat using `tools/list` (lightweight, required by MCP spec).
+   * If the server fails to respond within 30s, mark the driver as unhealthy.
+   */
+  private startHeartbeat(): void {
+    this._heartbeatTimer = setInterval(async () => {
+      if (!this._alive) { this.stopHeartbeat(); return; }
+
+      // Skip heartbeat if there was recent activity (within 30s) — no need to ping
+      if (Date.now() - this._lastActivity < 30_000) return;
+
+      try {
+        await this.sendRequest("tools/list", {}, 30_000);
+        // _lastActivity is updated by handleMessage on successful response
+      } catch (err) {
+        log(LOG_PREFIX, `Heartbeat failed: ${err instanceof Error ? err.message : err}`);
+        // Don't kill here — the orchestrator's crash handler will deal with process exit
+      }
+    }, 30_000); // Check every 30 seconds
+  }
+
+  private stopHeartbeat(): void {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer);
+      this._heartbeatTimer = null;
+    }
   }
 
   // --- MCP JSON-RPC protocol ---
@@ -290,6 +353,7 @@ export class CodexDriver {
 
       // JSON-RPC response (has "id" field)
       if (msg.id !== undefined && msg.id !== null) {
+        this._lastActivity = Date.now();
         const pending = this.pendingRequests.get(msg.id);
         if (pending) {
           this.pendingRequests.delete(msg.id);
@@ -303,10 +367,22 @@ export class CodexDriver {
       }
 
       // JSON-RPC notification (no "id" — server-initiated)
-      // These are MCP notifications like progress, logging, etc.
-      // We could emit them as events in the future.
+      // Codex emits codex/event notifications with progress, token usage,
+      // and activity data. Parse and forward to registered listeners.
       if (msg.method) {
-        // Ignore notifications for now — they're informational
+        this._lastActivity = Date.now();
+        if (this._notificationListeners.length > 0) {
+          const params = (msg.params ?? {}) as Record<string, unknown>;
+          const meta = params._meta as Record<string, unknown> | undefined;
+          const notification: CodexNotification = {
+            method: msg.method,
+            threadId: (meta?.threadId as string) ?? undefined,
+            params,
+          };
+          for (const listener of this._notificationListeners) {
+            try { listener(notification); } catch { /* don't let listener errors break the reader */ }
+          }
+        }
         return;
       }
     } catch {

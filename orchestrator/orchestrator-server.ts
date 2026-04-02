@@ -28,7 +28,7 @@ import {
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
-import { monitorProcess, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
+import { monitorProcess, monitorCodexDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
@@ -138,6 +138,7 @@ function handleEvent(event: AgentEvent): void {
                   activeCodexDrivers.set(event.sessionId, drivers);
                 }
                 drivers.set(event.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId });
+                monitorCodexDriver(result.codexDriver, event.slotId, event.sessionId, brokerClient, handleEvent);
                 result.codexDriver.onExit(() => {
                   handleEvent({
                     type: "agent_crashed", severity: "critical",
@@ -246,6 +247,7 @@ async function autoRestartIfIncomplete(
         let drivers = activeCodexDrivers.get(sessionId);
         if (!drivers) { drivers = new Map(); activeCodexDrivers.set(sessionId, drivers); }
         drivers.set(slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId });
+        monitorCodexDriver(result.codexDriver, slotId, sessionId, brokerClient, handleEvent);
         result.codexDriver.onExit(() => {
           handleEvent({
             type: "agent_crashed", severity: "critical", slotId, sessionId,
@@ -654,6 +656,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               activeCodexDrivers.set(sessionId, sessionDrivers);
             }
             sessionDrivers.set(result.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId });
+            monitorCodexDriver(result.codexDriver, result.slotId, sessionId, brokerClient, handleEvent);
 
             // Monitor driver process exit for auto-restart
             result.codexDriver.onExit(() => {
@@ -879,6 +882,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             activeCodexDrivers.set(session_id, sessionDrivers);
           }
           sessionDrivers.set(result.slotId, { driver: result.codexDriver, threadId: result.codexDriver.threadId });
+          monitorCodexDriver(result.codexDriver, result.slotId, session_id, brokerClient, handleEvent);
         } else {
           monitorProcess(result.process, result.slotId, session_id, brokerClient, handleEvent);
         }

@@ -135,7 +135,7 @@ export async function respawnAgent(
 ): Promise<{ pid: number; process: import("bun").Subprocess; codexDriver?: CodexDriver }> {
   // Get the crashed slot's info
   const slot = await brokerClient.getSlot(slotId);
-  const snapshot = safeJsonParse<{ last_summary?: string; last_status?: string }>(
+  const snapshot = safeJsonParse<{ last_summary?: string; last_status?: string; codex_thread_id?: string }>(
     slot.context_snapshot,
     {},
   );
@@ -199,7 +199,33 @@ export async function respawnAgent(
     // Mark slot as connected
     await brokerClient.updateSlot({ id: slotId, status: "connected" });
 
-    // Two-phase: fast bootstrap then task
+    // Try to resume the previous thread if we have a threadId in context_snapshot.
+    // This preserves full conversation history from before the crash instead of
+    // starting from a blank slate with only a 150-char recap.
+    const previousThreadId = snapshot.codex_thread_id as string | undefined;
+
+    if (previousThreadId) {
+      log(LOG_PREFIX, `Attempting to resume Codex thread ${previousThreadId} for slot ${slotId}`);
+      try {
+        const result = await driver.reply(previousThreadId, handoffTask);
+        await brokerClient.updateSlot({
+          id: slotId,
+          context_snapshot: JSON.stringify({
+            codex_thread_id: result.threadId,
+            last_summary: result.content.slice(0, 200),
+            last_status: "working",
+            updated_at: Date.now(),
+          }),
+        });
+        log(LOG_PREFIX, `Resumed Codex thread ${previousThreadId} for slot ${slotId} (PID ${driver.pid})`);
+        return { pid: driver.pid, process: driver.process, codexDriver: driver };
+      } catch (err) {
+        log(LOG_PREFIX, `Thread resume failed for ${previousThreadId}, falling back to new session: ${err}`);
+        // Fall through to fresh session below
+      }
+    }
+
+    // Fallback: create a new session (fresh thread, no prior context)
     const bootstrap = await driver.startSession({
       prompt: `You are "${slot.display_name ?? `Agent #${slotId}`}" (${slot.role ?? "agent"}). You are being restarted. Reply: "Ready."`,
       cwd: projectDir,

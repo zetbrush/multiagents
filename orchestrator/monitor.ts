@@ -7,6 +7,7 @@
 
 import type { Subprocess } from "bun";
 import type { BrokerClient } from "../shared/broker-client.ts";
+import type { CodexDriver, CodexNotification } from "./codex-driver.ts";
 import { log } from "../shared/utils.ts";
 
 const LOG_PREFIX = "monitor";
@@ -413,4 +414,134 @@ async function handleExit(
   }
 
   log(LOG_PREFIX, `Slot ${slotId} process exited with code ${exitCode}`);
+}
+
+/**
+ * Monitor a CodexDriver via its notification stream.
+ *
+ * In MCP server mode, Codex emits JSON-RPC notifications instead of JSONL
+ * on stdout. This bridges the gap: it listens to driver notifications and
+ * updates slot state (token tracking, activity detection, auto-transition
+ * to "working") using the same logic as the stdout-based monitor.
+ */
+export function monitorCodexDriver(
+  driver: CodexDriver,
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+  onEvent: (event: AgentEvent) => void,
+): void {
+  driver.onNotification((notification: CodexNotification) => {
+    handleCodexNotification(notification, slotId, sessionId, brokerClient, onEvent);
+  });
+}
+
+/** Process a single Codex MCP notification and update slot state. */
+async function handleCodexNotification(
+  notification: CodexNotification,
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+  onEvent: (event: AgentEvent) => void,
+): Promise<void> {
+  const { method, params } = notification;
+
+  // MCP logging notifications — extract error-level logs
+  if (method === "notifications/message" || method === "notifications/logging/message") {
+    const level = params.level as string | undefined;
+    const data = params.data as string | undefined;
+    if (level === "error" && data) {
+      onEvent({
+        type: "agent_error",
+        severity: "warning",
+        slotId,
+        sessionId,
+        message: `Codex MCP log: ${String(data).slice(0, 200)}`,
+      });
+    }
+    return;
+  }
+
+  // MCP progress notifications
+  if (method === "notifications/progress") {
+    // Activity detected — auto-transition to working
+    await autoTransitionToWorking(slotId, brokerClient);
+    return;
+  }
+
+  // Codex-specific event notifications (codex/event or similar)
+  // These carry item completions, token counts, and activity signals
+  const data = params.data as Record<string, unknown> | undefined;
+  const eventType = (params.type ?? data?.type) as string | undefined;
+
+  if (!eventType) return;
+
+  // Token usage from turn.completed events
+  if (eventType === "turn.completed") {
+    const usage = (params.usage ?? data?.usage) as Record<string, number> | undefined;
+    if (usage) {
+      await updateTokenUsage(slotId, {
+        input: usage.input_tokens ?? 0,
+        output: usage.output_tokens ?? 0,
+        cacheRead: usage.cached_input_tokens ?? 0,
+      }, brokerClient);
+    }
+    return;
+  }
+
+  // Item completions (agent_message, command_execution, mcp_tool_call)
+  if (eventType === "item.completed") {
+    await autoTransitionToWorking(slotId, brokerClient);
+    const item = (params.item ?? data?.item) as Record<string, unknown> | undefined;
+    if (!item) return;
+
+    const itemType = item.type as string | undefined;
+
+    if (itemType === "agent_message" && item.text) {
+      try {
+        await brokerClient.updateSlot({
+          id: slotId,
+          context_snapshot: JSON.stringify({
+            last_summary: String(item.text).slice(0, 200),
+            last_status: "working",
+            updated_at: Date.now(),
+          }),
+        });
+      } catch { /* best-effort */ }
+    }
+
+    if (itemType === "command_execution") {
+      try {
+        await brokerClient.updateSlot({
+          id: slotId,
+          context_snapshot: JSON.stringify({
+            last_summary: `Running: ${String(item.command ?? "shell command").slice(0, 100)}`,
+            last_status: "working",
+            updated_at: Date.now(),
+          }),
+        });
+      } catch { /* best-effort */ }
+    }
+
+    if (itemType === "mcp_tool_call") {
+      try {
+        await brokerClient.updateSlot({
+          id: slotId,
+          context_snapshot: JSON.stringify({
+            last_summary: `MCP: ${String(item.server ?? "")}/${String(item.tool ?? "unknown")}`.slice(0, 100),
+            last_status: "working",
+            updated_at: Date.now(),
+          }),
+        });
+      } catch { /* best-effort */ }
+    }
+
+    onEvent({
+      type: "agent_progress",
+      severity: "info",
+      slotId,
+      sessionId,
+      message: `Codex ${itemType ?? "activity"} in slot ${slotId}`,
+    });
+  }
 }
