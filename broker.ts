@@ -1226,6 +1226,15 @@ Bun.serve({
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/poll-by-slot":
           return Response.json(handlePollBySlot(body as { slot_id: number; session_id?: string }));
+        case "/peek-undelivered": {
+          // Non-consuming: returns count, msg_types, and oldest_at (epoch ms) of undelivered messages
+          const { slot_id } = body as { slot_id: number };
+          const rows = db.query(
+            "SELECT msg_type, sent_at FROM messages WHERE to_slot_id = ? AND delivered = 0 AND held = 0 ORDER BY id ASC"
+          ).all(slot_id) as { msg_type: string; sent_at: string }[];
+          const oldest_at = rows.length > 0 ? new Date(rows[0].sent_at).getTime() : 0;
+          return Response.json({ count: rows.length, msg_types: rows.map(r => r.msg_type), oldest_at });
+        }
         case "/unregister":
           return Response.json(handleUnregister(body as { id: string }));
 

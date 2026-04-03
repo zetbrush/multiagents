@@ -104,6 +104,11 @@ export class BrokerClient {
     return this.post("/poll-by-slot", { slot_id: slotId });
   }
 
+  /** Non-consuming peek at undelivered messages for a slot. */
+  peekUndelivered(slotId: number): Promise<{ count: number; msg_types: string[]; oldest_at: number }> {
+    return this.post("/peek-undelivered", { slot_id: slotId });
+  }
+
   unregister(id: PeerId): Promise<UnregisterResult> {
     return this.post("/unregister", { id });
   }

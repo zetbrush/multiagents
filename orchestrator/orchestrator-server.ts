@@ -1630,9 +1630,11 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           if (slot.status !== "connected" || !slot.peer_id) continue;
           if (slot.paused === true || (slot.paused as unknown as number) === 1) continue;
 
-          // Skip agents in terminal task states — no point nudging them
+          // Skip agents in truly terminal task states — no point nudging them
           const taskState = (slot as any).task_state;
-          if (taskState === "done_pending_review" || taskState === "approved" || taskState === "released") continue;
+          if (taskState === "approved" || taskState === "released") continue;
+          // Note: done_pending_review agents are NOT skipped — they may need
+          // to respond to feedback or review requests from teammates.
 
           // Codex driver-managed agents get nudges delivered via the
           // forwarding loop (steer or reply). Don't skip them — they need
@@ -1757,6 +1759,226 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
       } catch { /* ok */ }
     }
   }, 15_000);
+
+  // --- Session auto-end: archive session when all agents are approved/released ---
+  // Checks every 30s. Waits for a 30s grace period after the last approval
+  // to allow agents to see the final state before killing processes.
+  const sessionCompletionTimers: Map<string, number> = new Map();
+  setInterval(async () => {
+    for (const sessionId of activeProcesses.keys()) {
+      try {
+        const slots = await brokerClient.listSlots(sessionId);
+        if (slots.length === 0) continue;
+
+        // --- Auto-approve orphaned done_pending_review agents ---
+        // When all reviewer/QA agents are approved/released/disconnected but some
+        // non-reviewer agents are still at done_pending_review, there's nobody left
+        // to approve them. Auto-approve to unblock session completion.
+        const reviewerSlots = slots.filter((s) => s.role && /qa|review|test|lead/i.test(s.role));
+        const allReviewersDone = reviewerSlots.length > 0 && reviewerSlots.every(
+          (s) => (s as any).task_state === "approved" || (s as any).task_state === "released" || s.status === "disconnected"
+        );
+        if (allReviewersDone) {
+          const orphaned = slots.filter(
+            (s) => (s as any).task_state === "done_pending_review" && !(s.role && /qa|review|test|lead/i.test(s.role))
+          );
+          for (const slot of orphaned) {
+            log(LOG_PREFIX, `Auto-approving orphaned ${slot.display_name ?? `slot ${slot.id}`} (all reviewers done, no one left to approve)`);
+            await brokerClient.updateSlot({ id: slot.id, task_state: "approved" } as any);
+            pendingEvents.push({
+              type: "auto_approved",
+              severity: "info",
+              slotId: slot.id,
+              sessionId,
+              message: `${slot.display_name ?? `slot ${slot.id}`} auto-approved: all reviewers finished, no pending review possible.`,
+            });
+          }
+        }
+
+        const allDone = slots.every(
+          (s) => (s as any).task_state === "approved" || (s as any).task_state === "released" || s.status === "disconnected"
+        );
+        const anyApproved = slots.some((s) => (s as any).task_state === "approved" || (s as any).task_state === "released");
+
+        if (allDone && anyApproved) {
+          const existingTimer = sessionCompletionTimers.get(sessionId);
+          if (!existingTimer) {
+            sessionCompletionTimers.set(sessionId, Date.now());
+            log(LOG_PREFIX, `Session ${sessionId}: all agents done — starting 30s grace period before auto-end`);
+            pendingEvents.push({
+              type: "session_completing",
+              severity: "info",
+              slotId: -1,
+              sessionId,
+              message: `All agents approved/released. Session will auto-end in 30s.`,
+            });
+          } else if (Date.now() - existingTimer > 30_000) {
+            // Grace period elapsed — auto-end the session
+            log(LOG_PREFIX, `Session ${sessionId}: auto-ending (all agents approved for 30s)`);
+
+            // Kill all processes
+            const sessionProcs = activeProcesses.get(sessionId);
+            if (sessionProcs) {
+              for (const [slotId, proc] of sessionProcs) {
+                try { proc.kill(); } catch { /* already dead */ }
+              }
+              sessionProcs.clear();
+              activeProcesses.delete(sessionId);
+            }
+            const sessionDrivers = activeCodexDrivers.get(sessionId);
+            if (sessionDrivers) {
+              for (const [, state] of sessionDrivers) {
+                try { state.driver.kill(); } catch { /* already dead */ }
+              }
+              sessionDrivers.clear();
+              activeCodexDrivers.delete(sessionId);
+            }
+
+            // Mark all connected slots as disconnected
+            for (const slot of slots) {
+              if (slot.status === "connected") {
+                await brokerClient.updateSlot({ id: slot.id, status: "disconnected" });
+              }
+            }
+
+            // Archive the session
+            await brokerClient.updateSession({ id: sessionId, status: "archived" });
+
+            // Clean up tracking state
+            for (const slot of slots) {
+              clearSlotTracking(slot.id);
+              completionRestartHistory.delete(slot.id);
+            }
+            activeSessions.delete(sessionId);
+            sessionCompletionTimers.delete(sessionId);
+
+            pendingEvents.push({
+              type: "session_ended",
+              severity: "info",
+              slotId: -1,
+              sessionId,
+              message: `Session auto-ended: all agents approved. ${slots.length} agents stopped and session archived.`,
+            });
+          }
+        } else {
+          // Reset timer if conditions no longer met (agent restarted, etc.)
+          sessionCompletionTimers.delete(sessionId);
+        }
+      } catch { /* ok */ }
+    }
+  }, 15_000);
+
+  // --- Smart non-driver agent respawn ---
+  //
+  // Problem: Gemini (and disconnected Claude) agents have no push/steer mechanism.
+  // After signal_done or when idle, the LLM stops calling MCP tools and messages
+  // pile up undelivered. Teammates are blocked waiting.
+  //
+  // Solution: measure actual message staleness, not agent idle time.
+  //   - peek-undelivered returns `oldest_at` — the timestamp of the oldest unread message
+  //   - If actionable messages (review_request, feedback, task_complete) have been
+  //     sitting undelivered for >15s, the agent isn't polling → kill + respawn
+  //   - Disconnected agents with any actionable messages → respawn immediately
+  //   - Claude with channel push (connected) → skip, push handles delivery
+  //   - Codex with driver → skip, forwarding loop handles delivery
+  //
+  // This means: teammate sends review_request → 15s for Gemini to self-poll →
+  // if not picked up, orchestrator kills idle process and spawns a fresh one
+  // that gets recap + pending messages on startup.
+  //
+  const MESSAGE_STALE_MS = 15_000; // 15s — enough for ~50 poll cycles at 300ms
+  const lastRespawnAttempt: Map<number, number> = new Map();
+
+  setInterval(async () => {
+    for (const sessionId of activeProcesses.keys()) {
+      try {
+        const slots = await brokerClient.listSlots(sessionId);
+        for (const slot of slots) {
+          const taskState = (slot as any).task_state;
+          if (taskState === "released") continue;
+
+          // Skip Codex — driver-managed via forwarding loop
+          const drivers = activeCodexDrivers.get(sessionId);
+          if (drivers?.has(slot.id)) continue;
+
+          // Skip connected Claude — channel push handles delivery
+          if (slot.agent_type === "claude" && slot.status === "connected") continue;
+
+          // Peek at undelivered messages
+          const peek = await brokerClient.peekUndelivered(slot.id);
+          if (!peek || peek.count === 0) continue;
+
+          // Only act on actionable message types
+          const hasActionable = peek.msg_types.some(
+            (t) => t === "review_request" || t === "task_complete" || t === "feedback" || t === "system"
+          );
+          if (!hasActionable) continue;
+
+          const now = Date.now();
+
+          // For connected agents: check if messages are stale (agent not polling)
+          // For disconnected agents: always eligible for respawn
+          if (slot.status === "connected") {
+            const messageAge = peek.oldest_at ? now - peek.oldest_at : 0;
+            if (messageAge < MESSAGE_STALE_MS) continue; // Give agent time to self-poll
+          }
+
+          // Throttle respawns (at most once per 45s per slot)
+          const lastAttempt = lastRespawnAttempt.get(slot.id) ?? 0;
+          if (now - lastAttempt < 45_000) continue;
+          lastRespawnAttempt.set(slot.id, now);
+
+          const agentName = slot.display_name ?? `slot ${slot.id}`;
+          const sessionMeta = activeSessions.get(sessionId);
+          if (!sessionMeta) continue;
+
+          // If connected but not polling — kill the stale process first
+          if (slot.status === "connected") {
+            const messageAgeSec = peek.oldest_at ? Math.round((now - peek.oldest_at) / 1000) : 0;
+            log(LOG_PREFIX, `${agentName} (${slot.agent_type}) has ${peek.count} undelivered message(s) for ${messageAgeSec}s — not polling, killing process`);
+            const sessionProcs = activeProcesses.get(sessionId);
+            const proc = sessionProcs?.get(slot.id);
+            if (proc) {
+              try { proc.kill(); } catch { /* ok */ }
+              sessionProcs?.delete(slot.id);
+            }
+            // Brief wait for broker to register disconnect
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+
+          log(LOG_PREFIX, `Respawning ${agentName} (${slot.agent_type}) — ${peek.count} unread messages`);
+
+          try {
+            const { respawnAgent } = await import("./recovery.ts");
+            const result = await respawnAgent(sessionId, slot.id, brokerClient, sessionMeta.projectDir);
+
+            const sessionProcs = activeProcesses.get(sessionId);
+            if (sessionProcs && result.process) {
+              sessionProcs.set(slot.id, result.process);
+            }
+            if (result.codexDriver) {
+              let drvs = activeCodexDrivers.get(sessionId);
+              if (!drvs) { drvs = new Map(); activeCodexDrivers.set(sessionId, drvs); }
+              drvs.set(slot.id, { driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 });
+              monitorCodexDriver(result.codexDriver, slot.id, sessionId, brokerClient, handleEvent);
+            } else if (sessionProcs && result.process) {
+              monitorProcess(result.process, slot.id, sessionId, brokerClient, handleEvent);
+            }
+
+            pendingEvents.push({
+              type: "agent_restarted",
+              severity: "info",
+              slotId: slot.id,
+              sessionId,
+              message: `${agentName} auto-respawned: ${peek.count} unread messages waiting ${peek.oldest_at ? Math.round((now - peek.oldest_at) / 1000) : "?"}s`,
+            });
+          } catch (err) {
+            log(LOG_PREFIX, `Failed to respawn ${agentName}: ${err}`);
+          }
+        }
+      } catch { /* ok */ }
+    }
+  }, 10_000);
 }
 
 // --- Main ---
