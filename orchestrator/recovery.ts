@@ -10,7 +10,7 @@ import type { AgentEvent } from "./monitor.ts";
 import type { CodexDriver } from "./codex-driver.ts";
 import { FLAP_THRESHOLD, FLAP_WINDOW_MS } from "../shared/constants.ts";
 import { log, safeJsonParse, formatDuration } from "../shared/utils.ts";
-import { relaunchIntoSlot, buildTeamContext } from "./launcher.ts";
+import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
 
 const LOG_PREFIX = "recovery";
 
@@ -186,6 +186,7 @@ export async function respawnAgent(
 
     const spawnEnv: Record<string, string | undefined> = {
       ...process.env,
+      PATH: ENRICHED_PATH,
       MULTIAGENTS_SESSION: sessionId,
       MULTIAGENTS_SLOT: String(slotId),
       MULTIAGENTS_ROLE: slot.role ?? undefined,

@@ -19,6 +19,36 @@ const LOG_PREFIX = "launcher";
 /** Resolved path to cli.ts — used to build MCP server commands. */
 const CLI_PATH = path.resolve(import.meta.dir, "..", "cli.ts");
 
+/**
+ * Build a PATH that includes common CLI installation directories.
+ * GUI apps (like Claude Desktop) don't load shell profiles, so their PATH
+ * is minimal (just /usr/bin:/bin:/usr/sbin:/sbin). This ensures `which`
+ * and spawned child processes can find claude, codex, gemini, bun, etc.
+ */
+function enrichedPath(): string {
+  const home = process.env.HOME ?? "";
+  const extra = [
+    path.join(home, ".bun", "bin"),
+    path.join(home, ".local", "bin"),
+    path.join(home, ".nvm", "versions", "node", "current", "bin"),   // nvm
+    "/usr/local/bin",
+    "/opt/homebrew/bin",                                              // Apple Silicon brew
+    "/opt/homebrew/sbin",
+    path.join(home, ".cargo", "bin"),                                 // rustup
+    path.join(home, ".volta", "bin"),                                 // volta
+    path.join(home, "bin"),
+  ];
+  const current = process.env.PATH ?? "";
+  const dirs = new Set(current.split(":"));
+  for (const d of extra) {
+    if (!dirs.has(d)) dirs.add(d);
+  }
+  return [...dirs].join(":");
+}
+
+/** Cached enriched PATH — computed once per process. */
+export const ENRICHED_PATH = enrichedPath();
+
 /** Detection result for an agent CLI binary. */
 interface AgentDetection {
   available: boolean;
@@ -55,11 +85,14 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
     return { available: false };
   }
 
+  const spawnEnv = { ...process.env, PATH: ENRICHED_PATH };
+
   // Gemini is invoked via npx — check if the package is available
   if (type === "gemini") {
     try {
       const proc = Bun.spawnSync(["npx", "-y", "@google/gemini-cli", "--version"], {
         timeout: 15_000,
+        env: spawnEnv,
       });
       const out = new TextDecoder().decode(proc.stdout).trim();
       if (proc.exitCode === 0 && out) {
@@ -69,7 +102,7 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
     return { available: false };
   }
 
-  const which = Bun.spawnSync(["which", cmd]);
+  const which = Bun.spawnSync(["which", cmd], { env: spawnEnv });
   const binPath = new TextDecoder().decode(which.stdout).trim();
 
   if (which.exitCode !== 0 || !binPath) {
@@ -79,7 +112,7 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
   // Try to get version
   let version: string | undefined;
   try {
-    const proc = Bun.spawnSync([cmd, "--version"]);
+    const proc = Bun.spawnSync([binPath, "--version"], { env: spawnEnv });
     const out = new TextDecoder().decode(proc.stdout).trim();
     if (proc.exitCode === 0 && out) {
       version = out.split("\n")[0];
@@ -328,9 +361,10 @@ export async function launchAgent(
     "Use THESE tools. Do NOT try to call the broker via CLI or HTTP — use the MCP tools.",
   ].join("\n");
 
-  // Build env — unset CLAUDECODE to allow nested Claude sessions
+  // Build env — enrich PATH for GUI-spawned contexts, unset CLAUDECODE for nesting
   const spawnEnv: Record<string, string | undefined> = {
     ...process.env,
+    PATH: ENRICHED_PATH,
     MULTIAGENTS_SESSION: sessionId,
     MULTIAGENTS_ROLE: config.role,
     MULTIAGENTS_NAME: config.name,
@@ -553,6 +587,7 @@ export async function relaunchIntoSlot(
 
   const spawnEnv: Record<string, string | undefined> = {
     ...process.env,
+    PATH: ENRICHED_PATH,
     MULTIAGENTS_SESSION: sessionId,
     MULTIAGENTS_ROLE: slot.role ?? undefined,
     MULTIAGENTS_NAME: slot.display_name ?? undefined,

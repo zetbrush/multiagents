@@ -26,7 +26,7 @@ import {
   FLAP_WINDOW_MS,
 } from "../shared/constants.ts";
 
-import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext } from "./launcher.ts";
+import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
 import { monitorProcess, monitorCodexDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
@@ -73,7 +73,7 @@ function launchDashboard(sessionId: string, projectDir: string): void {
     } else if (platform === "linux") {
       // Linux: try common terminal emulators
       for (const term of ["gnome-terminal", "xterm", "konsole"]) {
-        const which = Bun.spawnSync(["which", term]);
+        const which = Bun.spawnSync(["which", term], { env: { ...process.env, PATH: ENRICHED_PATH } });
         if (which.exitCode === 0) {
           Bun.spawn([term, "--", "bun", CLI_PATH, "dashboard", sessionId], {
             cwd: projectDir,
