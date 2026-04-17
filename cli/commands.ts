@@ -164,6 +164,17 @@ export async function runCli(args: string[]): Promise<void> {
       break;
     }
 
+    case "web": {
+      // Launch web dashboard server (auto-opens browser)
+      const serverPath = new URL("../dashboard/server.ts", import.meta.url).pathname;
+      const proc = Bun.spawn(["bun", serverPath, ...(args[1] ? [args[1]] : [])], {
+        cwd: process.cwd(),
+        stdio: ["inherit", "inherit", "inherit"],
+      });
+      await proc.exited;
+      break;
+    }
+
     case "session": {
       const { sessionCommand } = await import("./session.ts");
       await sessionCommand(args.slice(1));

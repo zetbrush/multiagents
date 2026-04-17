@@ -20,6 +20,7 @@
     "shared/",
     "adapters/",
     "orchestrator/",
+    "dashboard/",
     "cli/",
     ".mcp.json",
     "README.md",

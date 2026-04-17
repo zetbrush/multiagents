@@ -89,6 +89,26 @@ function launchDashboard(sessionId: string, projectDir: string): void {
   }
 }
 
+const WEB_DASHBOARD_PATH = new URL("../dashboard/server.ts", import.meta.url).pathname;
+
+/**
+ * Launch the web dashboard as a background Bun process.
+ * Auto-opens the browser on localhost:7900.
+ */
+function launchWebDashboard(sessionId: string, projectDir: string): void {
+  try {
+    const proc = Bun.spawn(["bun", WEB_DASHBOARD_PATH, sessionId], {
+      cwd: projectDir,
+      env: { ...process.env, PATH: ENRICHED_PATH },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    proc.unref();
+    log(LOG_PREFIX, `Web dashboard launched for session ${sessionId} (PID ${proc.pid})`);
+  } catch (e) {
+    log(LOG_PREFIX, `Web dashboard auto-launch failed (non-critical): ${e}`);
+  }
+}
+
 // --- Broker lifecycle ---
 
 async function ensureBroker(brokerClient: BrokerClient): Promise<void> {
@@ -745,8 +765,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const status = await getTeamStatus(sessionId, brokerClient);
         const display = formatTeamStatusForDisplay(status);
 
-        // Auto-launch dashboard in a new terminal
+        // Auto-launch dashboards (TUI in terminal + web in browser)
         launchDashboard(sessionId, project_dir);
+        launchWebDashboard(sessionId, project_dir);
 
         return {
           content: [{
@@ -1415,8 +1436,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Track session for monitoring loops
         activeSessions.set(session_id, { projectDir: session.project_dir });
 
-        // Launch dashboard
+        // Launch dashboards (TUI + web)
         launchDashboard(session_id, session.project_dir);
+        launchWebDashboard(session_id, session.project_dir);
 
         const lines: string[] = [`Session "${session_id}" resumed.`];
         if (respawned.length > 0) {

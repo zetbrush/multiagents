@@ -200,13 +200,30 @@ Session monitoring stats and enforced limits:
 
 Adjustable from the TUI dashboard (+/- keys) or via `adjust_guardrail` tool.
 
+## Web Dashboard
+
+```bash
+multiagents web [session-id]
+```
+
+Real-time web dashboard on `localhost:7900` with live WebSocket updates. Auto-opens in browser when a team is created via the orchestrator. 6-tab interface:
+
+- **Agents**: agent cards with connection status, task state, role, summaries, token usage
+- **Messages**: live message feed with type badges and sender names
+- **Plan**: task progress with completion bar and assignee labels
+- **Knowledge**: shared knowledge entries with categories and provenance
+- **Files**: file locks and ownership zones
+- **Stats**: session metrics (connected agents, working, tokens) and guardrail bars
+
+Dark theme, responsive layout, keyboard shortcuts (`1-6` to switch tabs).
+
 ## TUI Dashboard
 
 ```bash
 multiagents dashboard [session-id]
 ```
 
-5-tab interface:
+5-tab terminal interface (same data, ANSI rendering):
 - **[1] Agents**: connection status, task state, summaries
 - **[2] Messages**: auto-scrolling message log with filtering
 - **[3] Stats**: guardrail monitoring and adjustment
@@ -219,6 +236,7 @@ Keys: `1-5` switch tabs, `j/k` scroll, `p` pause all, `r` resume all, `+/-` adju
 
 ```
 multiagents setup                     Interactive setup wizard
+multiagents web [session-id]         Web dashboard (localhost:7900)
 multiagents dashboard [session-id]    TUI dashboard
 multiagents session <sub>             Session management (create/list/resume/pause/delete)
 multiagents send <target> <msg>       Send message to agent

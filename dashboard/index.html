@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>multiagents dashboard</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --surface: #161b22;
+      --surface2: #1c2333;
+      --border: #2d333b;
+      --text: #e6edf3;
+      --text-dim: #7d8590;
+      --text-muted: #484f58;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --yellow: #d29922;
+      --orange: #db6d28;
+      --red: #f85149;
+      --purple: #bc8cff;
+      --cyan: #39d2c0;
+      --blue: #58a6ff;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.5;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* --- Header --- */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 16px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    .header-left { display: flex; align-items: center; gap: 12px; }
+    .header-title { font-weight: 600; font-size: 15px; }
+    .header-session {
+      font-size: 13px;
+      color: var(--text-dim);
+      background: var(--surface2);
+      padding: 2px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+    .conn-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+    .conn-dot.alive { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .conn-dot.dead { background: var(--red); box-shadow: 0 0 6px var(--red); }
+    .header-right { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--text-dim); }
+
+    /* --- Tab Bar --- */
+    .tabs {
+      display: flex;
+      gap: 0;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 16px;
+      flex-shrink: 0;
+    }
+    .tab {
+      padding: 8px 16px;
+      cursor: pointer;
+      color: var(--text-dim);
+      border-bottom: 2px solid transparent;
+      font-size: 13px;
+      font-weight: 500;
+      transition: all 0.15s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      user-select: none;
+    }
+    .tab:hover { color: var(--text); background: var(--surface2); }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-badge {
+      font-size: 11px;
+      padding: 0 6px;
+      border-radius: 10px;
+      background: var(--surface2);
+      color: var(--text-dim);
+      min-width: 18px;
+      text-align: center;
+    }
+    .tab.active .tab-badge { background: rgba(88,166,255,0.15); color: var(--accent); }
+
+    /* --- Main layout --- */
+    .main {
+      flex: 1;
+      overflow: auto;
+      padding: 16px;
+    }
+    .app { display: flex; flex-direction: column; height: 100vh; }
+
+    /* --- Cards --- */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 10px 14px;
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* --- Agent Cards --- */
+    .agents-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 12px;
+    }
+    .agent-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      transition: border-color 0.2s;
+    }
+    .agent-card:hover { border-color: var(--accent); }
+    .agent-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .agent-name { font-weight: 600; font-size: 14px; }
+    .agent-role { font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
+    .agent-summary { font-size: 12px; color: var(--text-dim); line-height: 1.4; margin-top: 8px;
+      border-top: 1px solid var(--border); padding-top: 8px; }
+
+    /* --- Status badges --- */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: 500;
+    }
+    .badge-idle { background: rgba(125,133,144,0.15); color: var(--text-dim); }
+    .badge-working { background: rgba(88,166,255,0.15); color: var(--blue); }
+    .badge-review { background: rgba(210,153,34,0.15); color: var(--yellow); }
+    .badge-feedback { background: rgba(219,109,40,0.15); color: var(--orange); }
+    .badge-approved { background: rgba(63,185,80,0.15); color: var(--green); }
+    .badge-released { background: rgba(125,133,144,0.1); color: var(--text-muted); }
+    .badge-connected { background: rgba(63,185,80,0.15); color: var(--green); }
+    .badge-disconnected { background: rgba(248,81,73,0.15); color: var(--red); }
+
+    /* --- Message feed --- */
+    .msg-feed { max-height: calc(100vh - 160px); overflow-y: auto; }
+    .msg-item {
+      display: flex;
+      gap: 10px;
+      padding: 6px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      transition: background 0.15s;
+    }
+    .msg-item:hover { background: var(--surface2); }
+    .msg-time { color: var(--text-muted); font-size: 12px; white-space: nowrap; font-family: monospace; min-width: 60px; }
+    .msg-from { color: var(--accent); font-weight: 500; white-space: nowrap; min-width: 100px; }
+    .msg-type {
+      font-size: 10px; padding: 1px 6px; border-radius: 4px;
+      text-transform: uppercase; font-weight: 600; white-space: nowrap;
+    }
+    .msg-type-chat { background: rgba(88,166,255,0.15); color: var(--blue); }
+    .msg-type-system { background: rgba(125,133,144,0.15); color: var(--text-dim); }
+    .msg-type-feedback { background: rgba(219,109,40,0.15); color: var(--orange); }
+    .msg-type-approval { background: rgba(63,185,80,0.15); color: var(--green); }
+    .msg-type-review_request { background: rgba(210,153,34,0.15); color: var(--yellow); }
+    .msg-type-task_complete { background: rgba(63,185,80,0.15); color: var(--green); }
+    .msg-type-release { background: rgba(188,140,255,0.15); color: var(--purple); }
+    .msg-text { color: var(--text); word-break: break-word; flex: 1; }
+
+    /* --- Plan --- */
+    .plan-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+    .plan-title { font-weight: 600; font-size: 16px; }
+    .progress-bar {
+      flex: 1; max-width: 200px; height: 6px;
+      background: var(--surface2); border-radius: 3px; overflow: hidden;
+    }
+    .progress-fill { height: 100%; background: var(--green); border-radius: 3px; transition: width 0.3s; }
+    .plan-pct { font-size: 13px; color: var(--text-dim); font-weight: 600; }
+    .plan-item { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 13px; }
+    .plan-check { font-size: 16px; width: 20px; text-align: center; }
+    .plan-check.done { color: var(--green); }
+    .plan-check.progress { color: var(--cyan); }
+    .plan-check.blocked { color: var(--red); }
+    .plan-check.pending { color: var(--text-muted); }
+    .plan-assignee { margin-left: auto; font-size: 11px; color: var(--text-dim);
+      background: var(--surface2); padding: 1px 8px; border-radius: 8px; }
+
+    /* --- Stats --- */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .stat-value { font-size: 24px; font-weight: 700; }
+    .stat-label { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+
+    /* --- Files table --- */
+    .table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .table th {
+      text-align: left; padding: 8px 12px; color: var(--text-dim);
+      font-weight: 600; font-size: 12px; text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+    }
+    .table td { padding: 6px 12px; border-bottom: 1px solid var(--border); }
+
+    /* --- Knowledge --- */
+    .knowledge-item {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .knowledge-key { font-weight: 600; color: var(--accent); font-size: 13px; }
+    .knowledge-cat {
+      font-size: 10px; padding: 1px 6px; border-radius: 4px; margin-left: 6px;
+      background: rgba(188,140,255,0.15); color: var(--purple);
+      text-transform: uppercase; font-weight: 600;
+    }
+    .knowledge-value { font-size: 13px; color: var(--text); margin-top: 4px; }
+    .knowledge-meta { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
+    /* --- Empty state --- */
+    .empty { text-align: center; padding: 40px; color: var(--text-dim); }
+    .empty-icon { font-size: 32px; margin-bottom: 8px; opacity: 0.5; }
+
+    /* --- Utilities --- */
+    .flex { display: flex; }
+    .gap-2 { gap: 8px; }
+    .items-center { align-items: center; }
+    .hidden { display: none !important; }
+
+    /* --- Scrollbar --- */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+    /* --- Mobile --- */
+    @media (max-width: 768px) {
+      .agents-grid { grid-template-columns: 1fr; }
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+      .header { flex-wrap: wrap; }
+      .msg-from { min-width: 60px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <div class="header">
+      <div class="header-left">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span class="header-title">multiagents</span>
+        <span class="header-session" id="session-name">connecting...</span>
+      </div>
+      <div class="header-right">
+        <span id="agent-count"></span>
+        <span id="uptime"></span>
+        <span id="ws-status" style="font-size:11px"></span>
+      </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs" id="tab-bar">
+      <div class="tab active" data-tab="agents">Agents <span class="tab-badge" id="badge-agents">0</span></div>
+      <div class="tab" data-tab="messages">Messages <span class="tab-badge" id="badge-messages">0</span></div>
+      <div class="tab" data-tab="plan">Plan <span class="tab-badge" id="badge-plan">-</span></div>
+      <div class="tab" data-tab="knowledge">Knowledge <span class="tab-badge" id="badge-knowledge">0</span></div>
+      <div class="tab" data-tab="files">Files <span class="tab-badge" id="badge-files">0</span></div>
+      <div class="tab" data-tab="stats">Stats <span class="tab-badge" id="badge-stats"></span></div>
+    </div>
+
+    <!-- Tab panels -->
+    <div class="main" id="main">
+      <div id="panel-agents"></div>
+      <div id="panel-messages" class="hidden"></div>
+      <div id="panel-plan" class="hidden"></div>
+      <div id="panel-knowledge" class="hidden"></div>
+      <div id="panel-files" class="hidden"></div>
+      <div id="panel-stats" class="hidden"></div>
+    </div>
+  </div>
+
+  <script>
+    // =========================================================================
+    // multiagents Web Dashboard — Frontend
+    // =========================================================================
+
+    let state = null;
+    let activeTab = "agents";
+    let ws = null;
+    let wsAttempt = 0;
+    let autoScroll = true;
+
+    // --- WebSocket ---
+
+    function connectWs() {
+      const url = `ws://${location.host}/ws`;
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        wsAttempt = 0;
+        document.getElementById("ws-status").textContent = "live";
+        document.getElementById("ws-status").style.color = "#3fb950";
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === "state") {
+            state = msg.data;
+            render();
+          }
+        } catch {}
+      };
+
+      ws.onclose = () => {
+        document.getElementById("ws-status").textContent = "reconnecting...";
+        document.getElementById("ws-status").style.color = "#d29922";
+        const delay = Math.min(500 * Math.pow(2, wsAttempt) + Math.random() * 1000, 30000);
+        wsAttempt++;
+        setTimeout(connectWs, delay);
+      };
+
+      ws.onerror = () => ws.close();
+
+      // Keepalive ping
+      setInterval(() => { if (ws?.readyState === 1) ws.send("ping"); }, 30000);
+    }
+
+    // --- Tab switching ---
+
+    document.getElementById("tab-bar").addEventListener("click", (e) => {
+      const tab = e.target.closest(".tab");
+      if (!tab) return;
+      activeTab = tab.dataset.tab;
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      showPanel(activeTab);
+    });
+
+    // Keyboard shortcuts
+    document.addEventListener("keydown", (e) => {
+      const tabs = ["agents", "messages", "plan", "knowledge", "files", "stats"];
+      const num = parseInt(e.key);
+      if (num >= 1 && num <= tabs.length) {
+        activeTab = tabs[num - 1];
+        document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+        document.querySelector(`[data-tab="${activeTab}"]`)?.classList.add("active");
+        showPanel(activeTab);
+      }
+    });
+
+    function showPanel(tab) {
+      document.querySelectorAll("[id^='panel-']").forEach(p => p.classList.add("hidden"));
+      const panel = document.getElementById(`panel-${tab}`);
+      if (panel) panel.classList.remove("hidden");
+      if (state) render();
+    }
+
+    // --- Rendering ---
+
+    function render() {
+      if (!state) return;
+      renderHeader();
+      renderBadges();
+
+      switch (activeTab) {
+        case "agents": renderAgents(); break;
+        case "messages": renderMessages(); break;
+        case "plan": renderPlan(); break;
+        case "knowledge": renderKnowledge(); break;
+        case "files": renderFiles(); break;
+        case "stats": renderStats(); break;
+      }
+    }
+
+    function renderHeader() {
+      const dot = document.getElementById("conn-dot");
+      dot.className = `conn-dot ${state.brokerAlive ? "alive" : "dead"}`;
+
+      const name = document.getElementById("session-name");
+      name.textContent = state.session?.name ?? state.sessionId ?? "no session";
+
+      const connected = state.slots.filter(s => s.status === "connected").length;
+      document.getElementById("agent-count").textContent = `${connected}/${state.slots.length} agents`;
+
+      if (state.session?.created_at) {
+        const elapsed = Math.round((Date.now() - state.session.created_at) / 1000);
+        const m = Math.floor(elapsed / 60);
+        const s = elapsed % 60;
+        document.getElementById("uptime").textContent = m > 0 ? `${m}m ${s}s` : `${s}s`;
+      }
+    }
+
+    function renderBadges() {
+      const connected = state.slots.filter(s => s.status === "connected").length;
+      document.getElementById("badge-agents").textContent = connected;
+      document.getElementById("badge-messages").textContent = state.messages.length;
+      document.getElementById("badge-plan").textContent = state.plan?.completion != null ? `${state.plan.completion}%` : "-";
+      document.getElementById("badge-knowledge").textContent = state.knowledge?.length ?? 0;
+      document.getElementById("badge-files").textContent = state.fileLocks.length + state.fileOwnership.length;
+
+      const warnings = state.guardrails.filter(g => g.status === "warning" || g.status === "triggered").length;
+      document.getElementById("badge-stats").textContent = warnings > 0 ? `${warnings}!` : "";
+    }
+
+    // --- Agents panel ---
+
+    function taskBadge(taskState) {
+      const map = {
+        idle: "badge-idle",
+        working: "badge-working",
+        done_pending_review: "badge-review",
+        addressing_feedback: "badge-feedback",
+        approved: "badge-approved",
+        released: "badge-released",
+      };
+      const label = {
+        idle: "idle",
+        working: "working",
+        done_pending_review: "in review",
+        addressing_feedback: "fixing",
+        approved: "approved",
+        released: "released",
+      };
+      return `<span class="badge ${map[taskState] ?? "badge-idle"}">${label[taskState] ?? taskState}</span>`;
+    }
+
+    function connBadge(status) {
+      return status === "connected"
+        ? '<span class="badge badge-connected">connected</span>'
+        : '<span class="badge badge-disconnected">disconnected</span>';
+    }
+
+    function renderAgents() {
+      const el = document.getElementById("panel-agents");
+      if (!state.slots.length) {
+        el.innerHTML = '<div class="empty"><div class="empty-icon">~</div>No agents in session</div>';
+        return;
+      }
+      // Match peers to slots for summary
+      const peerMap = new Map(state.peers.map(p => [p.id, p]));
+      const html = state.slots.map(slot => {
+        const peer = slot.peer_id ? peerMap.get(slot.peer_id) : null;
+        const summary = peer?.summary ?? (slot.context_snapshot ? (() => {
+          try { return JSON.parse(slot.context_snapshot)?.last_summary; } catch { return null; }
+        })() : null);
+        const tokens = (slot.input_tokens || slot.output_tokens)
+          ? `<div style="font-size:11px;color:var(--text-muted);margin-top:4px">${fmtTokens(slot.input_tokens ?? 0)} in / ${fmtTokens(slot.output_tokens ?? 0)} out</div>`
+          : "";
+        return `<div class="agent-card">
+          <div class="agent-top">
+            <span class="agent-name">${esc(slot.display_name ?? `Slot ${slot.id}`)}</span>
+            ${connBadge(slot.status)}
+          </div>
+          <div class="agent-role">${esc(slot.role ?? slot.agent_type ?? "")}</div>
+          <div class="flex gap-2 items-center">
+            ${taskBadge(slot.task_state ?? "idle")}
+            <span style="font-size:11px;color:var(--text-muted)">${slot.agent_type}</span>
+          </div>
+          ${tokens}
+          ${summary ? `<div class="agent-summary">${esc(truncate(summary, 200))}</div>` : ""}
+        </div>`;
+      }).join("");
+      el.innerHTML = `<div class="agents-grid">${html}</div>`;
+    }
+
+    // --- Messages panel ---
+
+    function renderMessages() {
+      const el = document.getElementById("panel-messages");
+      if (!state.messages.length) {
+        el.innerHTML = '<div class="empty"><div class="empty-icon">~</div>No messages yet</div>';
+        return;
+      }
+      const slotMap = new Map(state.slots.map(s => [s.id, s]));
+      const msgs = state.messages.slice().reverse(); // newest first in data, show oldest first
+      const html = msgs.map(m => {
+        const fromSlot = m.from_slot_id != null ? slotMap.get(m.from_slot_id) : null;
+        const fromName = fromSlot?.display_name ?? m.from_id ?? "?";
+        const time = fmtTime(m.sent_at);
+        const typeClass = `msg-type-${m.msg_type}`;
+        const text = (m.text ?? "").replace(/\n/g, " ").slice(0, 300);
+        return `<div class="msg-item">
+          <span class="msg-time">${time}</span>
+          <span class="msg-from">${esc(fromName)}</span>
+          <span class="msg-type ${typeClass}">${m.msg_type}</span>
+          <span class="msg-text">${esc(text)}</span>
+        </div>`;
+      }).join("");
+      el.innerHTML = `<div class="card"><div class="msg-feed">${html}</div></div>`;
+
+      // Auto-scroll to bottom
+      if (autoScroll) {
+        const feed = el.querySelector(".msg-feed");
+        if (feed) feed.scrollTop = feed.scrollHeight;
+      }
+    }
+
+    // --- Plan panel ---
+
+    function renderPlan() {
+      const el = document.getElementById("panel-plan");
+      if (!state.plan?.plan) {
+        el.innerHTML = '<div class="empty"><div class="empty-icon">~</div>No plan created</div>';
+        return;
+      }
+      const { plan, items, completion } = state.plan;
+      const slotMap = new Map(state.slots.map(s => [s.id, s]));
+      const statusIcon = { done: '<span class="plan-check done">&#10003;</span>',
+        in_progress: '<span class="plan-check progress">&#9654;</span>',
+        blocked: '<span class="plan-check blocked">&#10007;</span>',
+        pending: '<span class="plan-check pending">&#9675;</span>' };
+      const itemsHtml = items.map(item => {
+        const icon = statusIcon[item.status] ?? statusIcon.pending;
+        const assignee = item.assigned_to_slot ? slotMap.get(item.assigned_to_slot)?.display_name : null;
+        const dimClass = item.status === "done" ? 'style="opacity:0.5"' : "";
+        return `<div class="plan-item" ${dimClass}>
+          ${icon}
+          <span>${esc(item.label)}</span>
+          ${assignee ? `<span class="plan-assignee">${esc(assignee)}</span>` : ""}
+        </div>`;
+      }).join("");
+
+      el.innerHTML = `<div class="card">
+        <div class="card-header">
+          <div class="plan-header">
+            <span class="plan-title">${esc(plan.title)}</span>
+            <div class="progress-bar"><div class="progress-fill" style="width:${completion}%"></div></div>
+            <span class="plan-pct">${completion}%</span>
+          </div>
+        </div>
+        <div style="padding:12px 14px">${itemsHtml}</div>
+      </div>`;
+    }
+
+    // --- Knowledge panel ---
+
+    function renderKnowledge() {
+      const el = document.getElementById("panel-knowledge");
+      const entries = state.knowledge ?? [];
+      if (!entries.length) {
+        el.innerHTML = '<div class="empty"><div class="empty-icon">~</div>No knowledge entries. Agents will store decisions and discoveries here.</div>';
+        return;
+      }
+      const html = entries.map(e => {
+        const by = e.created_by_name ? `by ${esc(e.created_by_name)}` : "";
+        const ago = timeSince(e.updated_at);
+        return `<div class="knowledge-item">
+          <div><span class="knowledge-key">${esc(e.key)}</span><span class="knowledge-cat">${esc(e.category)}</span></div>
+          <div class="knowledge-value">${esc(e.value)}</div>
+          <div class="knowledge-meta">${by}${by && ago ? " \u00b7 " : ""}${ago}</div>
+        </div>`;
+      }).join("");
+      el.innerHTML = `<div class="card"><div class="card-header">Shared Knowledge <span style="font-size:12px;color:var(--text-dim)">(${entries.length})</span></div>${html}</div>`;
+    }
+
+    // --- Files panel ---
+
+    function renderFiles() {
+      const el = document.getElementById("panel-files");
+      const slotMap = new Map(state.slots.map(s => [s.id, s]));
+      let html = "";
+
+      if (state.fileOwnership.length) {
+        const rows = state.fileOwnership.map(o => {
+          const owner = slotMap.get(o.slot_id)?.display_name ?? `Slot ${o.slot_id}`;
+          return `<tr><td>${esc(o.path_pattern)}</td><td>${esc(owner)}</td><td style="color:var(--text-dim)">${esc(o.assigned_by ?? "")}</td></tr>`;
+        }).join("");
+        html += `<div class="card"><div class="card-header">Ownership Zones</div>
+          <table class="table"><thead><tr><th>Pattern</th><th>Owner</th><th>Assigned By</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      }
+
+      if (state.fileLocks.length) {
+        const rows = state.fileLocks.map(l => {
+          const holder = slotMap.get(l.held_by_slot)?.display_name ?? `Slot ${l.held_by_slot}`;
+          return `<tr><td>${esc(l.file_path)}</td><td>${esc(holder)}</td><td>${l.lock_type}</td></tr>`;
+        }).join("");
+        html += `<div class="card"><div class="card-header">Active Locks</div>
+          <table class="table"><thead><tr><th>File</th><th>Held By</th><th>Type</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+      }
+
+      if (!html) {
+        html = '<div class="empty"><div class="empty-icon">~</div>No file locks or ownership zones</div>';
+      }
+      el.innerHTML = html;
+    }
+
+    // --- Stats panel ---
+
+    function renderStats() {
+      const el = document.getElementById("panel-stats");
+
+      // Session metrics
+      const connected = state.slots.filter(s => s.status === "connected").length;
+      const working = state.slots.filter(s => s.task_state === "working").length;
+      const approved = state.slots.filter(s => s.task_state === "approved" || s.task_state === "released").length;
+      const totalIn = state.slots.reduce((a, s) => a + (s.input_tokens ?? 0), 0);
+      const totalOut = state.slots.reduce((a, s) => a + (s.output_tokens ?? 0), 0);
+
+      const statsCards = [
+        { value: connected, label: "Connected Agents", color: "var(--green)" },
+        { value: working, label: "Working", color: "var(--blue)" },
+        { value: approved, label: "Approved", color: "var(--green)" },
+        { value: state.messages.length, label: "Messages", color: "var(--cyan)" },
+        { value: fmtTokens(totalIn), label: "Input Tokens", color: "var(--purple)" },
+        { value: fmtTokens(totalOut), label: "Output Tokens", color: "var(--purple)" },
+      ];
+
+      const cardsHtml = statsCards.map(s =>
+        `<div class="stat-card"><div class="stat-value" style="color:${s.color}">${s.value}</div><div class="stat-label">${s.label}</div></div>`
+      ).join("");
+
+      // Guardrails
+      let guardrailHtml = "";
+      const enforced = state.guardrails.filter(g => g.action !== "monitor");
+      if (enforced.length) {
+        guardrailHtml = `<div class="card" style="margin-top:16px"><div class="card-header">Guardrails</div>
+          <div style="padding:12px 14px">${enforced.map(g => {
+            const pct = g.current_value && g.default_value ? Math.min(100, Math.round((g.current_value / g.default_value) * 100)) : 0;
+            const color = g.status === "triggered" ? "var(--red)" : g.status === "warning" ? "var(--yellow)" : "var(--green)";
+            return `<div style="margin-bottom:10px">
+              <div style="display:flex;justify-content:space-between;font-size:13px"><span>${esc(g.label)}</span><span style="color:${color}">${g.current_value}/${g.default_value} ${g.unit ?? ""}</span></div>
+              <div class="progress-bar" style="margin-top:4px"><div class="progress-fill" style="width:${pct}%;background:${color}"></div></div>
+            </div>`;
+          }).join("")}</div></div>`;
+      }
+
+      el.innerHTML = `<div class="stats-grid">${cardsHtml}</div>${guardrailHtml}`;
+    }
+
+    // --- Helpers ---
+
+    function esc(s) { if (!s) return ""; const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+    function truncate(s, n) { return s && s.length > n ? s.slice(0, n) + "..." : s; }
+    function fmtTokens(n) {
+      if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+      if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+      return String(n);
+    }
+    function fmtTime(iso) {
+      try {
+        const d = new Date(iso);
+        return d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      } catch { return ""; }
+    }
+    function timeSince(epoch) {
+      if (!epoch) return "";
+      const s = Math.round((Date.now() - epoch) / 1000);
+      if (s < 60) return `${s}s ago`;
+      const m = Math.floor(s / 60);
+      if (m < 60) return `${m}m ago`;
+      const h = Math.floor(m / 60);
+      return `${h}h ago`;
+    }
+
+    // --- Boot ---
+    connectWs();
+  </script>
+</body>
+</html>
