@@ -357,7 +357,8 @@ export async function launchAgent(
     "",
     "The multiagents-peer MCP tools are: set_summary, check_messages, send_message,",
     "check_team_status, get_plan, update_plan, signal_done, submit_feedback, approve,",
-    "list_peers, acquire_file, release_file, view_file_locks, get_history.",
+    "list_peers, acquire_file, release_file, view_file_locks, get_history,",
+    "store_knowledge, query_knowledge, remove_knowledge.",
     "Use THESE tools. Do NOT try to call the broker via CLI or HTTP — use the MCP tools.",
   ].join("\n");
 

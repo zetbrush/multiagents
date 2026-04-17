@@ -33,6 +33,13 @@ import type {
   ApproveRequest,
   ReleaseAgentRequest,
   UnregisterResult,
+  KnowledgePutRequest,
+  KnowledgePutResponse,
+  KnowledgeEntry,
+  KnowledgeListRequest,
+  KnowledgeGetRequest,
+  KnowledgeDeleteRequest,
+  KnowledgeCategory,
 } from "./types.ts";
 
 /** HTTP client for the multiagents broker API. */
@@ -241,6 +248,24 @@ export class BrokerClient {
 
   deleteSlot(slotId: number): Promise<{ ok: boolean; deleted: boolean }> {
     return this.post("/slots/delete", { id: slotId });
+  }
+
+  // --- Knowledge Store ---
+
+  putKnowledge(req: KnowledgePutRequest): Promise<KnowledgePutResponse> {
+    return this.post("/knowledge/put", req);
+  }
+
+  getKnowledge(sessionId: string, key: string): Promise<KnowledgeEntry | { error: string }> {
+    return this.post("/knowledge/get", { session_id: sessionId, key });
+  }
+
+  listKnowledge(sessionId: string, category?: KnowledgeCategory): Promise<KnowledgeEntry[]> {
+    return this.post("/knowledge/list", { session_id: sessionId, category });
+  }
+
+  deleteKnowledge(sessionId: string, key: string): Promise<{ ok: boolean }> {
+    return this.post("/knowledge/delete", { session_id: sessionId, key });
   }
 }
 

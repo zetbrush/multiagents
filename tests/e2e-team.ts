@@ -182,15 +182,25 @@ async function main() {
       role: "Software Engineer",
       role_description: "TypeScript engineer. Write clean, typed code. Your task has a cross-dependency with a teammate.",
       initial_task: [
-        "Create a file src/math.ts with a fibonacci function:",
+        "You have TWO deliverables. Both are REQUIRED before you call signal_done.",
+        "",
+        "DELIVERABLE 1 — Write src/math.ts:",
         "  export function fibonacci(n: number): number",
         "  - Returns the nth Fibonacci number (0-indexed: fib(0)=0, fib(1)=1, fib(2)=1, ...)",
         "  - Throws for negative numbers",
         "  - Use iterative approach (not recursive)",
         "",
-        "After writing the file, use set_summary to report what you wrote.",
-        "Then use send_message to tell your teammate (the Codex agent) that src/math.ts is ready for testing.",
-        "Then call signal_done with proof (show the file content).",
+        "DELIVERABLE 2 — Store knowledge about the API you created:",
+        '  Call the store_knowledge tool with key="fibonacci-api", category="decision",',
+        '  and value describing the function signature and behavior.',
+        "  This is REQUIRED — your teammate needs this knowledge entry to exist.",
+        "",
+        "THEN (after both deliverables):",
+        "  1. set_summary — report what you wrote",
+        "  2. send_message — tell the Codex agent that src/math.ts is ready",
+        "  3. signal_done — with proof (show the file content)",
+        "",
+        "DO NOT call signal_done until BOTH deliverables are complete.",
       ].join("\n"),
     };
 
@@ -384,6 +394,7 @@ async function main() {
     let claudeDone = false;
     let codexDone = false;
     let messagesExchanged = false;
+    let knowledgeStored = false;
 
     const success = await waitFor(
       "both agents complete",
@@ -401,6 +412,14 @@ async function main() {
         );
         messagesExchanged = agentMessages.length > 0;
 
+        // Check knowledge store
+        if (!knowledgeStored) {
+          try {
+            const knowledge = await brokerClient.listKnowledge(sessionId);
+            knowledgeStored = knowledge.length > 0;
+          } catch { /* knowledge endpoint may not be available in older broker */ }
+        }
+
         // Check task states
         for (const slot of slots) {
           const taskState = (slot as any).task_state ?? "idle";
@@ -416,6 +435,7 @@ async function main() {
         const statusParts: string[] = [];
         if (srcMathExists) statusParts.push("src/math.ts ✓");
         if (testsExist) statusParts.push("tests/math.test.ts ✓");
+        if (knowledgeStored) statusParts.push("knowledge ✓");
         if (messagesExchanged) statusParts.push(`messages: ${agentMessages.length}`);
         if (claudeDone) statusParts.push("Claude: done");
         if (codexDone) statusParts.push("Codex: done");
@@ -462,6 +482,9 @@ async function main() {
     allPassed = check("Inter-agent messages exchanged", messagesExchanged) && allPassed;
     allPassed = check("Claude-Engineer signaled done", claudeDone) && allPassed;
     allPassed = check("Codex-Tester signaled done", codexDone) && allPassed;
+
+    // Knowledge store milestone (informational — does not fail the test)
+    check("Knowledge entries stored by Claude", knowledgeStored);
 
     // Token usage
     console.log(`\n${C.bold}Token Usage:${C.reset}`);

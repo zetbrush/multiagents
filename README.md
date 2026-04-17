@@ -34,6 +34,7 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 - **File coordination**: exclusive locks + ownership zones prevent conflicts
 - **Task lifecycle**: `idle → working → done_pending_review → addressing_feedback → approved → released`
 - **Review loops**: `signal_done → submit_feedback → fix → re-review → approve`
+- **Shared knowledge**: persistent key-value store for architectural decisions, discovered patterns, and project context — prevents context drift across agents
 - **Persistent sessions**: survive agent restarts, full message history
 - **TUI dashboard**: real-time monitoring with 5 tabs (agents, messages, stats, plan, files)
 - **Auto-restart**: crashed agents respawn with handoff context
@@ -124,6 +125,9 @@ Agents **cannot disconnect** until explicitly released. This ensures the review 
 | `acquire_file` / `release_file` | File lock management |
 | `view_file_locks` | See active locks and ownership zones |
 | `get_history` | Query session message history |
+| `store_knowledge` | Store shared knowledge (decisions, patterns, conventions) |
+| `query_knowledge` | Query knowledge entries by key or category |
+| `remove_knowledge` | Remove outdated knowledge entries |
 
 ## Orchestrator Tools (Claude Desktop)
 
@@ -167,6 +171,20 @@ create_team assigns: Engineer owns src/**, Reviewer owns tests/**
 Engineer: acquire_file("package.json", "adding dependency")
 → Lock acquired, auto-expires in 5 minutes
 ```
+
+## Shared Knowledge Store
+
+Agents share a persistent key-value store to prevent context drift — the #1 failure mode in multi-agent systems.
+
+```
+Engineer:  store_knowledge("auth-pattern", "JWT with refresh rotation", category="decision")
+Designer:  query_knowledge()  →  sees the decision before designing auth UI
+Reviewer:  query_knowledge(category="decision")  →  reviews against team decisions
+```
+
+**Categories**: `decision`, `convention`, `discovery`, `blocker`, `context`
+
+Knowledge persists across agent restarts and is scoped to the session. Agents are instructed to query knowledge on startup and store decisions as they work.
 
 ## Guardrails
 
@@ -215,7 +233,7 @@ multiagents help [command]            Detailed help
 
 ```
 multiagents/
-├── broker.ts               SQLite broker daemon (sessions, slots, locks, messages, guardrails)
+├── broker.ts               SQLite broker daemon (sessions, slots, locks, messages, knowledge, guardrails)
 ├── server.ts               MCP server entry point (dispatches to adapter by --agent-type)
 ├── cli.ts                  CLI entry point
 ├── shared/

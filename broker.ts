@@ -56,6 +56,12 @@ import type {
   FileOwnership,
   AgentType,
   SlotCandidate,
+  KnowledgePutRequest,
+  KnowledgePutResponse,
+  KnowledgeEntry,
+  KnowledgeListRequest,
+  KnowledgeGetRequest,
+  KnowledgeDeleteRequest,
 } from "./shared/types.ts";
 
 // --- Configuration ---
@@ -241,6 +247,21 @@ db.run(`
     assigned_to_slot INTEGER,
     completed_at INTEGER,
     sort_order INTEGER DEFAULT 0
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS knowledge (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'context',
+    created_by_slot INTEGER,
+    created_by_name TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(session_id, key)
   )
 `);
 
@@ -671,6 +692,59 @@ function handleRenamePeer(body: RenamePeerRequest): { ok: boolean } {
   return { ok: true };
 }
 
+// --- Knowledge Store ---
+
+function handleKnowledgePut(body: KnowledgePutRequest): KnowledgePutResponse {
+  if (!body.session_id) throw new Error("session_id required");
+  if (!body.key || !body.key.trim()) throw new Error("key required");
+  if (!body.value || !body.value.trim()) throw new Error("value required");
+
+  const now = Date.now();
+  const category = body.category ?? "context";
+
+  // Check existence first for created/updated distinction, then upsert atomically.
+  // Both are synchronous bun:sqlite calls in the same event loop tick — no race window.
+  const existed = db.query("SELECT 1 FROM knowledge WHERE session_id = ? AND key = ?").get(body.session_id, body.key) !== null;
+
+  db.run(
+    `INSERT INTO knowledge (session_id, key, value, category, created_by_slot, created_by_name, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(session_id, key) DO UPDATE SET
+       value = excluded.value,
+       category = excluded.category,
+       created_by_slot = excluded.created_by_slot,
+       created_by_name = excluded.created_by_name,
+       updated_at = excluded.updated_at`,
+    [body.session_id, body.key, body.value, category, body.slot_id ?? null, body.slot_name ?? null, now, now]
+  );
+
+  const entry = db.query("SELECT * FROM knowledge WHERE session_id = ? AND key = ?").get(body.session_id, body.key) as KnowledgeEntry;
+  return { ok: true, entry, action: existed ? "updated" : "created" };
+}
+
+function handleKnowledgeGet(body: KnowledgeGetRequest): KnowledgeEntry | { error: string } {
+  if (!body.session_id) throw new Error("session_id required");
+  if (!body.key) throw new Error("key required");
+  const entry = db.query("SELECT * FROM knowledge WHERE session_id = ? AND key = ?").get(body.session_id, body.key) as KnowledgeEntry | null;
+  if (!entry) return { error: `No knowledge entry found for key "${body.key}"` };
+  return entry;
+}
+
+function handleKnowledgeList(body: KnowledgeListRequest): KnowledgeEntry[] {
+  if (!body.session_id) return [];
+  if (body.category) {
+    return db.query("SELECT * FROM knowledge WHERE session_id = ? AND category = ? ORDER BY updated_at DESC").all(body.session_id, body.category) as KnowledgeEntry[];
+  }
+  return db.query("SELECT * FROM knowledge WHERE session_id = ? ORDER BY updated_at DESC").all(body.session_id) as KnowledgeEntry[];
+}
+
+function handleKnowledgeDelete(body: KnowledgeDeleteRequest): { ok: boolean } {
+  if (!body.session_id) throw new Error("session_id required");
+  if (!body.key) throw new Error("key required");
+  db.run("DELETE FROM knowledge WHERE session_id = ? AND key = ?", [body.session_id, body.key]);
+  return { ok: true };
+}
+
 // --- Sessions ---
 
 function handleCreateSession(body: CreateSessionRequest): Session {
@@ -721,6 +795,9 @@ function handleDeleteSession(body: { id: string }): { ok: boolean; deleted: { sl
   // Delete guardrail overrides and events
   db.run("DELETE FROM guardrail_overrides WHERE session_id = ?", [body.id]);
   db.run("DELETE FROM guardrail_events WHERE session_id = ?", [body.id]);
+
+  // Delete knowledge entries
+  db.run("DELETE FROM knowledge WHERE session_id = ?", [body.id]);
 
   db.run("DELETE FROM sessions WHERE id = ?", [body.id]);
 
@@ -1461,6 +1538,20 @@ Bun.serve({
           if (!slot) return Response.json({ error: "Slot not found" }, { status: 404 });
           return Response.json(slot);
         }
+
+        // --- Knowledge Store ---
+
+        case "/knowledge/put":
+          return Response.json(handleKnowledgePut(body as KnowledgePutRequest));
+
+        case "/knowledge/get":
+          return Response.json(handleKnowledgeGet(body as KnowledgeGetRequest));
+
+        case "/knowledge/list":
+          return Response.json(handleKnowledgeList(body as KnowledgeListRequest));
+
+        case "/knowledge/delete":
+          return Response.json(handleKnowledgeDelete(body as KnowledgeDeleteRequest));
 
         default:
           return Response.json({ error: "not found" }, { status: 404 });

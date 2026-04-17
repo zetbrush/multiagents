@@ -33,6 +33,7 @@ import type {
   AcquireFileResult,
   FileLock,
   FileOwnership,
+  KnowledgeCategory,
 } from "../shared/types.ts";
 import {
   POLL_INTERVALS,
@@ -314,6 +315,67 @@ const TOOLS = [
         },
       },
       required: ["item_id", "status"],
+    },
+  },
+  // --- Knowledge Store ---
+  {
+    name: "store_knowledge",
+    description:
+      "Store shared knowledge visible to all teammates. Use for architectural decisions, discovered patterns, coding conventions, and project context. Knowledge persists across agent restarts. Query with query_knowledge.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        key: {
+          type: "string" as const,
+          description:
+            "Unique key (e.g., 'auth-pattern', 'api-style'). Use lowercase-kebab-case.",
+        },
+        value: {
+          type: "string" as const,
+          description:
+            "The knowledge content. Be concise — teammates will read this.",
+        },
+        category: {
+          type: "string" as const,
+          enum: ["decision", "convention", "discovery", "blocker", "context"],
+          description: "Category of knowledge. Default: 'context'.",
+        },
+      },
+      required: ["key", "value"],
+    },
+  },
+  {
+    name: "query_knowledge",
+    description:
+      "Query shared knowledge stored by any teammate. Call on startup to understand decisions already made. Call during work to check if a pattern was already discovered.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        category: {
+          type: "string" as const,
+          enum: ["decision", "convention", "discovery", "blocker", "context"],
+          description: "Filter by category. Omit to get all.",
+        },
+        key: {
+          type: "string" as const,
+          description: "Get a specific entry by key. Omit to list all.",
+        },
+      },
+    },
+  },
+  {
+    name: "remove_knowledge",
+    description:
+      "Remove a knowledge entry that is no longer accurate. Only remove entries you created or that are clearly outdated.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        key: {
+          type: "string" as const,
+          description: "Key of the entry to remove.",
+        },
+      },
+      required: ["key"],
     },
   },
 ];
@@ -838,6 +900,12 @@ export abstract class BaseAdapter {
           return this.handleGetPlan();
         case "update_plan":
           return this.handleUpdatePlan(args as { item_id: number; status: string });
+        case "store_knowledge":
+          return this.handleStoreKnowledge(args as { key: string; value: string; category?: string });
+        case "query_knowledge":
+          return this.handleQueryKnowledge(args as { category?: string; key?: string });
+        case "remove_knowledge":
+          return this.handleRemoveKnowledge(args as { key: string });
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
@@ -1344,6 +1412,71 @@ export abstract class BaseAdapter {
     }
   }
 
+  // --- Knowledge Store handlers ---
+
+  protected async handleStoreKnowledge(args: { key: string; value: string; category?: string }) {
+    if (!this.sessionId) {
+      return { content: [{ type: "text" as const, text: "Not in a session — knowledge requires a session." }], isError: true };
+    }
+    try {
+      const validCategories = ["decision", "convention", "discovery", "blocker", "context"];
+      const category = validCategories.includes(args.category ?? "") ? args.category as KnowledgeCategory : "context";
+      const result = await this.broker.putKnowledge({
+        session_id: this.sessionId,
+        key: args.key,
+        value: args.value,
+        category,
+        slot_id: this.mySlot?.id ?? undefined,
+        slot_name: this.mySlot?.display_name ?? undefined,
+      });
+      const verb = result.action === "created" ? "Stored" : "Updated";
+      return { content: [{ type: "text" as const, text: `${verb} knowledge: "${args.key}" [${result.entry.category}]` }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: `Failed to store knowledge: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+    }
+  }
+
+  protected async handleQueryKnowledge(args: { category?: string; key?: string }) {
+    if (!this.sessionId) {
+      return { content: [{ type: "text" as const, text: "Not in a session — knowledge requires a session." }], isError: true };
+    }
+    try {
+      if (args.key) {
+        const entry = await this.broker.getKnowledge(this.sessionId, args.key);
+        if (!entry || "error" in entry) {
+          return { content: [{ type: "text" as const, text: `No knowledge entry found for key "${args.key}".` }] };
+        }
+        const by = entry.created_by_name ? ` (by ${entry.created_by_name})` : "";
+        return { content: [{ type: "text" as const, text: `[${entry.category}] ${entry.key}${by}:\n${entry.value}` }] };
+      }
+
+      const entries = await this.broker.listKnowledge(this.sessionId, args.category as KnowledgeCategory | undefined);
+      if (!entries.length) {
+        return { content: [{ type: "text" as const, text: "No knowledge entries found. You can add entries with store_knowledge." }] };
+      }
+
+      const lines = entries.map((e) => {
+        const by = e.created_by_name ? ` (by ${e.created_by_name})` : "";
+        return `[${e.category}] ${e.key}${by}: ${e.value}`;
+      });
+      return { content: [{ type: "text" as const, text: `Shared knowledge (${entries.length} entries):\n\n${lines.join("\n\n")}` }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: `Failed to query knowledge: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+    }
+  }
+
+  protected async handleRemoveKnowledge(args: { key: string }) {
+    if (!this.sessionId) {
+      return { content: [{ type: "text" as const, text: "Not in a session — knowledge requires a session." }], isError: true };
+    }
+    try {
+      await this.broker.deleteKnowledge(this.sessionId, args.key);
+      return { content: [{ type: "text" as const, text: `Removed knowledge entry "${args.key}".` }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: `Failed to remove knowledge: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+    }
+  }
+
   private async resolveTargetSlot(target: string): Promise<Slot | null> {
     if (!this.sessionId) return null;
     const slots = await this.broker.listSlots(this.sessionId);
@@ -1670,6 +1803,21 @@ YOUR individual work is not done until:
 
 If ANY condition is unmet, continue the feedback loop. Do NOT go silent.
 When ALL conditions are met, set your summary to "All work approved, ready for release."
+
+--- 13. SHARED KNOWLEDGE ---
+
+Your team has a shared knowledge store that persists across agent restarts.
+
+ON START (after check_team_status and get_plan):
+- Call query_knowledge() to read all existing entries. This tells you what decisions have been made, what patterns were discovered, and what constraints exist.
+
+DURING WORK:
+- When you make an architectural decision: store_knowledge(key, value, category="decision")
+- When you discover a codebase pattern: store_knowledge(key, value, category="discovery")
+- When you find a blocker or constraint: store_knowledge(key, value, category="blocker")
+- Keep entries concise (1-3 sentences). Your teammates will read every entry.
+
+IMPORTANT: Query knowledge BEFORE making decisions. A teammate may have already decided on an approach. Contradicting existing decisions without discussion wastes everyone's time.
 `;
   }
 

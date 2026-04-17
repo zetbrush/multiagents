@@ -418,3 +418,51 @@ export interface TeamConfig {
   session_name: string;
   agents: AgentLaunchConfig[];
 }
+
+// --- Knowledge Store ---
+
+/** Category for knowledge entries */
+export type KnowledgeCategory = "decision" | "convention" | "discovery" | "blocker" | "context";
+
+/** A shared knowledge entry visible to all agents in a session */
+export interface KnowledgeEntry {
+  id: number;
+  session_id: string;
+  key: string;
+  value: string;
+  category: KnowledgeCategory;
+  created_by_slot: number | null;
+  created_by_name: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface KnowledgePutRequest {
+  session_id: string;
+  key: string;
+  value: string;
+  category?: KnowledgeCategory;
+  slot_id?: number;
+  slot_name?: string;
+}
+
+export interface KnowledgePutResponse {
+  ok: boolean;
+  entry: KnowledgeEntry;
+  action: "created" | "updated";
+}
+
+export interface KnowledgeListRequest {
+  session_id: string;
+  category?: KnowledgeCategory;
+}
+
+export interface KnowledgeGetRequest {
+  session_id: string;
+  key: string;
+}
+
+export interface KnowledgeDeleteRequest {
+  session_id: string;
+  key: string;
+}
