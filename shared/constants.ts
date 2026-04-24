@@ -16,6 +16,10 @@ export const POLL_INTERVALS: Record<AgentType, number> = {
   claude: 1000, // Claude uses channel push — polling is fallback only
   codex: 300, // Aggressive: piggyback delivery depends on fast buffering
   gemini: 300, // Same as Codex — no push capability
+  kimi: 500, // Kimi K2.6 — push capability to be tested, fallback polling
+  copilot: 300, // Copilot CLI — no push, aggressive polling for piggyback
+  qwen: 300, // Qwen CLI — same as Gemini, no push
+  jinn: 1000, // Jinn bridge — gateway API bridge, moderate polling
   custom: 500, // Reasonable default for unknown agents
 };
 
@@ -46,6 +50,10 @@ export const AGENT_ID_PREFIXES: Record<AgentType, string> = {
   claude: "cl",
   codex: "cx",
   gemini: "gm",
+  kimi: "km",
+  copilot: "cp",
+  qwen: "qw",
+  jinn: "jn",
   custom: "cu",
 };
 
