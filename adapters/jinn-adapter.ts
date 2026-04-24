@@ -125,10 +125,11 @@ acquire_file, release_file, view_file_locks, get_history`;
 
   private resolveEmployee(msg: BufferedMessage): string {
     const mention = msg.text.match(/@([a-zA-Z0-9_-]+)/);
-    if (mention && EMPLOYEES.includes(mention[1])) {
-      return mention[1];
+    const mentioned = mention?.[1];
+    if (mentioned && (EMPLOYEES as readonly string[]).includes(mentioned)) {
+      return mentioned;
     }
-    if (msg.to_id && EMPLOYEES.includes(msg.to_id)) {
+    if (msg.to_id && (EMPLOYEES as readonly string[]).includes(msg.to_id)) {
       return msg.to_id;
     }
     return "gpt-coder";
