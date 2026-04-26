@@ -249,6 +249,42 @@
     .empty { text-align: center; padding: 40px; color: var(--text-dim); }
     .empty-icon { font-size: 32px; margin-bottom: 8px; opacity: 0.5; }
 
+    /* --- Session Picker (command-palette style) --- */
+    .picker-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+      z-index: 100; display: none; align-items: flex-start; justify-content: center;
+      padding-top: 80px;
+    }
+    .picker-overlay.open { display: flex; }
+    .picker {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 10px; width: 480px; max-height: 420px;
+      display: flex; flex-direction: column; box-shadow: 0 16px 48px rgba(0,0,0,0.4);
+      overflow: hidden;
+    }
+    .picker-search {
+      padding: 12px 14px; border: none; border-bottom: 1px solid var(--border);
+      background: transparent; color: var(--text); font-size: 14px;
+      outline: none; width: 100%;
+    }
+    .picker-search::placeholder { color: var(--text-muted); }
+    .picker-list { overflow-y: auto; flex: 1; padding: 4px 0; }
+    .picker-group { padding: 6px 14px 2px; font-size: 11px; font-weight: 600;
+      color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .picker-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 14px; cursor: pointer; font-size: 13px;
+      transition: background 0.1s;
+    }
+    .picker-item:hover, .picker-item.focused { background: var(--surface2); }
+    .picker-item.active { border-left: 3px solid var(--accent); }
+    .picker-item-name { flex: 1; font-weight: 500; }
+    .picker-item-id { font-size: 11px; color: var(--text-muted); font-family: monospace; }
+    .picker-item-time { font-size: 11px; color: var(--text-muted); }
+    .picker-empty { padding: 20px; text-align: center; color: var(--text-dim); font-size: 13px; }
+    .header-session { cursor: pointer; }
+    .header-session:hover { border-color: var(--accent); color: var(--text); }
+
     /* --- Utilities --- */
     .flex { display: flex; }
     .gap-2 { gap: 8px; }
@@ -277,9 +313,10 @@
       <div class="header-left">
         <span class="conn-dot" id="conn-dot"></span>
         <span class="header-title">multiagents</span>
-        <span class="header-session" id="session-name">connecting...</span>
+        <span class="header-session" id="session-name" title="Click to switch sessions">connecting... &#9662;</span>
       </div>
       <div class="header-right">
+        <span id="session-status-badge" class="badge" style="display:none"></span>
         <span id="agent-count"></span>
         <span id="uptime"></span>
         <span id="ws-status" style="font-size:11px"></span>
@@ -304,6 +341,14 @@
       <div id="panel-knowledge" class="hidden"></div>
       <div id="panel-files" class="hidden"></div>
       <div id="panel-stats" class="hidden"></div>
+    </div>
+  </div>
+
+  <!-- Session Picker Overlay -->
+  <div class="picker-overlay" id="picker-overlay">
+    <div class="picker">
+      <input class="picker-search" id="picker-search" type="text" placeholder="Search sessions..." autocomplete="off" />
+      <div class="picker-list" id="picker-list"></div>
     </div>
   </div>
 
@@ -401,21 +446,91 @@
       }
     }
 
+    function isSessionComplete() {
+      if (!state || !state.slots.length) return false;
+      const allDisconnected = state.slots.every(s => s.status === "disconnected");
+      if (!allDisconnected) return false;
+      // Terminal: all agents finished their work (approved/released/done_pending_review with no active reviewers)
+      const allDone = state.slots.every(s =>
+        s.task_state === "approved" || s.task_state === "released" || s.task_state === "done_pending_review"
+      );
+      return allDone;
+    }
+
     function renderHeader() {
       const dot = document.getElementById("conn-dot");
-      dot.className = `conn-dot ${state.brokerAlive ? "alive" : "dead"}`;
+      const complete = isSessionComplete();
+      const sessionStatus = state.session?.status;
+      const isArchived = sessionStatus === "archived";
+      const isPaused = sessionStatus === "paused";
+
+      // Dot color: green=active, yellow=paused, dim=completed/archived, red=broker down
+      if (!state.brokerAlive) {
+        dot.className = "conn-dot dead";
+      } else if (isArchived || complete) {
+        dot.className = "conn-dot";
+        dot.style.background = "var(--text-muted)";
+        dot.style.boxShadow = "none";
+      } else if (isPaused) {
+        dot.className = "conn-dot";
+        dot.style.background = "var(--yellow)";
+        dot.style.boxShadow = "0 0 6px var(--yellow)";
+      } else {
+        dot.className = "conn-dot alive";
+        dot.style.background = "";
+        dot.style.boxShadow = "";
+      }
 
       const name = document.getElementById("session-name");
-      name.textContent = state.session?.name ?? state.sessionId ?? "no session";
+      name.textContent = (state.session?.name ?? state.sessionId ?? "no session") + " \u25BE";
+
+      // Status badge
+      const statusBadge = document.getElementById("session-status-badge");
+      if (isArchived) {
+        statusBadge.textContent = "archived";
+        statusBadge.className = "badge badge-released";
+        statusBadge.style.display = "";
+      } else if (isPaused) {
+        statusBadge.textContent = "paused";
+        statusBadge.className = "badge badge-review";
+        statusBadge.style.display = "";
+      } else if (complete) {
+        statusBadge.textContent = "completed";
+        statusBadge.className = "badge badge-approved";
+        statusBadge.style.display = "";
+      } else {
+        statusBadge.style.display = "none";
+      }
 
       const connected = state.slots.filter(s => s.status === "connected").length;
       document.getElementById("agent-count").textContent = `${connected}/${state.slots.length} agents`;
 
+      // Timer: show final duration for completed/archived sessions, live for active
       if (state.session?.created_at) {
-        const elapsed = Math.round((Date.now() - state.session.created_at) / 1000);
-        const m = Math.floor(elapsed / 60);
+        let endTime = Date.now();
+        if (complete || isArchived) {
+          // Use the latest signal: last_active_at, last message, or last slot disconnect
+          const candidates = [state.session.last_active_at || 0];
+          if (state.messages.length) {
+            const lastMsg = state.messages[state.messages.length - 1];
+            const msgTime = lastMsg.sent_at ? new Date(lastMsg.sent_at).getTime() : 0;
+            if (msgTime > 0) candidates.push(msgTime);
+          }
+          for (const slot of state.slots) {
+            if (slot.last_disconnected) candidates.push(slot.last_disconnected);
+          }
+          endTime = Math.max(...candidates);
+          if (endTime <= state.session.created_at) endTime = state.session.created_at;
+        }
+        const elapsed = Math.round((endTime - state.session.created_at) / 1000);
+        const h = Math.floor(elapsed / 3600);
+        const m = Math.floor((elapsed % 3600) / 60);
         const s = elapsed % 60;
-        document.getElementById("uptime").textContent = m > 0 ? `${m}m ${s}s` : `${s}s`;
+        let timeStr = "";
+        if (h > 0) timeStr = `${h}h ${m}m ${s}s`;
+        else if (m > 0) timeStr = `${m}m ${s}s`;
+        else timeStr = `${s}s`;
+        document.getElementById("uptime").textContent = timeStr;
       }
     }
 
@@ -680,6 +795,128 @@
       const h = Math.floor(m / 60);
       return `${h}h ago`;
     }
+
+    // --- Session Picker ---
+
+    let allSessions = [];
+    let pickerFocusIdx = 0;
+    let pickerFiltered = [];
+
+    function openPicker() {
+      const overlay = document.getElementById("picker-overlay");
+      const search = document.getElementById("picker-search");
+      overlay.classList.add("open");
+      search.value = "";
+      search.focus();
+      fetchSessions();
+    }
+
+    function closePicker() {
+      document.getElementById("picker-overlay").classList.remove("open");
+    }
+
+    async function fetchSessions() {
+      try {
+        const res = await fetch("/api/sessions");
+        allSessions = await res.json();
+        // Sort: active first, then paused, then archived; within each group by most recent
+        allSessions.sort((a, b) => {
+          const order = { active: 0, paused: 1, archived: 2 };
+          const so = (order[a.status] ?? 3) - (order[b.status] ?? 3);
+          if (so !== 0) return so;
+          return (b.last_active_at ?? b.created_at ?? 0) - (a.last_active_at ?? a.created_at ?? 0);
+        });
+        renderPicker();
+      } catch { allSessions = []; renderPicker(); }
+    }
+
+    function renderPicker() {
+      const search = document.getElementById("picker-search").value.toLowerCase();
+      pickerFiltered = allSessions.filter(s =>
+        !search || s.name?.toLowerCase().includes(search) || s.id.toLowerCase().includes(search)
+      );
+      pickerFocusIdx = Math.min(pickerFocusIdx, Math.max(0, pickerFiltered.length - 1));
+
+      const list = document.getElementById("picker-list");
+      if (!pickerFiltered.length) {
+        list.innerHTML = '<div class="picker-empty">No sessions found</div>';
+        return;
+      }
+
+      let html = "";
+      let lastStatus = "";
+      pickerFiltered.forEach((s, i) => {
+        if (s.status !== lastStatus) {
+          lastStatus = s.status;
+          const label = s.status === "active" ? "Active" : s.status === "paused" ? "Paused" : "Archived";
+          html += `<div class="picker-group">${label}</div>`;
+        }
+        const isCurrent = state?.sessionId === s.id;
+        const focused = i === pickerFocusIdx ? " focused" : "";
+        const active = isCurrent ? " active" : "";
+        const age = timeSince(s.last_active_at ?? s.created_at);
+        const statusDot = s.status === "active"
+          ? '<span style="color:var(--green)">&#9679;</span>'
+          : s.status === "paused"
+            ? '<span style="color:var(--yellow)">&#9679;</span>'
+            : '<span style="color:var(--text-muted)">&#9679;</span>';
+        html += `<div class="picker-item${focused}${active}" data-idx="${i}" data-id="${esc(s.id)}">
+          ${statusDot}
+          <span class="picker-item-name">${esc(s.name || s.id)}</span>
+          <span class="picker-item-id">${esc(s.id.length > 24 ? s.id.slice(0, 24) + "..." : s.id)}</span>
+          <span class="picker-item-time">${age}</span>
+        </div>`;
+      });
+      list.innerHTML = html;
+
+      // Scroll focused into view
+      const focusedEl = list.querySelector(".focused");
+      if (focusedEl) focusedEl.scrollIntoView({ block: "nearest" });
+    }
+
+    async function selectSession(id) {
+      closePicker();
+      try {
+        await fetch("/api/session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: id }),
+        });
+      } catch {}
+    }
+
+    // Click session name to open picker
+    document.getElementById("session-name").addEventListener("click", openPicker);
+
+    // Close on overlay click (not picker body)
+    document.getElementById("picker-overlay").addEventListener("click", (e) => {
+      if (e.target.id === "picker-overlay") closePicker();
+    });
+
+    // Search input
+    document.getElementById("picker-search").addEventListener("input", () => {
+      pickerFocusIdx = 0;
+      renderPicker();
+    });
+
+    // Click on picker item
+    document.getElementById("picker-list").addEventListener("click", (e) => {
+      const item = e.target.closest(".picker-item");
+      if (item) selectSession(item.dataset.id);
+    });
+
+    // Keyboard navigation in picker
+    document.getElementById("picker-search").addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { closePicker(); e.preventDefault(); return; }
+      if (e.key === "ArrowDown") { pickerFocusIdx = Math.min(pickerFocusIdx + 1, pickerFiltered.length - 1); renderPicker(); e.preventDefault(); return; }
+      if (e.key === "ArrowUp") { pickerFocusIdx = Math.max(pickerFocusIdx - 1, 0); renderPicker(); e.preventDefault(); return; }
+      if (e.key === "Enter" && pickerFiltered[pickerFocusIdx]) { selectSession(pickerFiltered[pickerFocusIdx].id); e.preventDefault(); return; }
+    });
+
+    // Global Escape to close picker
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closePicker();
+    });
 
     // --- Boot ---
     connectWs();

@@ -99,6 +99,17 @@ async function cleanup(sessionId: string, procs: Map<number, Subprocess>, driver
   for (const [slotId, proc] of procs) {
     try { proc.kill(); } catch { /* ok */ }
   }
+
+  // Kill orphaned MCP server child processes (they survive parent CLI kill)
+  try {
+    const slots = await brokerClient.listSlots(sessionId);
+    for (const slot of slots) {
+      if (slot.peer_id) {
+        try { await brokerClient.unregister(slot.peer_id); } catch { /* ok */ }
+      }
+    }
+  } catch { /* broker may be down */ }
+
   clearAllTracking();
 
   // Clean up temp project directory
@@ -225,9 +236,8 @@ async function main() {
         "  test('negative input throws')",
         "",
         "STEP 4: Run `bun test tests/math.test.ts` and verify all pass.",
-        "STEP 5: Call signal_done with the test output as proof.",
-        "",
-        "IMPORTANT: Focus on writing tests. Do not spend time on team communication — just write the tests and signal done.",
+        "STEP 5: If all tests pass, call approve(target=\"Claude-Engineer\") to approve the implementation.",
+        "STEP 6: Call signal_done with the test output as proof.",
       ].join("\n"),
     };
 
@@ -423,10 +433,10 @@ async function main() {
         // Check task states
         for (const slot of slots) {
           const taskState = (slot as any).task_state ?? "idle";
-          if (slot.display_name === "Claude-Engineer" && (taskState === "done_pending_review" || taskState === "approved" || taskState === "released")) {
+          if (slot.display_name === "Claude-Engineer" && (taskState === "approved" || taskState === "released")) {
             claudeDone = true;
           }
-          if (slot.display_name === "Codex-Tester" && (taskState === "done_pending_review" || taskState === "approved" || taskState === "released")) {
+          if (slot.display_name === "Codex-Tester" && (taskState === "approved" || taskState === "released")) {
             codexDone = true;
           }
         }

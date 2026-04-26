@@ -322,6 +322,18 @@ function cleanStalePeers() {
   // Clean expired file locks
   db.run("DELETE FROM file_locks WHERE expires_at < ?", [now]);
 
+  // Fix dangling slot references: slots that point to a peer_id no longer in the peers table.
+  // This happens when a process dies between cleanup cycles or when kill -9 leaves zombies.
+  const danglingSlots = db.query(
+    "SELECT s.id, s.peer_id FROM slots s WHERE s.peer_id IS NOT NULL AND s.peer_id NOT IN (SELECT id FROM peers)"
+  ).all() as { id: number; peer_id: string }[];
+  for (const slot of danglingSlots) {
+    db.run(
+      "UPDATE slots SET status = 'disconnected', peer_id = NULL, last_disconnected = ? WHERE id = ?",
+      [now, slot.id]
+    );
+  }
+
   // Clean orphan peers: alive processes with no session that have been idle for >5 min.
   // These are typically multiagents-peer adapters spawned by codex mcp-server
   // that outlived their parent process.

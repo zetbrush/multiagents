@@ -132,7 +132,9 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
 
 const wsClients = new Set<any>();
 let currentState: DashboardState | null = null;
-let pollTimer: ReturnType<typeof setInterval> | null = null;
+let pollTimer: ReturnType<typeof setTimeout> | null = null;
+let pollGeneration = 0; // Incremented on session switch to kill stale poll loops
+let userPinnedSession = false; // True when user explicitly selected a session — disables auto-switch
 
 function broadcastState(state: DashboardState) {
   const json = JSON.stringify({ type: "state", data: state });
@@ -145,22 +147,65 @@ function broadcastState(state: DashboardState) {
   }
 }
 
-async function startPolling(sessionId: string | null) {
-  if (pollTimer) clearInterval(pollTimer);
+/** Check if a session is effectively complete (all agents done + disconnected) */
+function isSessionComplete(state: DashboardState): boolean {
+  if (!state.slots.length) return false;
+  const allDisconnected = state.slots.every(s => s.status === "disconnected");
+  if (!allDisconnected) return false;
+  const allDone = state.slots.every(s =>
+    s.task_state === "approved" || s.task_state === "released" || s.task_state === "done_pending_review"
+  );
+  return allDone;
+}
+
+async function startPolling() {
+  // Cancel any existing poll loop
+  if (pollTimer) clearTimeout(pollTimer);
+  const gen = ++pollGeneration;
 
   // Initial fetch
   currentState = await fetchState(sessionId);
   broadcastState(currentState);
 
-  // Poll at DASHBOARD_REFRESH interval (500ms for active, slower for paused/archived)
-  pollTimer = setInterval(async () => {
-    const refreshMs = currentState?.session?.status === "archived" ? 5000
-      : currentState?.session?.status === "paused" ? 2000
-      : DASHBOARD_REFRESH;
+  // Recursive tick — reads the global `sessionId` each cycle
+  async function tick() {
+    // If a new startPolling() was called, this stale loop must die
+    if (gen !== pollGeneration) return;
+
+    const complete = currentState ? isSessionComplete(currentState) : false;
+    const status = currentState?.session?.status;
+
+    // For completed or archived sessions: auto-switch to newer active session (unless user pinned)
+    if (!userPinnedSession && (complete || status === "archived") && sessionId) {
+      try {
+        const sessions = await broker.listSessions();
+        const newer = sessions.find((s: any) =>
+          s.status === "active" && s.id !== sessionId &&
+          (s.created_at ?? 0) > (currentState?.session?.created_at ?? 0)
+        );
+        if (newer) {
+          sessionId = newer.id;
+          console.error(`[web-dashboard] Auto-switched to new session: ${newer.id}`);
+        }
+      } catch { /* broker down */ }
+    }
 
     currentState = await fetchState(sessionId);
     broadcastState(currentState);
-  }, DASHBOARD_REFRESH);
+
+    // Stop if superseded
+    if (gen !== pollGeneration) return;
+
+    // Schedule next tick: slow for completed/archived, fast for active
+    const nextComplete = isSessionComplete(currentState);
+    const nextStatus = currentState?.session?.status;
+    const delay = (nextComplete || nextStatus === "archived") ? 3000
+      : nextStatus === "paused" ? 2000
+      : DASHBOARD_REFRESH;
+    pollTimer = setTimeout(tick, delay);
+  }
+
+  pollTimer = setTimeout(tick, DASHBOARD_REFRESH);
 }
 
 // --- Resolve session and start ---
@@ -194,7 +239,8 @@ const server = Bun.serve({
       const body = await req.json() as { session_id?: string };
       if (body.session_id) {
         sessionId = body.session_id;
-        await startPolling(sessionId);
+        userPinnedSession = true; // User explicitly chose — don't auto-switch away
+        await startPolling();
         return Response.json({ ok: true, session_id: sessionId });
       }
       return Response.json({ error: "session_id required" }, { status: 400 });
@@ -274,7 +320,7 @@ const server = Bun.serve({
 });
 
 // Start polling
-await startPolling(sessionId);
+await startPolling();
 
 console.error(`[web-dashboard] Listening on http://127.0.0.1:${WEB_DASHBOARD_PORT}`);
 console.error(`[web-dashboard] Session: ${sessionId ?? "(none — waiting for session)"}`);
