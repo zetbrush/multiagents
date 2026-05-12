@@ -35,7 +35,8 @@ import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget } from "./session-control.ts";
 
 const LOG_PREFIX = "orchestrator";
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
+const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
+const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
 
 // Track active processes per session
 const activeProcesses: Map<string, Map<number, Subprocess>> = new Map();
