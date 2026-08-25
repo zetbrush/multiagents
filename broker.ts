@@ -413,7 +413,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   // Explicit slot targeting — when orchestrator passes a specific slot_id
   // Resolve session_id: explicit > inferred from the slot's own record.
-  // This fallback covers sandboxed agents (Codex, Gemini) that may lose
+  // This fallback covers sandboxed agents (Codex, AGY) that may lose
   // MULTIAGENTS_SESSION env var but still have MULTIAGENTS_SLOT.
   let effectiveSessionId = body.session_id;
   if (body.slot_id && !effectiveSessionId) {

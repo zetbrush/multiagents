@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * GeminiAdapter — MCP adapter for Gemini CLI instances.
+ * AgyAdapter — MCP adapter for Antigravity CLI instances.
  *
  * Nearly identical to CodexAdapter: no push capability. Messages are
  * delivered via file-based inbox + piggybacked on tool responses.
@@ -11,13 +11,13 @@ import type { BufferedMessage } from "../shared/types.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export class GeminiAdapter extends BaseAdapter {
+export class AgyAdapter extends BaseAdapter {
   private messageBuffer: BufferedMessage[] = [];
   private inboxPath: string | null = null;
   private hasRunStartup = false;
 
   constructor() {
-    super("gemini");
+    super("agy");
   }
 
   getCapabilities(): Record<string, unknown> {
@@ -77,7 +77,7 @@ QUALITY: Production-grade code. Plan before coding. Verify before signaling done
 
   /**
    * Deliver a message by both buffering (for piggyback) and writing to
-   * the file-based inbox so Gemini sees it via native file reads.
+   * the file-based inbox so AGY sees it via native file reads.
    */
   async deliverMessage(msg: BufferedMessage): Promise<void> {
     this.messageBuffer.push(msg);

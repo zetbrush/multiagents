@@ -3,7 +3,7 @@
  * BaseAdapter — Abstract base class for all agent MCP adapters.
  *
  * Extracts ALL shared logic from the original server.ts into a reusable
- * base that Claude, Codex, Gemini, and custom adapters extend.
+ * base that Claude, Codex, AGY, and custom adapters extend.
  *
  * Subclasses override:
  *   - deliverMessage(msg)  — how inbound messages reach the agent
@@ -78,7 +78,7 @@ const TOOLS = [
         },
         agent_type: {
           type: "string" as const,
-          enum: ["claude", "codex", "gemini", "custom", "all"],
+          enum: ["claude", "codex", "agy", "custom", "all"],
           description: "Optional filter by agent type. Defaults to all.",
         },
       },
@@ -480,7 +480,7 @@ export abstract class BaseAdapter {
     // Merge resources capability — base-adapter registers a ListResources
     // handler (empty list) for all adapters, so the capability MUST be
     // declared or the MCP SDK rejects resources/list requests. Codex and
-    // Gemini CLIs send resources/list during init even if not advertised.
+    // AGY may send resources/list during init even if not advertised.
     const subclassCapabilities = this.getCapabilities();
     const mergedCapabilities = { resources: {}, ...subclassCapabilities };
     this.mcp = new Server(

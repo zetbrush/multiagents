@@ -7,6 +7,7 @@ import { BrokerClient } from "../shared/broker-client.ts";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import { readOrchestratorHost } from "../shared/orchestrator-host.ts";
 
 const BROKER_PORT = parseInt(process.env.MULTIAGENTS_PORT ?? String(DEFAULT_BROKER_PORT), 10);
 const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
@@ -25,11 +26,10 @@ const KNOWN_PATHS: Record<string, string[]> = {
     path.join(os.homedir(), ".npm-global", "bin", "codex"),
     "/opt/homebrew/bin/codex",
   ],
-  gemini: [
-    path.join(os.homedir(), ".local", "bin", "gemini"),
-    "/usr/local/bin/gemini",
-    "/opt/homebrew/bin/gemini",
-    path.join(os.homedir(), ".npm-global", "bin", "gemini"),
+  agy: [
+    path.join(os.homedir(), ".local", "bin", "agy"),
+    "/usr/local/bin/agy",
+    "/opt/homebrew/bin/agy",
   ],
 };
 
@@ -73,7 +73,7 @@ export async function setup(): Promise<void> {
   const agents = [
     { name: "Claude Code", cmd: "claude", info: detectAgent("claude") },
     { name: "Codex CLI", cmd: "codex", info: detectAgent("codex") },
-    { name: "Gemini CLI", cmd: "gemini", info: detectAgent("gemini") },
+    { name: "Antigravity CLI", cmd: "agy", info: detectAgent("agy") },
   ];
 
   for (const a of agents) {
@@ -84,7 +84,7 @@ export async function setup(): Promise<void> {
 
   const available = agents.filter(a => a.info.available);
   if (available.length === 0) {
-    console.error("\n\x1b[31mNo supported agents found. Install at least one: claude, codex, or gemini.\x1b[0m");
+    console.error("\n\x1b[31mNo supported agents found. Install at least one: claude, codex, or agy.\x1b[0m");
     process.exit(1);
   }
 
@@ -92,6 +92,7 @@ export async function setup(): Promise<void> {
   console.log("\n\x1b[1mConfiguring MCP servers...\x1b[0m\n");
   const { installMcpSilent } = await import("./install-mcp.ts");
   await installMcpSilent();
+  const orchestratorHost = readOrchestratorHost() ?? "claude";
 
   // 3. Start broker
   console.log("\n\x1b[1mStarting broker...\x1b[0m");
@@ -117,8 +118,8 @@ export async function setup(): Promise<void> {
 \x1b[1m\x1b[32mSetup complete!\x1b[0m
 
 \x1b[1mUsage:\x1b[0m
-  1. Restart Claude Code to load the multiagents tools.
-  2. In Claude Code, ask it to use the multiagents tools.
+  1. Restart ${orchestratorHost} to load the multiagents tools.
+  2. In ${orchestratorHost}, ask it to use the multiagents orchestrator tools.
   3. Or use the orchestrator to create a team:
      \x1b[90mmultiagents create-team --project /path/to/project\x1b[0m
 

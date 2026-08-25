@@ -15,7 +15,7 @@ export const BROKER_HOSTNAME = "127.0.0.1";
 export const POLL_INTERVALS: Record<AgentType, number> = {
   claude: 1000, // Claude uses channel push — polling is fallback only
   codex: 300, // Aggressive: piggyback delivery depends on fast buffering
-  gemini: 300, // Same as Codex — no push capability
+  agy: 300, // Same as Codex — no push capability
   custom: 500, // Reasonable default for unknown agents
 };
 
@@ -45,7 +45,7 @@ export const RECONNECT_RECAP_LIMIT = 20; // messages to replay on reconnect
 export const AGENT_ID_PREFIXES: Record<AgentType, string> = {
   claude: "cl",
   codex: "cx",
-  gemini: "gm",
+  agy: "ag",
   custom: "cu",
 };
 

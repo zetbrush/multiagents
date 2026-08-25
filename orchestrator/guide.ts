@@ -1,7 +1,7 @@
 // ============================================================================
 // multiagents — Orchestrator Guide & Documentation
 // ============================================================================
-// Comprehensive documentation for the orchestrator user (Claude Desktop).
+// Comprehensive documentation for the selected orchestrator host.
 // Exposed via the get_guide MCP tool with topic-based sections.
 // ============================================================================
 
@@ -32,11 +32,11 @@ const GUIDES: Record<GuideTopic, string> = {
   overview: `# Multiagents — Overview
 
 ## What It Is
-Multiagents is a multi-agent orchestration platform that lets you manage teams of AI coding agents (Claude Code, Codex CLI, Gemini CLI) working together on the same codebase. Agents discover each other, communicate in real-time, coordinate file edits, and follow structured feedback loops.
+Multiagents is a multi-agent orchestration platform that lets you manage teams of AI coding agents (Claude Code, Codex CLI, Antigravity CLI) working together on the same codebase. Agents discover each other, communicate in real-time, coordinate file edits, and follow structured feedback loops.
 
 ## Architecture
 \`\`\`
-You (Claude Desktop / Orchestrator)
+You (Claude, Codex, or AGY / Orchestrator)
   |
   v
 Orchestrator MCP Server (multiagents-orch)
@@ -128,7 +128,7 @@ When get_team_status shows "ALL AGENTS APPROVED":
 ## Step 5: Resume Later (optional)
 If you need to pause and come back:
 1. Call control_session with action "pause_all"
-2. Close Claude Desktop
+2. Close the current orchestrator host
 3. Later: call list_sessions to find your session
 4. Call resume_session to restart all agents with their context`,
 
@@ -298,7 +298,7 @@ You (the orchestrator) should:
                [PAUSED] [ARCHIVED]
                    |
                    v
-              (close Claude Desktop)
+          (close orchestrator host)
                    |
                    v
               list_sessions → resume_session
@@ -333,7 +333,7 @@ Everything is stored in SQLite via the broker:
 - Plan items (status, assignments)
 - File locks and ownership
 
-When you close Claude Desktop and come back:
+When you close the orchestrator host and come back:
 1. Call list_sessions → shows all sessions with status and agent counts
 2. Call resume_session(session_id) → respawns agents with:
    - Their original role and description

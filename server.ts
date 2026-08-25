@@ -7,7 +7,7 @@
  * Usage:
  *   bun server.ts                    # defaults to claude
  *   bun server.ts --agent-type codex
- *   bun server.ts --agent-type gemini
+ *   bun server.ts --agent-type agy
  */
 
 import type { AgentType } from "./shared/types.ts";
@@ -30,9 +30,9 @@ async function main() {
       await new CodexAdapter().start();
       break;
     }
-    case "gemini": {
-      const { GeminiAdapter } = await import("./adapters/gemini-adapter.ts");
-      await new GeminiAdapter().start();
+    case "agy": {
+      const { AgyAdapter } = await import("./adapters/agy-adapter.ts");
+      await new AgyAdapter().start();
       break;
     }
     default: {

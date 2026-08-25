@@ -2,7 +2,7 @@
 // ============================================================================
 // multiagents — Orchestrator MCP Server
 // ============================================================================
-// MCP server for Claude Desktop that provides tools to manage a team of
+// MCP server for Claude, Codex, or AGY that provides tools to manage a team of
 // headless AI agents. Exposes create_team, status, broadcast, control, etc.
 // ============================================================================
 
@@ -345,7 +345,7 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
             items: {
               type: "object",
               properties: {
-                agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
+                agent_type: { type: "string", enum: ["claude", "codex", "agy"] },
                 name: { type: "string", description: "Display name for the agent, e.g., 'Alice' or 'Backend Engineer'" },
                 role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity: 'Android Software Engineer', 'Web QA Engineer'." },
                 role_description: { type: "string", description: "Detailed role brief including platform (web/android/ios/cli/api), framework/stack, specific expertise, constraints, and acceptance criteria. The richer this is, the better the agent performs." },
@@ -415,7 +415,7 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
         type: "object" as const,
         properties: {
           session_id: { type: "string" },
-          agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
+          agent_type: { type: "string", enum: ["claude", "codex", "agy"] },
           name: { type: "string", description: "Display name for the agent" },
           role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity." },
           role_description: { type: "string", description: "Detailed role brief including platform, framework, expertise, constraints. The richer this is, the better the agent performs." },
@@ -602,14 +602,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         if (unavailable.length > 0) {
           // Check what IS available on this machine
-          const allTypes: Array<"claude" | "codex" | "gemini"> = ["claude", "codex", "gemini"];
+          const allTypes: Array<"claude" | "codex" | "agy"> = ["claude", "codex", "agy"];
           for (const t of allTypes) {
             const d = await detectAgent(t);
             if (d.available) availableTypes.add(t);
           }
           const availableList = availableTypes.size > 0
             ? `Available agent CLIs on this machine: ${[...availableTypes].join(", ")}.`
-            : "No agent CLIs found. Install claude, codex, or gemini CLI first.";
+            : "No agent CLIs found. Install claude, codex, or agy first.";
           const failedList = unavailable.map(u => `${u.name} (${u.type})`).join(", ");
           return {
             content: [{
@@ -663,7 +663,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Launch each agent with staggered delays to prevent race conditions.
         // Codex agents share a global skills directory (~/.codex/system-skills/)
         // that gets corrupted when multiple instances initialize simultaneously.
-        // Gemini via npx can also race on package caching.
+        // Antigravity can also race during concurrent native CLI startup.
         const launchedAgents: { name: string; slot_id: number; pid: number }[] = [];
         const launchedTypes = new Set<string>();
         for (const agentCfg of agents) {
@@ -698,7 +698,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               });
             });
           } else {
-            // Start process monitoring for non-Codex agents (Claude, Gemini)
+            // Start process monitoring for non-Codex agents (Claude, AGY)
             monitorProcess(result.process, result.slotId, sessionId, brokerClient, handleEvent);
           }
 
@@ -871,7 +871,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "add_agent": {
         const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership } = args as {
           session_id: string;
-          agent_type: "claude" | "codex" | "gemini";
+          agent_type: "claude" | "codex" | "agy";
           name: string;
           role: string;
           role_description: string;
@@ -1892,7 +1892,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
   // --- Smart non-driver agent respawn ---
   //
-  // Problem: Gemini (and disconnected Claude) agents have no push/steer mechanism.
+  // Problem: AGY (and disconnected Claude) agents have no push/steer mechanism.
   // After signal_done or when idle, the LLM stops calling MCP tools and messages
   // pile up undelivered. Teammates are blocked waiting.
   //
@@ -1904,7 +1904,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
   //   - Claude with channel push (connected) → skip, push handles delivery
   //   - Codex with driver → skip, forwarding loop handles delivery
   //
-  // This means: teammate sends review_request → 15s for Gemini to self-poll →
+  // This means: teammate sends review_request → 15s for AGY to self-poll →
   // if not picked up, orchestrator kills idle process and spawns a fresh one
   // that gets recap + pending messages on startup.
   //

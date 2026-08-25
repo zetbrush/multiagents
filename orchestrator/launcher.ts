@@ -23,7 +23,7 @@ const CLI_PATH = path.resolve(import.meta.dir, "..", "cli.ts");
  * Build a PATH that includes common CLI installation directories.
  * GUI apps (like Claude Desktop) don't load shell profiles, so their PATH
  * is minimal (just /usr/bin:/bin:/usr/sbin:/sbin). This ensures `which`
- * and spawned child processes can find claude, codex, gemini, bun, etc.
+ * and spawned child processes can find claude, codex, agy, bun, etc.
  */
 function enrichedPath(): string {
   const home = process.env.HOME ?? "";
@@ -71,13 +71,13 @@ interface LaunchResult {
 const AGENT_COMMANDS: Record<AgentType, string> = {
   claude: "claude",
   codex: "codex",
-  gemini: "npx",
+  agy: "agy",
   custom: "",
 };
 
 /**
  * Detect whether an agent CLI is installed and available on PATH.
- * Handles both direct binaries (claude, codex) and npx-based tools (gemini).
+ * Handles direct agent binaries (claude, codex, and agy).
  */
 export async function detectAgent(type: AgentType): Promise<AgentDetection> {
   const cmd = AGENT_COMMANDS[type];
@@ -86,21 +86,6 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
   }
 
   const spawnEnv = { ...process.env, PATH: ENRICHED_PATH };
-
-  // Gemini is invoked via npx — check if the package is available
-  if (type === "gemini") {
-    try {
-      const proc = Bun.spawnSync(["npx", "-y", "@google/gemini-cli", "--version"], {
-        timeout: 15_000,
-        env: spawnEnv,
-      });
-      const out = new TextDecoder().decode(proc.stdout).trim();
-      if (proc.exitCode === 0 && out) {
-        return { available: true, version: out.split("\n")[0], path: "npx" };
-      }
-    } catch { /* ok */ }
-    return { available: false };
-  }
 
   const which = Bun.spawnSync(["which", cmd], { env: spawnEnv });
   const binPath = new TextDecoder().decode(which.stdout).trim();
@@ -193,31 +178,33 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string): P
   const codexEntry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\n`;
   await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + codexEntry);
 
-  // --- Gemini: ~/.gemini/settings.json ---
-  const geminiSettingsPath = path.join(process.env.HOME ?? "", ".gemini", "settings.json");
+  // --- Antigravity CLI: ~/.gemini/config/mcp_config.json ---
+  const agyConfigDir = path.join(process.env.HOME ?? "", ".gemini", "config");
+  const agyMcpConfigPath = path.join(agyConfigDir, "mcp_config.json");
   try {
-    let geminiConfig: Record<string, unknown> = {};
+    if (!fs.existsSync(agyConfigDir)) fs.mkdirSync(agyConfigDir, { recursive: true });
+    let agyConfig: Record<string, unknown> = {};
     try {
-      const existing = await Bun.file(geminiSettingsPath).text();
-      geminiConfig = JSON.parse(existing);
-    } catch { /* ok */ }
+      const existing = await Bun.file(agyMcpConfigPath).text();
+      agyConfig = JSON.parse(existing);
+    } catch (error) {
+      // A missing file is expected. Preserve malformed user configuration
+      // instead of replacing it with a new object.
+      if (fs.existsSync(agyMcpConfigPath)) throw error;
+    }
 
-    const geminiMcpServers = (geminiConfig.mcpServers as Record<string, unknown>) ?? {};
+    const agyMcpServers = (agyConfig.mcpServers as Record<string, unknown>) ?? {};
     // Remove stale "multiagents" entries from older versions
-    if (geminiMcpServers["multiagents"] && !geminiMcpServers["multiagents-peer"]) {
-      delete geminiMcpServers["multiagents"];
-    }
-    if (!geminiMcpServers["multiagents-peer"]) {
-      const geminiMcp = mcpServerCommand("gemini");
-      geminiMcpServers["multiagents-peer"] = {
-        command: geminiMcp.command,
-        args: geminiMcp.args,
-      };
-      geminiConfig.mcpServers = geminiMcpServers;
-      await Bun.write(geminiSettingsPath, JSON.stringify(geminiConfig, null, 2));
-    }
+    delete agyMcpServers["multiagents"];
+    const agyMcp = mcpServerCommand("agy");
+    agyMcpServers["multiagents-peer"] = {
+      command: agyMcp.command,
+      args: agyMcp.args,
+    };
+    agyConfig.mcpServers = agyMcpServers;
+    await Bun.write(agyMcpConfigPath, JSON.stringify(agyConfig, null, 2));
   } catch {
-    // Gemini config is optional — skip if ~/.gemini doesn't exist
+    // Antigravity config is optional; launch can still continue without MCP.
   }
 
   // --- Session file: .multiagents/session.json ---
@@ -309,8 +296,8 @@ export async function launchAgent(
   // because agents read the -p flag first and may start working before MCP tools load.
   // Without explicit enforcement here, agents execute their task using native tools only
   // and never call check_messages, set_summary, or signal_done.
-  // Codex/Gemini agents get file-based inbox instructions since they lack push notifications
-  const isNonPushAgent = config.agent_type === "codex" || config.agent_type === "gemini";
+  // Codex/AGY agents get file-based inbox instructions since they lack push notifications
+  const isNonPushAgent = config.agent_type === "codex" || config.agent_type === "agy";
 
   const taskPrompt = [
     `You are "${config.name}", role: ${config.role}.`,
@@ -373,7 +360,7 @@ export async function launchAgent(
   };
   delete spawnEnv.CLAUDECODE;
 
-  // Update session file with slot info so sandboxed agents (Codex, Gemini)
+  // Update session file with slot info so sandboxed agents (Codex, AGY)
   // can recover slot_id even if MULTIAGENTS_* env vars are stripped.
   // The adapter reads this as a fallback when env vars are absent.
   const sessionDir = path.join(projectDir, ".multiagents");
@@ -505,7 +492,7 @@ export async function launchAgent(
     };
   }
 
-  // --- Claude / Gemini / Custom: traditional process spawn ---
+  // --- Claude / AGY / Custom: traditional process spawn ---
   const args = buildCliArgs(config.agent_type, taskPrompt, spawnEnv);
   const cmd = AGENT_COMMANDS[config.agent_type];
 
@@ -569,7 +556,7 @@ export async function relaunchIntoSlot(
 
   // Build the task prompt with mandatory MCP enforcement
   const agentName = slot.display_name ?? `Agent #${slot.id}`;
-  const isNonPush = slot.agent_type === "codex" || slot.agent_type === "gemini";
+  const isNonPush = slot.agent_type === "codex" || slot.agent_type === "agy";
   const taskPrompt = [
     `You are "${agentName}", role: ${slot.role ?? "general"}.`,
     enrichedDescription,
@@ -679,17 +666,14 @@ export function buildCliArgs(agentType: AgentType, task: string, env?: Record<st
         task,
       ];
     }
-    case "gemini": {
-      // Gemini CLI is invoked via npx. MCP is configured at user level
-      // (~/.gemini/settings.json) by ensureMcpConfigs. Use --approval-mode
-      // yolo for fully autonomous operation, --sandbox for safety, and
-      // --output-format stream-json for structured output parsing.
+    case "agy": {
+      // Antigravity CLI is a native binary. MCP is configured globally in
+      // ~/.gemini/config/mcp_config.json by ensureMcpConfigs. Headless mode
+      // uses the same stream-json output contract as the previous integration.
       return [
-        "-y", "@google/gemini-cli",
         "--sandbox",
-        "--approval-mode", "yolo",
+        "--dangerously-skip-permissions",
         "--output-format", "stream-json",
-        "--allowed-mcp-server-names", "multiagents-peer",
         "-p", task,
       ];
     }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Pre-uninstall script: removes MCP server configs that were added by postinstall.
- * Cleans up Claude Code, Codex CLI, and Gemini CLI configurations.
+ * Cleans up Claude Code, Codex CLI, and Antigravity CLI configurations.
  * If it fails, prints a message — never breaks the uninstall.
  */
 
@@ -81,7 +81,8 @@ function removeCodex(): void {
   const codexPath = findAgentCli("codex");
   if (codexPath) {
     Bun.spawnSync([codexPath, "mcp", "remove", "multiagents"], { stderr: "ignore", stdout: "ignore" });
-    console.log("[multiagents] Removed MCP server from Codex CLI (via codex mcp remove)");
+    Bun.spawnSync([codexPath, "mcp", "remove", "multiagents-orch"], { stderr: "ignore", stdout: "ignore" });
+    console.log("[multiagents] Removed MCP servers from Codex CLI (via codex mcp remove)");
   }
 
   // Always also remove the persisted config block for idempotent cleanup.
@@ -90,7 +91,9 @@ function removeCodex(): void {
     try {
       const content = fs.readFileSync(configPath, "utf-8");
       // Remove only the multiagents section, not TOML arrays inside it.
-      const updated = content.replace(/(^|\n)\[mcp_servers\.multiagents\]\n[\s\S]*?(?=\n\[|$)/, "$1");
+      const updated = content
+        .replace(/(^|\n)\[mcp_servers\.multiagents\]\n[\s\S]*?(?=\n\[|$)/, "$1")
+        .replace(/(^|\n)\[mcp_servers\.multiagents-orch\]\n[\s\S]*?(?=\n\[|$)/, "$1");
       if (updated !== content) {
         fs.writeFileSync(configPath, updated.trim() + "\n");
         console.log("[multiagents] Removed MCP server from ~/.codex/config.toml");
@@ -99,23 +102,18 @@ function removeCodex(): void {
   }
 }
 
-// --- Gemini CLI ---
-function removeGemini(): void {
-  const geminiPath = findAgentCli("gemini");
-  if (geminiPath) {
-    Bun.spawnSync([geminiPath, "mcp", "remove", "-s", "user", "multiagents"], { stderr: "ignore", stdout: "ignore" });
-    console.log("[multiagents] Removed MCP server from Gemini CLI (via gemini mcp remove -s user)");
-  }
-
-  const configPath = path.join(HOME, ".gemini", "settings.json");
+// --- Antigravity CLI ---
+function removeAgy(): void {
+  const configPath = path.join(HOME, ".gemini", "config", "mcp_config.json");
   if (fs.existsSync(configPath)) {
     try {
-      const settings = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      const mcpServers = asRecord(settings.mcpServers);
-      if (mcpServers && mcpServers["multiagents"]) {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      const mcpServers = asRecord(config.mcpServers);
+      if (mcpServers && (mcpServers["multiagents"] || mcpServers["multiagents-peer"])) {
         delete mcpServers["multiagents"];
-        fs.writeFileSync(configPath, JSON.stringify(settings, null, 2) + "\n");
-        console.log("[multiagents] Removed MCP server from ~/.gemini/settings.json");
+        delete mcpServers["multiagents-peer"];
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+        console.log("[multiagents] Removed MCP server from ~/.gemini/config/mcp_config.json");
       }
     } catch { /* ok */ }
   }
@@ -125,7 +123,7 @@ function removeGemini(): void {
 try {
   removeClaude();
   removeCodex();
-  removeGemini();
+  removeAgy();
   console.log("[multiagents] MCP cleanup complete. Restart your agent CLIs to apply.");
 } catch (e) {
   console.error(`[multiagents] preuninstall warning: ${e instanceof Error ? e.message : String(e)}`);

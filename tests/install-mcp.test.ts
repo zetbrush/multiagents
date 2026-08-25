@@ -55,6 +55,10 @@ function runPreuninstall(home: string): { exitCode: number | null; stdout: strin
   return runWithHome(home, [BUN_BIN, "run", "scripts/preuninstall.ts"]);
 }
 
+function switchOrchestrator(home: string, host: "claude" | "codex" | "agy") {
+  return runWithHome(home, [BUN_BIN, "cli.ts", "orchestrator", "set", host]);
+}
+
 afterEach(() => {
   for (const home of tempHomes.splice(0)) {
     fs.rmSync(home, { recursive: true, force: true });
@@ -62,11 +66,11 @@ afterEach(() => {
 });
 
 describe("install-mcp / preuninstall", () => {
-  test("installs safe Claude/Codex/Gemini config and removes Codex cleanly", () => {
+  test("installs safe Claude/Codex/Antigravity config and removes it cleanly", () => {
     const home = makeTempHome();
     fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
 
-    for (const name of ["claude", "codex", "gemini", "multiagents-server", "multiagents-orch"]) {
+    for (const name of ["claude", "codex", "agy", "multiagents-server", "multiagents-orch"]) {
       writeExecutable(home, name, "#!/bin/sh\nexit 0\n");
     }
 
@@ -81,6 +85,8 @@ describe("install-mcp / preuninstall", () => {
 
     const install = runInstall(home);
     expect(install.exitCode).toBe(0);
+    const hostConfig = JSON.parse(fs.readFileSync(path.join(home, ".multiagents", "config.json"), "utf-8"));
+    expect(hostConfig.orchestrator_host).toBe("claude");
 
     const claudeSettings = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"));
     expect(claudeSettings.permissions.allow).toContain("mcp__multiagents");
@@ -94,13 +100,13 @@ describe("install-mcp / preuninstall", () => {
     // Args now include server.ts path + agent type (self-resolving paths)
     expect(codexToml).toContain('"--agent-type", "codex"');
     expect(codexToml).toContain("server.ts");
+    expect(codexToml).not.toContain("[mcp_servers.multiagents-orch]");
 
-    const geminiSettings = JSON.parse(fs.readFileSync(path.join(home, ".gemini", "settings.json"), "utf-8"));
-    // Gemini args: [server.ts path, "--agent-type", "gemini"]
-    expect(geminiSettings.mcpServers.multiagents.args).toContain("--agent-type");
-    expect(geminiSettings.mcpServers.multiagents.args).toContain("gemini");
-    expect(geminiSettings.mcpServers.multiagents.timeout).toBe(30000);
-    expect(geminiSettings.mcpServers.multiagents.trust).toBe(true);
+    const agyConfigPath = path.join(home, ".gemini", "config", "mcp_config.json");
+    const agyConfig = JSON.parse(fs.readFileSync(agyConfigPath, "utf-8"));
+    expect(agyConfig.mcpServers.multiagents.args).toContain("--agent-type");
+    expect(agyConfig.mcpServers.multiagents.args).toContain("agy");
+    expect(agyConfig.mcpServers["multiagents-orch"]).toBeUndefined();
 
     const uninstall = runPreuninstall(home);
     expect(uninstall.exitCode).toBe(0);
@@ -108,6 +114,8 @@ describe("install-mcp / preuninstall", () => {
     const cleanedCodex = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf-8");
     expect(cleanedCodex).not.toContain("[mcp_servers.multiagents]");
     expect(cleanedCodex).not.toContain("--agent-type");
+    const cleanedAgy = JSON.parse(fs.readFileSync(agyConfigPath, "utf-8"));
+    expect(cleanedAgy.mcpServers.multiagents).toBeUndefined();
   });
 
   test("does not overwrite malformed ~/.claude.json when Claude CLI add fails", () => {
@@ -132,5 +140,52 @@ describe("install-mcp / preuninstall", () => {
 
     const settings = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"));
     expect(settings.permissions.allow).toEqual(["mcp__multiagents", "mcp__multiagents-orch"]);
+  });
+
+  test("switches the orchestrator between AGY and Codex", () => {
+    const home = makeTempHome();
+    for (const name of ["codex", "agy", "multiagents-server", "multiagents-orch"]) {
+      writeExecutable(home, name, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.0.0; fi\nexit 0\n");
+    }
+
+    const agySwitch = switchOrchestrator(home, "agy");
+    expect(agySwitch.exitCode).toBe(0);
+    expect(agySwitch.stdout).toContain("Orchestrator switched to agy");
+
+    const hostConfig = JSON.parse(fs.readFileSync(path.join(home, ".multiagents", "config.json"), "utf-8"));
+    expect(hostConfig.orchestrator_host).toBe("agy");
+
+    let agyConfig = JSON.parse(fs.readFileSync(path.join(home, ".gemini", "config", "mcp_config.json"), "utf-8"));
+    expect(agyConfig.mcpServers["multiagents-orch"].args.join(" ")).toContain("orchestrator-server.ts");
+
+    let codexToml = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf-8");
+    expect(codexToml).not.toContain("[mcp_servers.multiagents-orch]");
+
+    const codexSwitch = switchOrchestrator(home, "codex");
+    expect(codexSwitch.exitCode).toBe(0);
+    expect(codexSwitch.stdout).toContain("Orchestrator switched to codex");
+
+    codexToml = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf-8");
+    expect(codexToml).toContain("[mcp_servers.multiagents-orch]");
+    expect(codexToml).toContain("orchestrator-server.ts");
+
+    agyConfig = JSON.parse(fs.readFileSync(path.join(home, ".gemini", "config", "mcp_config.json"), "utf-8"));
+    expect(agyConfig.mcpServers["multiagents-orch"]).toBeUndefined();
+  });
+
+  test("selects Codex automatically when Claude is unavailable", () => {
+    const home = makeTempHome();
+    for (const name of ["codex", "agy", "multiagents-server", "multiagents-orch"]) {
+      writeExecutable(home, name, "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.0.0; fi\nexit 0\n");
+    }
+
+    const install = runInstall(home);
+    expect(install.exitCode).toBe(0);
+
+    const hostConfig = JSON.parse(fs.readFileSync(path.join(home, ".multiagents", "config.json"), "utf-8"));
+    expect(hostConfig.orchestrator_host).toBe("codex");
+
+    const codexToml = fs.readFileSync(path.join(home, ".codex", "config.toml"), "utf-8");
+    expect(codexToml).toContain("[mcp_servers.multiagents-orch]");
   });
 });

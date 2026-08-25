@@ -10,7 +10,7 @@
 export type PeerId = string;
 
 /** Supported agent CLI types */
-export type AgentType = "claude" | "codex" | "gemini" | "custom";
+export type AgentType = "claude" | "codex" | "agy" | "custom";
 
 /** Message types for routing and formatting */
 export type MessageType =

@@ -66,7 +66,7 @@ async function createTestSession() {
   const designer = await post("/slots/create", {
     session_id: session.id,
     display_name: "Designer",
-    agent_type: "gemini",
+    agent_type: "agy",
     role: "UI/UX Designer",
   });
 
@@ -86,7 +86,7 @@ async function createTestSession() {
 
   // Register fake peers for each slot
   const designerPeer = await post("/register", {
-    agent_type: "gemini",
+    agent_type: "agy",
     pid: 10001 + testCounter,
     cwd: "/tmp/test-lifecycle",
     summary: "Designer starting",

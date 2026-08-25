@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/multiagents.svg)](https://www.npmjs.com/package/multiagents)
 [![npm downloads](https://img.shields.io/npm/dm/multiagents.svg)](https://www.npmjs.com/package/multiagents)
 
-Multi-agent orchestration platform for **Claude Code**, **Codex CLI**, and **Gemini CLI**. Enables AI agents to discover each other, communicate in real-time, coordinate file edits, and work as a team on shared codebases.
+Multi-agent orchestration platform for **Claude Code**, **Codex CLI**, and **Antigravity CLI (AGY)**. Enables AI agents to discover each other, communicate in real-time, coordinate file edits, and work as a team on shared codebases.
 
 Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 
@@ -11,7 +11,7 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Claude Code  │     │  Codex CLI  │     │ Gemini CLI  │
+│ Claude Code  │     │  Codex CLI  │     │   AGY CLI   │
 │ (Engineer)   │     │ (Reviewer)  │     │ (Designer)  │
 └──────┬───────┘     └──────┬──────┘     └──────┬──────┘
        │   MCP (stdio)      │  CodexDriver       │
@@ -23,13 +23,13 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
             └───────┬────────┘
                     │
             ┌───────▼────────┐
-            │  Orchestrator   │  MCP server for Claude Desktop
+            │  Orchestrator   │  MCP server hosted by Claude, Codex,
             │  (team manager) │  Spawns agents, forwards messages,
-            └────────────────┘  monitors progress, auto-restarts
+            └────────────────┘  or AGY; monitors and auto-restarts
 ```
 
 - **Peer discovery**: agents find each other via `list_peers`
-- **Real-time messaging**: instant for Claude (channel push), <3s for Codex (mid-turn steer), 1-3s for Gemini (piggyback)
+- **Real-time messaging**: instant for Claude (channel push), <3s for Codex (mid-turn steer), 1-3s for AGY (piggyback)
 - **Role assignment**: `assign_role`, `rename_peer` at runtime
 - **File coordination**: exclusive locks + ownership zones prevent conflicts
 - **Task lifecycle**: `idle → working → done_pending_review → addressing_feedback → approved → released`
@@ -49,20 +49,29 @@ bun install -g multiagents
 # Setup (detects CLIs, configures MCP servers, starts broker)
 multiagents setup
 
-# Restart your Claude Code / Codex / Gemini sessions to load MCP tools
+# Restart your Claude Code / Codex / AGY sessions to load MCP tools
 
 # Monitor
 multiagents dashboard
 ```
 
-### From Claude Desktop (Orchestrator)
+### From the selected orchestrator
 
-Ask Claude to create a team:
+Ask Claude, Codex, or AGY to create a team:
 
-> "Create a team of 3 agents: a Claude engineer, a Codex reviewer, and a Gemini designer.
+> "Create a team of 3 agents: a Claude engineer, a Codex reviewer, and an AGY designer.
 > Build a calculator web app in TypeScript."
 
 The orchestrator handles everything: spawning agents, assigning roles, creating slots, launching the dashboard, and forwarding messages between agents.
+
+The first `multiagents setup` selects the first installed CLI in this order: Claude, Codex, AGY. You can switch later:
+
+```bash
+multiagents orchestrator status
+multiagents orchestrator set agy
+```
+
+Restart the agent CLIs after switching. For an existing session, close the old host, then call `list_sessions` and `resume_session` from the new host.
 
 ## Agent Support
 
@@ -70,7 +79,7 @@ The orchestrator handles everything: spawning agents, assigning roles, creating 
 |-------|-------------------|---------|--------|
 | Claude Code | Channel push notifications | Instant | `~/.claude/settings.json` |
 | Codex CLI | CodexDriver (`codex app-server`) | <3s mid-turn, 3-9s between turns | `~/.codex/config.toml` |
-| Gemini CLI | Piggyback on MCP tool responses | 1-3s | `~/.gemini/settings.json` |
+| Antigravity CLI (`agy`) | Piggyback on MCP tool responses | 1-3s | `~/.gemini/config/mcp_config.json` |
 
 ### Codex Integration (CodexDriver)
 
@@ -129,7 +138,7 @@ Agents **cannot disconnect** until explicitly released. This ensures the review 
 | `query_knowledge` | Query knowledge entries by key or category |
 | `remove_knowledge` | Remove outdated knowledge entries |
 
-## Orchestrator Tools (Claude Desktop)
+## Orchestrator Tools (Claude, Codex, or AGY)
 
 | Tool | Description |
 |------|-------------|
@@ -264,7 +273,7 @@ multiagents/
 │   ├── base-adapter.ts     Abstract MCP adapter (tools, registration, polling)
 │   ├── claude-adapter.ts   Claude Code adapter (channel push delivery)
 │   ├── codex-adapter.ts    Codex adapter (piggyback + file inbox delivery)
-│   ├── gemini-adapter.ts   Gemini adapter (piggyback + file inbox delivery)
+│   ├── agy-adapter.ts      AGY adapter (piggyback + file inbox delivery)
 │   └── role-practices.ts   Role-specific best practices injection
 ├── orchestrator/
 │   ├── orchestrator-server.ts  Orchestrator MCP server (team management)
@@ -312,7 +321,7 @@ multiagents/
 ## Requirements
 
 - [Bun](https://bun.sh/) runtime (v1.1+)
-- At least one of: Claude Code, Codex CLI, or Gemini CLI
+- At least one of: Claude Code, Codex CLI, or Antigravity CLI (`agy`)
 
 ## License
 
