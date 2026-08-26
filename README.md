@@ -144,6 +144,8 @@ Agents **cannot disconnect** until explicitly released. This ensures the review 
 |------|-------------|
 | `create_team` | Spawn a team with roles, file ownership, and a plan |
 | `get_team_status` | Live status of all agents with completion tracking |
+| `get_optimization_report` | Model decisions, token budgets, escalation, and cost report |
+| `adjust_token_budget` | Set or extend session/agent token budgets |
 | `broadcast_to_team` | Message all agents at once |
 | `direct_agent` | Message a specific agent by name/role |
 | `add_agent` / `remove_agent` | Add or remove agents mid-session |
@@ -208,6 +210,59 @@ Session monitoring stats and enforced limits:
 | Longest Idle | Monitor | Per agent | Observe |
 
 Adjustable from the TUI dashboard (+/- keys) or via `adjust_guardrail` tool.
+
+## Token and Model Optimization
+
+Token optimization is enabled by default. Tasks are classified locally (no LLM call) into
+`economy`, `balanced`, or `expert`, then mapped to a provider model and reasoning effort.
+Explicit per-agent choices always win over automatic classification.
+
+```json
+{
+  "session_name": "Auth work",
+  "project_dir": "/workspace/app",
+  "optimization": {
+    "session_token_budget": 200000,
+    "default_agent_token_budget": 50000,
+    "auto_escalate": true,
+    "right_size": "recommend",
+    "tiers": {
+      "codex": {
+        "economy": { "model": "gpt-5.6-luna", "reasoning_effort": "low" },
+        "balanced": { "model": "gpt-5.6-terra", "reasoning_effort": "medium" },
+        "expert": { "model": "gpt-5.6-sol", "reasoning_effort": "high" }
+      }
+    },
+    "pricing": {
+      "your-model": { "input": 1.0, "output": 4.0, "cached_input": 0.2 }
+    }
+  },
+  "agents": [{
+    "agent_type": "codex",
+    "name": "Engineer",
+    "role": "Software Engineer",
+    "role_description": "Implement and verify the requested change.",
+    "initial_task": "Implement the endpoint and its tests.",
+    "model_policy": { "token_budget": 40000 }
+  }]
+}
+```
+
+The optimizer also:
+
+- recommends a smaller team for bounded work (`right_size: "enforce"` applies it);
+- promotes an incomplete/crashed task one tier at a time when auto-escalation is enabled;
+- stops agents or sessions at their token budget so they cannot silently restart;
+- preserves routing metadata across summaries, crashes, and resumptions;
+- reports model choice, decision reasons, tokens, cache reads, escalations, and estimated cost.
+
+Use `get_optimization_report` for the report and `adjust_token_budget` to set or extend a
+session/agent budget. Cost is only estimated when pricing is explicitly configured, avoiding
+stale hard-coded prices.
+
+Default model mappings can be replaced without code changes through the `tiers` configuration
+or environment variables such as `MULTIAGENTS_CODEX_ECONOMY_MODEL`,
+`MULTIAGENTS_CLAUDE_BALANCED_MODEL`, and `MULTIAGENTS_AGY_EXPERT_MODEL`.
 
 ## Web Dashboard
 

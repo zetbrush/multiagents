@@ -207,6 +207,16 @@ describe("buildCliArgs — codex", () => {
     expect(cFlags).toContain('model_reasoning_effort="high"');
   });
 
+  test("applies optimizer model and reasoning policy", () => {
+    const args = buildCliArgs("codex", task, undefined, {
+      model: "test-economy",
+      reasoning_effort: "low",
+      max_output_tokens: 2_000,
+    });
+    expect(getFlagValue(args, "--model")).toBe("test-economy");
+    expect(collectFlagValues(args, "-c")).toContain('model_reasoning_effort="low"');
+  });
+
   test("task is the last argument", () => {
     const args = buildCliArgs("codex", task);
     expect(args[args.length - 1]).toBe(task);

@@ -873,7 +873,19 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
       fields.push("last_connected = ?"); values.push(Date.now());
     }
   }
-  if (body.context_snapshot !== undefined) { fields.push("context_snapshot = ?"); values.push(body.context_snapshot); }
+  if (body.context_snapshot !== undefined) {
+    // Snapshots are incremental status updates. Preserve durable optimizer and
+    // handoff metadata instead of discarding it whenever an agent reports a
+    // new one-line summary.
+    let snapshot = body.context_snapshot;
+    try {
+      const row = db.query("SELECT context_snapshot FROM slots WHERE id = ?").get(body.id) as { context_snapshot: string | null } | null;
+      const previous = row?.context_snapshot ? JSON.parse(row.context_snapshot) : {};
+      const incoming = JSON.parse(body.context_snapshot);
+      snapshot = JSON.stringify({ ...previous, ...incoming });
+    } catch { /* keep the caller payload when either value is not JSON */ }
+    fields.push("context_snapshot = ?"); values.push(snapshot);
+  }
   if (body.display_name !== undefined) { fields.push("display_name = ?"); values.push(body.display_name); }
   if (body.role !== undefined) { fields.push("role = ?"); values.push(body.role); }
   if (body.role_description !== undefined) { fields.push("role_description = ?"); values.push(body.role_description); }
@@ -1321,7 +1333,7 @@ Bun.serve({
           const rows = db.query(
             "SELECT msg_type, sent_at FROM messages WHERE to_slot_id = ? AND delivered = 0 AND held = 0 ORDER BY id ASC"
           ).all(slot_id) as { msg_type: string; sent_at: string }[];
-          const oldest_at = rows.length > 0 ? new Date(rows[0].sent_at).getTime() : 0;
+          const oldest_at = rows[0] ? new Date(rows[0].sent_at).getTime() : 0;
           return Response.json({ count: rows.length, msg_types: rows.map(r => r.msg_type), oldest_at });
         }
         case "/unregister":

@@ -46,7 +46,7 @@ async function resolveSessionId(explicit?: string): Promise<string | null> {
     const active = sessions
       .filter((s: Session) => s.status === "active" || s.status === "paused")
       .sort((a: Session, b: Session) => (b.last_active_at ?? 0) - (a.last_active_at ?? 0));
-    if (active.length > 0) return active[0].id;
+    if (active[0]) return active[0].id;
   } catch { /* broker down */ }
 
   return null;
@@ -263,7 +263,7 @@ const server = Bun.serve({
         const result = await broker.updateGuardrail({
           session_id: body.session_id,
           guardrail_id: body.guardrail_id,
-          value: body.value,
+          new_value: body.value,
           reason: body.reason ?? "Adjusted via web dashboard",
           changed_by: "web-dashboard",
         });

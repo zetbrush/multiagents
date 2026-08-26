@@ -16,7 +16,8 @@ import type { Subprocess } from "bun";
 
 import * as fs from "node:fs";
 import { BrokerClient } from "../shared/broker-client.ts";
-import type { AgentLaunchConfig } from "../shared/types.ts";
+import type { AgentLaunchConfig, TokenOptimizationConfig } from "../shared/types.ts";
+import { DEFAULT_OPTIMIZATION, recommendedTeamSize, rightSizeTeam } from "../shared/model-routing.ts";
 import { log, getGitRoot, slugify, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
   DEFAULT_BROKER_PORT,
@@ -33,6 +34,7 @@ import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget } from "./session-control.ts";
+import { buildOptimizationReport, formatOptimizationReport, getOptimizationConfig } from "./token-optimizer.ts";
 
 const LOG_PREFIX = "orchestrator";
 const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
@@ -52,6 +54,8 @@ interface CodexSlotState {
   lastNudge: number;
 }
 const activeCodexDrivers: Map<string, Map<number, CodexSlotState>> = new Map();
+/** Slots intentionally stopped by token budgets; they must not auto-respawn. */
+const budgetStoppedSlots = new Set<number>();
 
 // --- Dashboard auto-launch ---
 
@@ -138,6 +142,17 @@ async function ensureBroker(brokerClient: BrokerClient): Promise<void> {
 
 function handleEvent(event: AgentEvent): void {
   log(LOG_PREFIX, `[${event.severity}] ${event.message}`);
+
+  if (budgetStoppedSlots.has(event.slotId) && (event.type === "agent_crashed" || event.type === "agent_completed")) {
+    pendingEvents.push({
+      type: "guardrail_triggered",
+      severity: "warning",
+      slotId: event.slotId,
+      sessionId: event.sessionId,
+      message: `Slot ${event.slotId} remains stopped because its token budget was exhausted.`,
+    });
+    return;
+  }
 
   // Auto-respawn on crash (unless flapping)
   if (event.type === "agent_crashed" && event.data && !event.data.is_flapping) {
@@ -351,6 +366,18 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
                 role_description: { type: "string", description: "Detailed role brief including platform (web/android/ios/cli/api), framework/stack, specific expertise, constraints, and acceptance criteria. The richer this is, the better the agent performs." },
                 initial_task: { type: "string", description: "Specific task with acceptance criteria. Include what 'done' looks like, files to modify, APIs to use, and verification steps." },
                 file_ownership: { type: "array", items: { type: "string" }, description: "Glob patterns for files this agent owns exclusively, e.g., 'src/auth/**'" },
+                model_policy: {
+                  type: "object",
+                  description: "Optional optimizer overrides. Omit for automatic local classification.",
+                  properties: {
+                    tier: { type: "string", enum: ["economy", "balanced", "expert"] },
+                    model: { type: "string" },
+                    reasoning_effort: { type: "string", enum: ["low", "medium", "high"] },
+                    token_budget: { type: "number" },
+                    max_output_tokens: { type: "number" },
+                    auto_escalate: { type: "boolean" },
+                  },
+                },
               },
               required: ["agent_type", "name", "role", "role_description", "initial_task"],
             },
@@ -367,6 +394,19 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
               required: ["label"],
             },
           },
+          optimization: {
+            type: "object",
+            description: "Token optimizer settings; enabled by default.",
+            properties: {
+              enabled: { type: "boolean" },
+              session_token_budget: { type: "number" },
+              default_agent_token_budget: { type: "number" },
+              auto_escalate: { type: "boolean" },
+              right_size: { type: "string", enum: ["off", "recommend", "enforce"] },
+              tiers: { type: "object", description: "Provider/tier model overrides." },
+              pricing: { type: "object", description: "Optional USD per million input/output tokens keyed by model." },
+            },
+          },
         },
         required: ["project_dir", "session_name", "agents"],
       },
@@ -380,6 +420,30 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
           session_id: { type: "string" },
         },
         required: ["session_id"],
+      },
+    },
+    {
+      name: "get_optimization_report",
+      description: "Show model-routing decisions, token budgets, escalation counts and optional estimated cost for a session.",
+      inputSchema: {
+        type: "object" as const,
+        properties: { session_id: { type: "string" } },
+        required: ["session_id"],
+      },
+    },
+    {
+      name: "adjust_token_budget",
+      description: "Set or extend a session or agent token budget. A stopped agent can then be resumed explicitly.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          session_id: { type: "string" },
+          scope: { type: "string", enum: ["session", "agent"] },
+          target: { type: "string", description: "Agent name/role/slot ID when scope=agent." },
+          operation: { type: "string", enum: ["set", "extend"] },
+          tokens: { type: "number", description: "Positive token amount." },
+        },
+        required: ["session_id", "scope", "operation", "tokens"],
       },
     },
     {
@@ -421,6 +485,17 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
           role_description: { type: "string", description: "Detailed role brief including platform, framework, expertise, constraints. The richer this is, the better the agent performs." },
           initial_task: { type: "string", description: "Specific task with acceptance criteria. Include what 'done' looks like." },
           file_ownership: { type: "array", items: { type: "string" }, description: "Glob patterns for files this agent owns exclusively" },
+          model_policy: {
+            type: "object",
+            properties: {
+              tier: { type: "string", enum: ["economy", "balanced", "expert"] },
+              model: { type: "string" },
+              reasoning_effort: { type: "string", enum: ["low", "medium", "high"] },
+              token_budget: { type: "number" },
+              max_output_tokens: { type: "number" },
+              auto_escalate: { type: "boolean" },
+            },
+          },
         },
         required: ["session_id", "agent_type", "name", "role", "role_description", "initial_task"],
       },
@@ -582,17 +657,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       // ---- create_team ----
       case "create_team": {
-        const { project_dir, session_name, agents, plan: planItems } = args as {
+        const { project_dir, session_name, agents, plan: planItems, optimization } = args as {
           project_dir: string;
           session_name: string;
           agents: AgentLaunchConfig[];
           plan?: { label: string; agent_name?: string }[];
+          optimization?: TokenOptimizationConfig;
         };
+        const optimizationConfig: TokenOptimizationConfig = {
+          ...DEFAULT_OPTIMIZATION,
+          ...(optimization ?? {}),
+        };
+        if (optimizationConfig.enabled === false) optimizationConfig.right_size = "off";
+        const recommendedCount = recommendedTeamSize(agents);
+        const agentsToLaunch = optimizationConfig.right_size === "enforce" && agents.length > recommendedCount
+          ? rightSizeTeam(agents, recommendedCount)
+          : agents;
 
         // Detect available agents — check ALL before failing, report what IS available
         const unavailable: { name: string; type: string }[] = [];
         const availableTypes = new Set<string>();
-        for (const agentCfg of agents) {
+        for (const agentCfg of agentsToLaunch) {
           const detection = await detectAgent(agentCfg.agent_type);
           if (!detection.available) {
             unavailable.push({ name: agentCfg.name, type: agentCfg.agent_type });
@@ -654,6 +739,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           name: session_name,
           project_dir,
           git_root: gitRoot,
+          config: { optimization: optimizationConfig },
         });
 
         const sessionProcs = new Map<number, Subprocess>();
@@ -666,14 +752,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Antigravity can also race during concurrent native CLI startup.
         const launchedAgents: { name: string; slot_id: number; pid: number }[] = [];
         const launchedTypes = new Set<string>();
-        for (const agentCfg of agents) {
+        for (const agentCfg of agentsToLaunch) {
           // Stagger if we've already launched an agent of this type
           if (launchedTypes.has(agentCfg.agent_type)) {
             await new Promise((r) => setTimeout(r, 3000));
           }
           launchedTypes.add(agentCfg.agent_type);
 
-          const result = await launchAgent(sessionId, project_dir, agentCfg, brokerClient);
+          const result = await launchAgent(sessionId, project_dir, agentCfg, brokerClient, optimizationConfig);
           sessionProcs.set(result.slotId, result.process);
 
           // Track CodexDriver instances for message forwarding
@@ -764,6 +850,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const status = await getTeamStatus(sessionId, brokerClient);
         const display = formatTeamStatusForDisplay(status);
+        const rightSizeSummary = agents.length > recommendedCount && optimizationConfig.right_size !== "off"
+          ? optimizationConfig.right_size === "enforce"
+            ? `Optimizer right-sized the requested team from ${agents.length} to ${agentsToLaunch.length} agent(s).`
+            : `Optimizer recommendation: this workload needs about ${recommendedCount} agent(s), ${agents.length} were explicitly requested and kept.`
+          : `Optimizer team-size recommendation: ${recommendedCount} agent(s).`;
 
         // Auto-launch dashboards (TUI in terminal + web in browser)
         launchDashboard(sessionId, project_dir);
@@ -776,6 +867,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               `Session "${sessionId}" created with ${launchedAgents.length} agents.${planSummary}`,
               "",
               display,
+              "",
+              rightSizeSummary,
               "",
               "IMPORTANT: Agents take 15-60 seconds to start up (loading MCP servers, connecting to broker).",
               "They will show as 'starting' until they register. This is NORMAL — do NOT call cleanup_dead_slots",
@@ -833,6 +926,60 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: display + eventText + blockedText + completionText }] };
       }
 
+      // ---- get_optimization_report ----
+      case "get_optimization_report": {
+        const { session_id } = args as { session_id: string };
+        const session = await brokerClient.getSession(session_id);
+        const slots = await brokerClient.listSlots(session_id);
+        const report = buildOptimizationReport(session, slots);
+        return {
+          content: [{ type: "text", text: formatOptimizationReport(report) }],
+          structuredContent: report,
+        };
+      }
+
+      // ---- adjust_token_budget ----
+      case "adjust_token_budget": {
+        const { session_id, scope, target, operation, tokens } = args as {
+          session_id: string;
+          scope: "session" | "agent";
+          target?: string;
+          operation: "set" | "extend";
+          tokens: number;
+        };
+        if (!Number.isFinite(tokens) || tokens <= 0) {
+          return { content: [{ type: "text", text: "tokens must be a positive number." }], isError: true };
+        }
+        if (scope === "session") {
+          const session = await brokerClient.getSession(session_id);
+          const config = safeJsonParse<Record<string, any>>(session.config, {});
+          const optimization = config.optimization ?? {};
+          const current = optimization.session_token_budget ?? DEFAULT_OPTIMIZATION.session_token_budget;
+          optimization.session_token_budget = operation === "extend" ? current + tokens : tokens;
+          config.optimization = optimization;
+          await brokerClient.updateSession({ id: session_id, config });
+          const slots = await brokerClient.listSlots(session_id);
+          for (const slot of slots) {
+            budgetStoppedSlots.delete(slot.id);
+            await brokerClient.updateSlot({ id: slot.id, context_snapshot: JSON.stringify({ budget_exhausted: false, updated_at: Date.now() }) });
+          }
+          return { content: [{ type: "text", text: `Session token budget ${operation === "extend" ? "extended to" : "set to"} ${optimization.session_token_budget}.` }] };
+        }
+        if (!target) return { content: [{ type: "text", text: "target is required for an agent budget." }], isError: true };
+        const slot = await resolveTarget(session_id, target, brokerClient);
+        if (!slot) return { content: [{ type: "text", text: `Agent "${target}" not found.` }], isError: true };
+        const snapshot = safeJsonParse<Record<string, any>>(slot.context_snapshot, {});
+        const policy = snapshot.optimization ?? {};
+        const current = policy.token_budget ?? DEFAULT_OPTIMIZATION.default_agent_token_budget;
+        policy.token_budget = operation === "extend" ? current + tokens : tokens;
+        await brokerClient.updateSlot({
+          id: slot.id,
+          context_snapshot: JSON.stringify({ optimization: policy, budget_exhausted: false, updated_at: Date.now() }),
+        });
+        budgetStoppedSlots.delete(slot.id);
+        return { content: [{ type: "text", text: `${slot.display_name ?? target} token budget ${operation === "extend" ? "extended to" : "set to"} ${policy.token_budget}. Resume the agent if it was stopped.` }] };
+      }
+
       // ---- broadcast_to_team ----
       case "broadcast_to_team": {
         const { session_id, message, exclude_roles } = args as {
@@ -869,7 +1016,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // ---- add_agent ----
       case "add_agent": {
-        const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership } = args as {
+        const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership, model_policy } = args as {
           session_id: string;
           agent_type: "claude" | "codex" | "agy";
           name: string;
@@ -877,6 +1024,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           role_description: string;
           initial_task: string;
           file_ownership?: string[];
+          model_policy?: AgentLaunchConfig["model_policy"];
         };
 
         const detection = await detectAgent(agent_type);
@@ -892,9 +1040,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           role_description,
           initial_task,
           file_ownership,
+          model_policy,
         };
 
-        const result = await launchAgent(session_id, session.project_dir, config, brokerClient);
+        const optimizationConfig = getOptimizationConfig(session);
+        const result = await launchAgent(session_id, session.project_dir, config, brokerClient, optimizationConfig);
 
         const sessionProcs = activeProcesses.get(session_id) ?? new Map();
         sessionProcs.set(result.slotId, result.process);
@@ -1350,9 +1500,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             // Get message recap for this slot
             let recapLines: string[] = [];
             try {
-              const messages = await brokerClient.getMessageLog(session_id, { limit: 30, with_slot: slot.id });
+              const messages = await brokerClient.getMessageLog(session_id, { limit: 10, with_slot: slot.id });
               recapLines = messages.map((m: any) =>
-                `[${m.msg_type}] ${m.from_id}: ${(m.text ?? "").slice(0, 200)}`
+                `[${m.msg_type}] ${m.from_id}: ${(m.text ?? "").slice(0, 120)}`
               );
             } catch { /* ok */ }
 
@@ -1490,6 +1640,36 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     for (const sessionId of activeProcesses.keys()) {
       try {
         await enforceGuardrails(sessionId, brokerClient, handleEvent);
+        const session = await brokerClient.getSession(sessionId);
+        const slots = await brokerClient.listSlots(sessionId);
+        const report = buildOptimizationReport(session, slots);
+        if (!report.enabled) continue;
+
+        const stopSlot = async (slotId: number, message: string) => {
+          if (budgetStoppedSlots.has(slotId)) return;
+          budgetStoppedSlots.add(slotId);
+          try { activeProcesses.get(sessionId)?.get(slotId)?.kill(); } catch { /* already stopped */ }
+          try { activeCodexDrivers.get(sessionId)?.get(slotId)?.driver.kill(); } catch { /* already stopped */ }
+          await brokerClient.updateSlot({
+            id: slotId,
+            paused: true,
+            paused_at: Date.now(),
+            status: "disconnected",
+            context_snapshot: JSON.stringify({ budget_exhausted: true, last_status: "token_budget_exhausted", updated_at: Date.now() }),
+          });
+          pendingEvents.push({ type: "guardrail_triggered", severity: "warning", slotId, sessionId, message });
+        };
+
+        if (report.session_token_budget > 0 && report.total_tokens >= report.session_token_budget) {
+          for (const agent of report.agents) await stopSlot(agent.slot_id, `Session token budget exhausted (${report.total_tokens}/${report.session_token_budget}).`);
+          await brokerClient.updateSession({ id: sessionId, status: "paused", pause_reason: "Token budget exhausted", paused_at: Date.now() });
+        } else {
+          for (const agent of report.agents) {
+            if (agent.token_budget > 0 && agent.total_tokens >= agent.token_budget) {
+              await stopSlot(agent.slot_id, `${agent.name} token budget exhausted (${agent.total_tokens}/${agent.token_budget}).`);
+            }
+          }
+        }
       } catch (err) {
         log(LOG_PREFIX, `Guardrail check error for ${sessionId}: ${err}`);
       }
@@ -1531,7 +1711,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
   // --- Codex message forwarding prompt ---
   function buildForwardingPrompt(formatted: string): string {
-    return `[Teammate message] ${formatted}\nAcknowledge briefly, then continue your current task.`;
+    return `[Teammate message] ${formatted}\nIncorporate it and continue. Reply only if a decision or answer is required.`;
   }
 
   // --- Codex message forwarding loop ---

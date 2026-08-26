@@ -7,8 +7,9 @@
 // ============================================================================
 
 import type { Subprocess } from "bun";
-import type { AgentType, AgentLaunchConfig, Slot } from "../shared/types.ts";
+import type { AgentType, AgentLaunchConfig, ResolvedModelPolicy, Slot, TokenOptimizationConfig } from "../shared/types.ts";
 import type { BrokerClient } from "../shared/broker-client.ts";
+import { resolveModelPolicy } from "../shared/model-routing.ts";
 import { log } from "../shared/utils.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 import * as path from "node:path";
@@ -263,6 +264,7 @@ export async function launchAgent(
   projectDir: string,
   config: AgentLaunchConfig,
   brokerClient: BrokerClient,
+  optimization: TokenOptimizationConfig = {},
 ): Promise<LaunchResult> {
   // Ensure MCP configs and session file exist before spawning any agent
   await ensureMcpConfigs(projectDir, sessionId);
@@ -280,6 +282,19 @@ export async function launchAgent(
   });
 
   log(LOG_PREFIX, `Created slot ${slot.id} for ${config.name} (${config.agent_type})`);
+
+  const modelPolicy = resolveModelPolicy(config, optimization);
+  const cliPolicy = optimization.enabled === false ? undefined : modelPolicy;
+  await brokerClient.updateSlot({
+    id: slot.id,
+    context_snapshot: JSON.stringify({
+      optimization: modelPolicy,
+      original_task: config.initial_task,
+      last_status: "starting",
+      updated_at: Date.now(),
+    }),
+  });
+  log(LOG_PREFIX, `Optimizer selected ${modelPolicy.tier}/${modelPolicy.model ?? "provider-default"} (${modelPolicy.reasoning_effort}) for ${config.name}`);
 
   // Assign file ownership if specified
   if (config.file_ownership && config.file_ownership.length > 0) {
@@ -302,51 +317,15 @@ export async function launchAgent(
   const taskPrompt = [
     `You are "${config.name}", role: ${config.role}.`,
     enrichedDescription,
+    `Task: ${config.initial_task}`,
+    `Output discipline: keep summaries concise (target <= ${modelPolicy.max_output_tokens} generated tokens overall).`,
     "",
-    `Your task: ${config.initial_task}`,
-    "",
-    "╔══════════════════════════════════════════════════════════════╗",
-    "║  MANDATORY: USE multiagents-peer MCP TOOLS — NOT OPTIONAL  ║",
-    "╚══════════════════════════════════════════════════════════════╝",
-    "",
-    "You have an MCP server called 'multiagents-peer' with tools for team communication.",
-    "These are NOT optional. You MUST call them. Your team is BLOCKED until you do.",
-    "",
-    "STEP 1 — DO THESE FIRST (before ANY other work, before reading files, before running commands):",
-    "  → Call set_summary with a 1-line description of your task",
-    "  → Call check_team_status to see your teammates",
-    "  → Call get_plan to see the team plan",
-    "  → Call check_messages to read messages from teammates",
-    "",
-    "STEP 2 — WHILE WORKING (after EVERY file write, EVERY shell command, EVERY build):",
-    "  → Call check_messages — teammates may have sent you critical info",
-    "  → Call set_summary with what you're currently doing",
-    "  → Call update_plan when you start or finish a plan item",
-    ...(isNonPushAgent ? [
-      `  → Read .multiagents/inbox/${config.name}.md — messages arrive here in real-time`,
-    ] : []),
-    "",
-    "STEP 3 — WHEN DONE:",
-    "  → Call signal_done with: what you built, what you tested, what the results were",
-    "  → Stay active — call check_messages every 10 seconds waiting for review feedback",
-    "  → If you get feedback: fix issues, then call signal_done again",
-    "",
-    "STEP 4 — WHEN TEAMMATES MESSAGE YOU:",
-    "  → Reply IMMEDIATELY via send_message. They are waiting on you.",
-    "  → If you need time, reply 'Working on it, will respond in ~N minutes'",
-    "",
-    "FAILURE MODES (your team will be stuck if you do these):",
-    "  ✗ Working for 1+ minute without calling check_messages",
-    "  ✗ Finishing work without calling signal_done",
-    "  ✗ Receiving a message and not replying via send_message",
-    "  ✗ Not calling set_summary — teammates can't see what you're doing",
-    "  ✗ Using shell commands to read broker state instead of MCP tools",
-    "",
-    "The multiagents-peer MCP tools are: set_summary, check_messages, send_message,",
-    "check_team_status, get_plan, update_plan, signal_done, submit_feedback, approve,",
-    "list_peers, acquire_file, release_file, view_file_locks, get_history,",
-    "store_knowledge, query_knowledge, remove_knowledge.",
-    "Use THESE tools. Do NOT try to call the broker via CLI or HTTP — use the MCP tools.",
+    "Coordinate through the multiagents-peer MCP server:",
+    "- At start: set_summary, then check_team_status, get_plan and check_messages.",
+    "- Check messages at meaningful milestones and reply when action is required.",
+    "- Update your summary/plan only when status changes; do not report every command.",
+    "- When complete, call signal_done once with changes and verification evidence.",
+    ...(isNonPushAgent ? [`- Inbox fallback: .multiagents/inbox/${config.name}.md.`] : []),
   ].join("\n");
 
   // Build env — enrich PATH for GUI-spawned contexts, unset CLAUDECODE for nesting
@@ -410,20 +389,8 @@ export async function launchAgent(
       `You are "${config.name}", role: ${config.role}.`,
       enrichedDescription,
       "",
-      "You have 'multiagents-peer' MCP tools: signal_done, set_summary, send_message, check_messages.",
-      "When done: call signal_done with proof. Use set_summary to show progress.",
+    "Use multiagents-peer at milestones; call signal_done with concise verification evidence when done.",
     ].join("\n");
-
-    // --- Two-phase startup for fast threadId acquisition ---
-    // Phase 1: Fast bootstrap turn (~5-9s) to get a threadId.
-    //   Codex creates the thread and returns immediately.
-    // Phase 2: Push the real task as a reply turn.
-    //   This runs in the background. The orchestrator can forward
-    //   teammate messages between turns because we have the threadId.
-    //
-    // Without this split, the entire task runs as turn 1 (can take
-    // minutes for complex tasks), blocking message forwarding.
-    const bootstrapPrompt = `You are "${config.name}" (${config.role}). Acknowledge by replying: "Ready."`;
 
     // Codex-specific task prompt: lightweight, action-focused.
     // Codex is slow per tool call (~10-30s each), so the heavy "MANDATORY MCP"
@@ -435,6 +402,7 @@ export async function launchAgent(
       enrichedDescription,
       "",
       config.initial_task,
+      `Keep generated prose concise; target no more than ${modelPolicy.max_output_tokens} output tokens.`,
       "",
       "After completing your task:",
       "  → Call signal_done (multiagents-peer MCP tool) with proof of what you did",
@@ -445,33 +413,24 @@ export async function launchAgent(
 
     const startPromise = (async () => {
       try {
-        // Phase 1: fast bootstrap (~5-9s)
-        const bootstrap = await driver.startSession({
-          prompt: bootstrapPrompt,
+        // Start the real task directly. The old acknowledgement-only bootstrap
+        // spent a full model turn without advancing the task.
+        const taskResult = await driver.startSession({
+          prompt: codexTaskPrompt,
           cwd: projectDir,
           sandbox: "workspace-write",
           developerInstructions,
+          model: cliPolicy?.model,
+          reasoningEffort: cliPolicy?.reasoning_effort,
+          maxOutputTokens: cliPolicy?.max_output_tokens,
         });
-        log(LOG_PREFIX, `${config.name} bootstrap complete: thread=${bootstrap.threadId} (${bootstrap.content.slice(0, 50)})`);
-
-        // Store threadId immediately — enables message forwarding
-        await brokerClient.updateSlot({
-          id: slot.id,
-          context_snapshot: JSON.stringify({
-            codex_thread_id: bootstrap.threadId,
-            last_summary: `Starting: ${config.initial_task.slice(0, 100)}`,
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
-
-        // Phase 2: push real task as a reply turn (runs in background)
-        const taskResult = await driver.reply(bootstrap.threadId, codexTaskPrompt);
-        log(LOG_PREFIX, `${config.name} task turn complete: ${taskResult.content.slice(0, 100)}`);
+        log(LOG_PREFIX, `${config.name} task turn complete: thread=${taskResult.threadId}`);
 
         await brokerClient.updateSlot({
           id: slot.id,
           context_snapshot: JSON.stringify({
+            optimization: modelPolicy,
+            original_task: config.initial_task,
             codex_thread_id: taskResult.threadId,
             last_summary: taskResult.content.slice(0, 200),
             last_status: "working",
@@ -493,7 +452,7 @@ export async function launchAgent(
   }
 
   // --- Claude / AGY / Custom: traditional process spawn ---
-  const args = buildCliArgs(config.agent_type, taskPrompt, spawnEnv);
+  const args = buildCliArgs(config.agent_type, taskPrompt, spawnEnv, cliPolicy);
   const cmd = AGENT_COMMANDS[config.agent_type];
 
   if (!cmd) {
@@ -563,14 +522,9 @@ export async function relaunchIntoSlot(
     "",
     handoffTask,
     "",
-    "═══ MANDATORY: USE multiagents-peer MCP TOOLS ═══",
-    "BEFORE any work: call set_summary, check_team_status, get_plan, check_messages (in that order).",
-    "AFTER every file write/shell command: call check_messages + set_summary.",
-    "WHEN done: call signal_done with proof of what you did and tested.",
-    "WHEN messaged: reply via send_message IMMEDIATELY — teammates are blocked on you.",
+    "Use multiagents-peer at meaningful milestones: check status/messages on start,",
+    "update summary only when it changes, and call signal_done with verification when done.",
     ...(isNonPush ? [`Also read .multiagents/inbox/${agentName}.md for real-time messages.`] : []),
-    "NEVER work 1+ minute without calling check_messages. NEVER finish without signal_done.",
-    "Your team CANNOT see your work unless you use these MCP tools.",
   ].join("\n");
 
   const spawnEnv: Record<string, string | undefined> = {
@@ -583,7 +537,9 @@ export async function relaunchIntoSlot(
   };
   delete spawnEnv.CLAUDECODE;
 
-  const args = buildCliArgs(slot.agent_type, taskPrompt, spawnEnv);
+  let storedPolicy: ResolvedModelPolicy | undefined;
+  try { storedPolicy = JSON.parse(slot.context_snapshot ?? "{}").optimization; } catch { /* use provider defaults */ }
+  const args = buildCliArgs(slot.agent_type, taskPrompt, spawnEnv, storedPolicy);
   const cmd = AGENT_COMMANDS[slot.agent_type];
 
   if (!cmd) {
@@ -615,7 +571,12 @@ export async function relaunchIntoSlot(
  * --mcp-config (inline JSON); for Codex this uses -c to override the
  * mcp_servers config key (replacing any broken global entries).
  */
-export function buildCliArgs(agentType: AgentType, task: string, env?: Record<string, string | undefined>): string[] {
+export function buildCliArgs(
+  agentType: AgentType,
+  task: string,
+  env?: Record<string, string | undefined>,
+  policy?: Pick<ResolvedModelPolicy, "model" | "reasoning_effort" | "max_output_tokens">,
+): string[] {
   switch (agentType) {
     case "claude": {
       // Build inline MCP config JSON for --mcp-config.
@@ -642,40 +603,48 @@ export function buildCliArgs(agentType: AgentType, task: string, env?: Record<st
           },
         },
       });
-      return [
+      const args = [
         "--print",
         "--verbose",
         "--output-format", "stream-json",
         "--max-turns", "200",
         "--dangerously-skip-permissions",
         "--mcp-config", mcpConfigJson,
-        "-p", task,
       ];
+      if (policy?.model) args.push("--model", policy.model);
+      if (policy?.reasoning_effort) args.push("--effort", policy.reasoning_effort);
+      args.push("-p", task);
+      return args;
     }
     case "codex": {
       // IMPORTANT: Codex CLI's `-c` flag does NOT support injecting MCP servers.
       // MCP servers are loaded exclusively from ~/.codex/config.toml (global).
       // The `-c mcp_servers.*` overrides are silently ignored.
       // MCP injection is handled by ensureMcpConfigs() writing to the global config.
-      return [
+      const args = [
         "exec",
         "--sandbox", "workspace-write",
         "--full-auto",
         "--json",
-        "-c", 'model_reasoning_effort="high"',
-        task,
       ];
+      if (policy?.model) args.push("--model", policy.model);
+      args.push("-c", `model_reasoning_effort="${policy?.reasoning_effort ?? "high"}"`);
+      args.push(task);
+      return args;
     }
     case "agy": {
       // Antigravity CLI is a native binary. MCP is configured globally in
       // ~/.gemini/config/mcp_config.json by ensureMcpConfigs. Headless mode
       // uses the same stream-json output contract as the previous integration.
-      return [
+      const args = [
         "--sandbox",
         "--dangerously-skip-permissions",
         "--output-format", "stream-json",
-        "-p", task,
       ];
+      if (policy?.model) args.push("--model", policy.model);
+      if (policy?.reasoning_effort) args.push("--effort", policy.reasoning_effort);
+      args.push("-p", task);
+      return args;
     }
     case "custom":
       return [task];

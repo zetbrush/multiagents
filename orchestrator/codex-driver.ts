@@ -21,6 +21,7 @@
 // ============================================================================
 
 import type { Subprocess } from "bun";
+import type { ReasoningEffort } from "../shared/types.ts";
 import { log } from "../shared/utils.ts";
 
 /** Subprocess type with all stdio set to "pipe". */
@@ -54,6 +55,14 @@ export interface CodexSessionOptions {
   baseInstructions?: string;
   developerInstructions?: string;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
+  maxOutputTokens?: number;
+}
+
+export interface CodexTurnOptions {
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  maxOutputTokens?: number;
 }
 
 /** Convert a simplified sandbox string to the Codex app-server's serde enum object.
@@ -225,6 +234,7 @@ export class CodexDriver {
     }
     if (opts.developerInstructions) turnInput.developerInstructions = opts.developerInstructions;
     if (opts.model) turnInput.model = opts.model;
+    if (opts.reasoningEffort) turnInput.effort = opts.reasoningEffort;
     // Enable fully autonomous execution (equivalent to `codex exec -a never`).
     // Without this, MCP tool calls require interactive approval which hangs in headless mode.
     // The schema accepts: "untrusted" | "on-failure" | "on-request" | "never"
@@ -239,14 +249,17 @@ export class CodexDriver {
   /**
    * Send a new turn to an existing thread.
    */
-  async reply(threadId: string, prompt: string): Promise<CodexTurnResult> {
+  async reply(threadId: string, prompt: string, opts: CodexTurnOptions = {}): Promise<CodexTurnResult> {
     log(LOG_PREFIX, `Reply to thread ${threadId}: ${prompt.slice(0, 100)}...`);
 
-    const result = await this.startTurnAndWait(threadId, {
+    const turnInput: Record<string, unknown> = {
       threadId,
       input: [{ type: "text", text: prompt }],
       approvalPolicy: "never",
-    });
+    };
+    if (opts.model) turnInput.model = opts.model;
+    if (opts.reasoningEffort) turnInput.effort = opts.reasoningEffort;
+    const result = await this.startTurnAndWait(threadId, turnInput);
 
     log(LOG_PREFIX, `Reply complete: content=${result.content.slice(0, 100)}...`);
     return result;

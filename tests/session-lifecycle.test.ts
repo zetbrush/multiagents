@@ -245,6 +245,29 @@ describe("peek-undelivered", () => {
   });
 });
 
+describe("slot snapshot persistence", () => {
+  test("incremental summaries preserve optimizer metadata", async () => {
+    const session = await post("/sessions/create", {
+      id: uid("snapshot-session"), name: "snapshot", project_dir: "/tmp/snapshot",
+    });
+    const slot = await post("/slots/create", {
+      session_id: session.id, display_name: "Worker", agent_type: "codex", role: "Engineer",
+    });
+    await post("/slots/update", {
+      id: slot.id,
+      context_snapshot: JSON.stringify({ optimization: { tier: "economy", token_budget: 1000 } }),
+    });
+    await post("/slots/update", {
+      id: slot.id,
+      context_snapshot: JSON.stringify({ last_summary: "working", updated_at: Date.now() }),
+    });
+    const updated = await post("/slots/get", { id: slot.id });
+    const snapshot = JSON.parse(updated.context_snapshot);
+    expect(snapshot.optimization.tier).toBe("economy");
+    expect(snapshot.last_summary).toBe("working");
+  });
+});
+
 describe("Signal done notifications", () => {
   test("signal_done sends review_request to reviewer slots", async () => {
     const { session, engineer, reviewer } = await createTestSession();

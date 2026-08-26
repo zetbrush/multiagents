@@ -968,7 +968,6 @@ export abstract class BaseAdapter {
         to_id: args.to_id,
         text: args.message,
         session_id: this.sessionId ?? undefined,
-        from_slot_id: this.mySlot?.id ?? undefined,
       });
       if (!result.ok) {
         return this.errorResult(`Failed to send: ${result.error}`);
