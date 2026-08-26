@@ -20,6 +20,10 @@ import {
   RECONNECT_RECAP_LIMIT,
   DEFAULT_GUARDRAILS,
   CLEANUP_INTERVAL,
+  KNOWLEDGE_LIST_DEFAULT_LIMIT,
+  KNOWLEDGE_LIST_MAX_LIMIT,
+  KNOWLEDGE_VALUE_PREVIEW_CHARS,
+  KNOWLEDGE_VALUE_MAX_CHARS,
 } from "./shared/constants.ts";
 import { generatePeerId } from "./shared/utils.ts";
 import type {
@@ -710,6 +714,12 @@ function handleKnowledgePut(body: KnowledgePutRequest): KnowledgePutResponse {
   if (!body.session_id) throw new Error("session_id required");
   if (!body.key || !body.key.trim()) throw new Error("key required");
   if (!body.value || !body.value.trim()) throw new Error("value required");
+  if (body.value.length > KNOWLEDGE_VALUE_MAX_CHARS) {
+    throw new Error(
+      `value too long: ${body.value.length} chars (max ${KNOWLEDGE_VALUE_MAX_CHARS}). ` +
+        `Store a summary instead, or split across multiple keys.`
+    );
+  }
 
   const now = Date.now();
   const category = body.category ?? "context";
@@ -742,12 +752,59 @@ function handleKnowledgeGet(body: KnowledgeGetRequest): KnowledgeEntry | { error
   return entry;
 }
 
+/**
+ * Normalize a `since` cutoff to ms-epoch. Accepts a number (ms), a numeric
+ * string, or an ISO timestamp. Returns null for anything unparseable so a
+ * malformed cutoff degrades to "no filter" rather than hiding every entry.
+ */
+function parseSince(since: number | string | undefined): number | null {
+  if (since === undefined || since === null || since === "") return null;
+  const numeric = Number(since);
+  if (Number.isFinite(numeric)) return numeric;
+  const parsed = Date.parse(String(since));
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Shorten a value to a preview, tagging it so callers know to re-query with `full: true`.
+ * Returns the entry untouched when it already fits.
+ */
+function previewKnowledgeValue(entry: KnowledgeEntry): KnowledgeEntry {
+  if (entry.value.length <= KNOWLEDGE_VALUE_PREVIEW_CHARS) return entry;
+  return {
+    ...entry,
+    value: `${entry.value.slice(0, KNOWLEDGE_VALUE_PREVIEW_CHARS)}... [truncated, ${entry.value.length} chars total — use knowledge_get for the full value]`,
+    truncated: true,
+  };
+}
+
 function handleKnowledgeList(body: KnowledgeListRequest): KnowledgeEntry[] {
   if (!body.session_id) return [];
+
+  // Clamp rather than reject: an oversized limit is a caller mistake, not a failure.
+  const requested = Number(body.limit);
+  const limit = Number.isFinite(requested) && requested > 0
+    ? Math.min(Math.floor(requested), KNOWLEDGE_LIST_MAX_LIMIT)
+    : KNOWLEDGE_LIST_DEFAULT_LIMIT;
+
+  const where = ["session_id = ?"];
+  const params: (string | number)[] = [body.session_id];
   if (body.category) {
-    return db.query("SELECT * FROM knowledge WHERE session_id = ? AND category = ? ORDER BY updated_at DESC").all(body.session_id, body.category) as KnowledgeEntry[];
+    where.push("category = ?");
+    params.push(body.category);
   }
-  return db.query("SELECT * FROM knowledge WHERE session_id = ? ORDER BY updated_at DESC").all(body.session_id) as KnowledgeEntry[];
+  const since = parseSince(body.since);
+  if (since !== null) {
+    where.push("updated_at >= ?");
+    params.push(since);
+  }
+  params.push(limit);
+
+  const entries = db
+    .query(`SELECT * FROM knowledge WHERE ${where.join(" AND ")} ORDER BY updated_at DESC LIMIT ?`)
+    .all(...params) as KnowledgeEntry[];
+
+  return body.full === true ? entries : entries.map(previewKnowledgeValue);
 }
 
 function handleKnowledgeDelete(body: KnowledgeDeleteRequest): { ok: boolean } {

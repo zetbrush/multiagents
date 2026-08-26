@@ -40,6 +40,13 @@ export const SESSION_DIR = ".multiagents";
 export const SESSION_FILE = ".multiagents/session.json";
 export const RECONNECT_RECAP_LIMIT = 20; // messages to replay on reconnect
 
+// --- Knowledge store ---
+
+export const KNOWLEDGE_LIST_DEFAULT_LIMIT = 20; // entries returned by /knowledge/list when no limit given
+export const KNOWLEDGE_LIST_MAX_LIMIT = 100; // hard ceiling — larger requests are clamped, not rejected
+export const KNOWLEDGE_VALUE_PREVIEW_CHARS = 500; // per-entry value length in list results unless full: true
+export const KNOWLEDGE_VALUE_MAX_CHARS = 4000; // max stored value length — longer puts are rejected
+
 // --- Agent ID prefixes ---
 
 export const AGENT_ID_PREFIXES: Record<AgentType, string> = {

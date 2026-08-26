@@ -16,8 +16,8 @@ import type { Subprocess } from "bun";
 
 import * as fs from "node:fs";
 import { BrokerClient } from "../shared/broker-client.ts";
-import type { AgentLaunchConfig, TokenOptimizationConfig } from "../shared/types.ts";
-import { DEFAULT_OPTIMIZATION, recommendedTeamSize, rightSizeTeam } from "../shared/model-routing.ts";
+import type { AgentLaunchConfig, ResolvedModelPolicy, TokenOptimizationConfig } from "../shared/types.ts";
+import { DEFAULT_OPTIMIZATION, decayModelPolicy, escalateModelPolicy, recommendedTeamSize, rightSizeTeam } from "../shared/model-routing.ts";
 import { log, getGitRoot, slugify, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
   DEFAULT_BROKER_PORT,
@@ -56,6 +56,8 @@ interface CodexSlotState {
 const activeCodexDrivers: Map<string, Map<number, CodexSlotState>> = new Map();
 /** Slots intentionally stopped by token budgets; they must not auto-respawn. */
 const budgetStoppedSlots = new Set<number>();
+/** Slots already escalated in place by the proactive budget check (one per budget). */
+const proactivelyEscalatedSlots = new Set<number>();
 
 // --- Dashboard auto-launch ---
 
@@ -237,6 +239,113 @@ function handleEvent(event: AgentEvent): void {
 const completionRestartHistory: Map<number, number[]> = new Map();
 const COMPLETION_RESTART_LIMIT = 3; // max code-0 restarts in FLAP_WINDOW_MS
 
+// --- Model policy persistence -----------------------------------------------
+// The resolved policy lives inside slot.context_snapshot, which several call
+// sites rewrite wholesale. Always read-modify-write so a turn update can't drop
+// the routing state (or the Codex thread id) another writer put there.
+
+interface SlotPolicyContext {
+  policy: ResolvedModelPolicy;
+  snapshot: Record<string, any>;
+  config: TokenOptimizationConfig;
+}
+
+async function loadSlotPolicy(
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+): Promise<SlotPolicyContext | null> {
+  const slot = await brokerClient.getSlot(slotId);
+  const snapshot = safeJsonParse<Record<string, any>>(slot.context_snapshot, {});
+  const policy = snapshot.optimization as ResolvedModelPolicy | undefined;
+  if (!policy?.tier) return null;
+  const session = await brokerClient.getSession(sessionId);
+  const config = getOptimizationConfig(session);
+  if (config.enabled === false) return null;
+  return { policy, snapshot, config };
+}
+
+async function persistSlotPolicy(
+  slotId: number,
+  snapshot: Record<string, any>,
+  policy: ResolvedModelPolicy,
+  brokerClient: BrokerClient,
+): Promise<void> {
+  await brokerClient.updateSlot({
+    id: slotId,
+    context_snapshot: JSON.stringify({ ...snapshot, optimization: policy, updated_at: Date.now() }),
+  });
+}
+
+/**
+ * Record a turn that finished without needing an escalation. After enough clean
+ * turns decayModelPolicy steps the agent back down a tier, so a single hard task
+ * no longer pins it on `expert` for the rest of the session.
+ */
+async function recordAgentTurnSuccess(
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+): Promise<void> {
+  try {
+    const loaded = await loadSlotPolicy(slotId, sessionId, brokerClient);
+    if (!loaded) return;
+    const { policy, snapshot, config } = loaded;
+    const next = decayModelPolicy(policy, (await brokerClient.getSlot(slotId)).agent_type, config);
+    await persistSlotPolicy(slotId, snapshot, next, brokerClient);
+    if (next.tier !== policy.tier) {
+      log(LOG_PREFIX, `Decayed slot ${slotId} from ${policy.tier} to ${next.tier} after ${config.decay_after_stable_turns ?? DEFAULT_OPTIMIZATION.decay_after_stable_turns} stable turns`);
+      pendingEvents.push({
+        type: "guardrail_triggered",
+        severity: "info",
+        slotId,
+        sessionId,
+        message: `Slot ${slotId} stepped down to ${next.tier}/${next.model ?? "provider-default"} after stable turns.`,
+      });
+      // A decayed agent may climb again if the cheaper tier stalls on the budget.
+      proactivelyEscalatedSlots.delete(slotId);
+    }
+  } catch (err) {
+    log(LOG_PREFIX, `Tier decay update failed for slot ${slotId}: ${err}`);
+  }
+}
+
+/**
+ * Escalate an agent in place while it is still running, before the hard budget
+ * stop kills it. Recovery-path escalation only happens after a kill+respawn, so
+ * an agent burning through its budget on a too-weak model used to have to die
+ * first. Returns the new policy when the tier actually moved.
+ */
+async function proactivelyEscalateSlot(
+  slotId: number,
+  sessionId: string,
+  budgetPercent: number,
+  threshold: number,
+  brokerClient: BrokerClient,
+): Promise<ResolvedModelPolicy | null> {
+  if (proactivelyEscalatedSlots.has(slotId) || budgetStoppedSlots.has(slotId)) return null;
+  const loaded = await loadSlotPolicy(slotId, sessionId, brokerClient);
+  if (!loaded) return null;
+  const { policy, snapshot, config } = loaded;
+  if (!policy.auto_escalate || policy.tier === "expert") return null;
+
+  const slot = await brokerClient.getSlot(slotId);
+  const next = escalateModelPolicy(policy, slot.agent_type, config);
+  if (next.tier === policy.tier) return null;
+
+  proactivelyEscalatedSlots.add(slotId);
+  await persistSlotPolicy(slotId, snapshot, next, brokerClient);
+  log(LOG_PREFIX, `Proactively escalated slot ${slotId} to ${next.tier}/${next.model ?? "provider-default"} at ${budgetPercent}% of budget (threshold ${threshold}%)`);
+  pendingEvents.push({
+    type: "guardrail_triggered",
+    severity: "warning",
+    slotId,
+    sessionId,
+    message: `${slot.display_name ?? `Slot ${slotId}`} reached ${budgetPercent}% of its token budget — escalated to ${next.tier}/${next.model ?? "provider-default"} in place.`,
+  });
+  return next;
+}
+
 /** Check if a completed agent actually finished its task; if not, respawn it. */
 async function autoRestartIfIncomplete(
   slotId: number,
@@ -314,6 +423,7 @@ async function autoRestartIfIncomplete(
     }
 
     // Agent completed normally (done_pending_review, approved, released)
+    await recordAgentTurnSuccess(slotId, sessionId, brokerClient);
     log(LOG_PREFIX, `${name} completed with task_state="${state}" — no restart needed`);
     return false;
   } catch (err) {

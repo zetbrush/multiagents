@@ -56,13 +56,11 @@ export interface CodexSessionOptions {
   developerInstructions?: string;
   model?: string;
   reasoningEffort?: ReasoningEffort;
-  maxOutputTokens?: number;
 }
 
 export interface CodexTurnOptions {
   model?: string;
   reasoningEffort?: ReasoningEffort;
-  maxOutputTokens?: number;
 }
 
 /** Convert a simplified sandbox string to the Codex app-server's serde enum object.
@@ -176,7 +174,12 @@ export class CodexDriver {
     env: Record<string, string | undefined>,
     timeoutMs = 30_000,
   ): Promise<CodexDriver> {
-    const proc = Bun.spawn(["codex", "app-server"], {
+    const appServerArgs = ["codex", "app-server"];
+    const verbosity = env.MULTIAGENTS_CODEX_VERBOSITY;
+    if (verbosity === "low" || verbosity === "medium" || verbosity === "high") {
+      appServerArgs.push("-c", `model_verbosity="${verbosity}"`);
+    }
+    const proc = Bun.spawn(appServerArgs, {
       cwd,
       stdin: "pipe",
       stdout: "pipe",

@@ -318,7 +318,7 @@ export async function launchAgent(
     `You are "${config.name}", role: ${config.role}.`,
     enrichedDescription,
     `Task: ${config.initial_task}`,
-    `Output discipline: keep summaries concise (target <= ${modelPolicy.max_output_tokens} generated tokens overall).`,
+    "Output discipline: keep summaries concise and omit repeated context.",
     "",
     "Coordinate through the multiagents-peer MCP server:",
     "- At start: set_summary, then check_team_status, get_plan and check_messages.",
@@ -334,8 +334,11 @@ export async function launchAgent(
     PATH: ENRICHED_PATH,
     MULTIAGENTS_SESSION: sessionId,
     MULTIAGENTS_ROLE: config.role,
+    MULTIAGENTS_ROLE_DESCRIPTION: enrichedDescription,
     MULTIAGENTS_NAME: config.name,
     MULTIAGENTS_SLOT: String(slot.id),
+    MULTIAGENTS_TIER: cliPolicy?.tier,
+    MULTIAGENTS_CODEX_VERBOSITY: cliPolicy ? (cliPolicy.tier === "expert" ? "medium" : "low") : undefined,
   };
   delete spawnEnv.CLAUDECODE;
 
@@ -398,11 +401,7 @@ export async function launchAgent(
     // The developerInstructions already cover MCP tools — keep the task prompt
     // focused on the actual task with minimal MCP instructions.
     const codexTaskPrompt = [
-      `You are "${config.name}", role: ${config.role}.`,
-      enrichedDescription,
-      "",
       config.initial_task,
-      `Keep generated prose concise; target no more than ${modelPolicy.max_output_tokens} output tokens.`,
       "",
       "After completing your task:",
       "  → Call signal_done (multiagents-peer MCP tool) with proof of what you did",
@@ -422,7 +421,6 @@ export async function launchAgent(
           developerInstructions,
           model: cliPolicy?.model,
           reasoningEffort: cliPolicy?.reasoning_effort,
-          maxOutputTokens: cliPolicy?.max_output_tokens,
         });
         log(LOG_PREFIX, `${config.name} task turn complete: thread=${taskResult.threadId}`);
 
@@ -475,7 +473,14 @@ export async function launchAgent(
     if (!fs.existsSync(slotsDir)) fs.mkdirSync(slotsDir, { recursive: true });
     fs.writeFileSync(
       path.join(slotsDir, `${proc.pid}.json`),
-      JSON.stringify({ slot_id: slot.id, role: config.role, name: config.name, session_id: sessionId }),
+      JSON.stringify({
+        slot_id: slot.id,
+        role: config.role,
+        role_description: enrichedDescription,
+        name: config.name,
+        session_id: sessionId,
+        tier: cliPolicy?.tier,
+      }),
     );
   } catch { /* best effort */ }
 
@@ -527,18 +532,22 @@ export async function relaunchIntoSlot(
     ...(isNonPush ? [`Also read .multiagents/inbox/${agentName}.md for real-time messages.`] : []),
   ].join("\n");
 
+  let storedPolicy: ResolvedModelPolicy | undefined;
+  try { storedPolicy = JSON.parse(slot.context_snapshot ?? "{}").optimization; } catch { /* use provider defaults */ }
+
   const spawnEnv: Record<string, string | undefined> = {
     ...process.env,
     PATH: ENRICHED_PATH,
     MULTIAGENTS_SESSION: sessionId,
     MULTIAGENTS_ROLE: slot.role ?? undefined,
+    MULTIAGENTS_ROLE_DESCRIPTION: enrichedDescription,
     MULTIAGENTS_NAME: slot.display_name ?? undefined,
     MULTIAGENTS_SLOT: String(slot.id),
+    MULTIAGENTS_TIER: storedPolicy?.tier,
+    MULTIAGENTS_CODEX_VERBOSITY: storedPolicy ? (storedPolicy.tier === "expert" ? "medium" : "low") : undefined,
   };
   delete spawnEnv.CLAUDECODE;
 
-  let storedPolicy: ResolvedModelPolicy | undefined;
-  try { storedPolicy = JSON.parse(slot.context_snapshot ?? "{}").optimization; } catch { /* use provider defaults */ }
   const args = buildCliArgs(slot.agent_type, taskPrompt, spawnEnv, storedPolicy);
   const cmd = AGENT_COMMANDS[slot.agent_type];
 
@@ -593,7 +602,9 @@ export function buildCliArgs(
       if (env?.MULTIAGENTS_SESSION) mcpArgs.push("--session", env.MULTIAGENTS_SESSION);
       if (env?.MULTIAGENTS_SLOT) mcpArgs.push("--slot", env.MULTIAGENTS_SLOT);
       if (env?.MULTIAGENTS_ROLE) mcpArgs.push("--role", env.MULTIAGENTS_ROLE);
+      if (env?.MULTIAGENTS_ROLE_DESCRIPTION) mcpArgs.push("--role-description", env.MULTIAGENTS_ROLE_DESCRIPTION);
       if (env?.MULTIAGENTS_NAME) mcpArgs.push("--name", env.MULTIAGENTS_NAME);
+      if (env?.MULTIAGENTS_TIER) mcpArgs.push("--tier", env.MULTIAGENTS_TIER);
 
       const mcpConfigJson = JSON.stringify({
         mcpServers: {

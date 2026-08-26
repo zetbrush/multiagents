@@ -15,6 +15,7 @@ import {
   DEFAULT_BROKER_PORT,
   BROKER_HOSTNAME,
   DASHBOARD_REFRESH,
+  KNOWLEDGE_LIST_MAX_LIMIT,
 } from "../shared/constants.ts";
 import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
@@ -102,7 +103,8 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
       broker.listFileLocks(sessionId).catch(() => []),
       broker.listFileOwnership(sessionId).catch(() => []),
       broker.getPlan(sessionId).catch(() => null),
-      broker.listKnowledge(sessionId).catch(() => []),
+      // Dashboard renders for a human, not an agent context window — take the full window.
+      broker.listKnowledge(sessionId, undefined, { limit: KNOWLEDGE_LIST_MAX_LIMIT, full: true }).catch(() => []),
     ]);
 
     // Get peers for slot enrichment

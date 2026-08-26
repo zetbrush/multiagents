@@ -140,6 +140,16 @@ describe("buildCliArgs — claude", () => {
     expect(mcpJson.mcpServers["multiagents-peer"].args).toContain("claude");
   });
 
+  test("forwards optimizer tier and role description to the MCP adapter", () => {
+    const args = buildCliArgs("claude", task, {
+      MULTIAGENTS_TIER: "economy",
+      MULTIAGENTS_ROLE_DESCRIPTION: "Implement a bounded change.",
+    });
+    const mcpArgs = JSON.parse(getFlagValue(args, "--mcp-config")).mcpServers["multiagents-peer"].args;
+    expect(getFlagValue(mcpArgs, "--tier")).toBe("economy");
+    expect(getFlagValue(mcpArgs, "--role-description")).toBe("Implement a bounded change.");
+  });
+
   test("ends with -p and the task", () => {
     const args = buildCliArgs("claude", task);
     const pIdx = args.lastIndexOf("-p");

@@ -367,3 +367,84 @@ export function getStructuredRolePractices(
     completionCriteria: completionParts.join("\n"),
   };
 }
+
+// ---------------------------------------------------------------------------
+// Role Handoff Protocols
+// ---------------------------------------------------------------------------
+// Step-by-step review/QA handoff loops. These used to live inline in
+// base-adapter's lifecycle prompt and were injected into every agent
+// regardless of role. They are now matched to the agent's role so an
+// engineer never pays for the QA protocol (and vice versa).
+
+interface HandoffProtocol {
+  keywords: string[];
+  category: string;
+  protocol: string;
+}
+
+const HANDOFF_PROTOCOLS: HandoffProtocol[] = [
+  {
+    keywords: ["software engineer", "engineer", "developer", "programmer", "implementer", "fullstack", "full-stack"],
+    category: "engineer",
+    protocol: `HANDOFF PROTOCOL (Software Engineer):
+  1. Read the spec/task → identify ALL unknowns → ask the owner via send_message until zero remain
+  2. Implement with TDD: failing test → implement → verify → refactor
+  3. Run linters, type checkers, and the full test suite. Fix ALL issues.
+  4. signal_done with proof: test output, build log, manual verification results
+  5. Fix ALL [BLOCKING] reviewer items and every QA bug → signal_done again
+  6. Loop until BOTH the Code Reviewer AND QA have called approve() on you`,
+  },
+  {
+    keywords: ["designer", "ui/ux", "ux", "ui designer", "product designer"],
+    category: "designer",
+    protocol: `HANDOFF PROTOCOL (UI/UX Designer):
+  1. Analyze requirements → produce a spec covering ALL component states
+  2. signal_done with the spec deliverable
+  3. Answer engineer questions immediately via send_message — they are blocked on you
+  4. Review the implementation against your spec → give specific visual feedback
+  5. Done when the implementation matches the spec AND QA approves accessibility`,
+  },
+  {
+    keywords: ["reviewer", "code review", "code reviewer", "tech lead", "architect"],
+    category: "reviewer",
+    protocol: `HANDOFF PROTOCOL (Code Reviewer):
+  1. Watch check_team_status — start the moment an engineer hits "done_pending_review"
+  2. Read ALL changed files and trace cross-file dependencies
+  3. Check security (OWASP Top 10), performance, architecture, code smells, test coverage
+  4. submit_feedback prefixed [BLOCKING] for must-fix, [SUGGESTION] for nice-to-have
+  5. After fixes, RE-REVIEW every prior [BLOCKING] item plus the new changes
+  6. approve() only when zero [BLOCKING] issues remain — QA may trigger another round`,
+  },
+  {
+    keywords: ["qa", "quality assurance", "tester", "test engineer", "sdet"],
+    category: "qa",
+    protocol: `HANDOFF PROTOCOL (QA Engineer):
+  1. Watch check_team_status — start the moment an engineer hits "done_pending_review"
+  2. Design a platform-appropriate test plan (see your ROLE-SPECIFIC PRACTICES)
+  3. Execute happy path + edge cases + error states + platform lifecycle
+  4. Use the real tools: browser automation for web, emulator for mobile, CLI for commands
+  5. submit_feedback(actionable=true) with [P0-P3] severity + file:line + repro steps
+  6. After fixes, RE-TEST every bug and run regression on related features
+  7. approve() only when all P0/P1 bugs are fixed and the app works end-to-end
+  8. Missing infrastructure? send_message(to_id="orchestrator", "BLOCKED: Need [what] for [why]")`,
+  },
+];
+
+/**
+ * Match role + description and return the handoff protocol(s) for that role.
+ * Returns null when no role matches — callers should then inject nothing
+ * rather than falling back to every protocol.
+ */
+export function getRoleHandoffProtocol(
+  role?: string | null,
+  roleDescription?: string | null,
+): string | null {
+  if (!role && !roleDescription) return null;
+
+  const haystack = `${role ?? ""} ${roleDescription ?? ""}`.toLowerCase();
+  const matched = HANDOFF_PROTOCOLS
+    .filter(p => p.keywords.some(kw => haystack.includes(kw)))
+    .map(p => p.protocol);
+
+  return matched.length > 0 ? matched.join("\n\n") : null;
+}

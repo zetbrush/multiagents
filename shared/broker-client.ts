@@ -260,8 +260,18 @@ export class BrokerClient {
     return this.post("/knowledge/get", { session_id: sessionId, key });
   }
 
-  listKnowledge(sessionId: string, category?: KnowledgeCategory): Promise<KnowledgeEntry[]> {
-    return this.post("/knowledge/list", { session_id: sessionId, category });
+  /**
+   * List knowledge entries, newest first. Bounded by default: at most
+   * KNOWLEDGE_LIST_DEFAULT_LIMIT entries, each value shortened to a preview.
+   * Pass `full: true` for untruncated values and `limit` (max
+   * KNOWLEDGE_LIST_MAX_LIMIT) / `since` (ms-epoch) to widen or narrow the window.
+   */
+  listKnowledge(
+    sessionId: string,
+    category?: KnowledgeCategory,
+    opts?: { limit?: number; since?: number | string; full?: boolean }
+  ): Promise<KnowledgeEntry[]> {
+    return this.post("/knowledge/list", { session_id: sessionId, category, ...opts });
   }
 
   deleteKnowledge(sessionId: string, key: string): Promise<{ ok: boolean }> {

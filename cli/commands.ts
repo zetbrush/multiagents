@@ -311,8 +311,12 @@ export async function runCli(args: string[]): Promise<void> {
       if (slotIdx !== -1 && args[slotIdx + 1]) process.env.MULTIAGENTS_SLOT = args[slotIdx + 1];
       const roleIdx = args.indexOf("--role");
       if (roleIdx !== -1 && args[roleIdx + 1]) process.env.MULTIAGENTS_ROLE = args[roleIdx + 1];
+      const roleDescriptionIdx = args.indexOf("--role-description");
+      if (roleDescriptionIdx !== -1 && args[roleDescriptionIdx + 1]) process.env.MULTIAGENTS_ROLE_DESCRIPTION = args[roleDescriptionIdx + 1];
       const nameIdx = args.indexOf("--name");
       if (nameIdx !== -1 && args[nameIdx + 1]) process.env.MULTIAGENTS_NAME = args[nameIdx + 1];
+      const tierIdx = args.indexOf("--tier");
+      if (tierIdx !== -1 && args[tierIdx + 1]) process.env.MULTIAGENTS_TIER = args[tierIdx + 1];
       await import("../server.ts");
       break;
     }

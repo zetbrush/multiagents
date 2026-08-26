@@ -212,8 +212,11 @@ export async function respawnAgent(
       MULTIAGENTS_SESSION: sessionId,
       MULTIAGENTS_SLOT: String(slotId),
       MULTIAGENTS_ROLE: slot.role ?? undefined,
+      MULTIAGENTS_ROLE_DESCRIPTION: slot.role_description ?? undefined,
       MULTIAGENTS_NAME: slot.display_name ?? undefined,
       MULTIAGENTS_DRIVER_MODE: "1",
+      MULTIAGENTS_TIER: recoveryPolicy?.tier,
+      MULTIAGENTS_CODEX_VERBOSITY: recoveryPolicy ? (recoveryPolicy.tier === "expert" ? "medium" : "low") : undefined,
     };
     delete spawnEnv.CLAUDECODE;
 
@@ -233,7 +236,6 @@ export async function respawnAgent(
         const result = await driver.reply(previousThreadId, handoffTask, recoveryPolicy ? {
           model: recoveryPolicy.model,
           reasoningEffort: recoveryPolicy.reasoning_effort,
-          maxOutputTokens: recoveryPolicy.max_output_tokens,
         } : {});
         await brokerClient.updateSlot({
           id: slotId,
@@ -260,7 +262,6 @@ export async function respawnAgent(
       developerInstructions: slot.role_description ?? "",
       model: recoveryPolicy?.model,
       reasoningEffort: recoveryPolicy?.reasoning_effort,
-      maxOutputTokens: recoveryPolicy?.max_output_tokens,
     });
     await brokerClient.updateSlot({
       id: slotId,

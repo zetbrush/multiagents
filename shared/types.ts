@@ -45,6 +45,10 @@ export interface TokenOptimizationConfig {
   auto_escalate?: boolean;
   /** "recommend" reports excess agents; "enforce" keeps only the recommended count. */
   right_size?: "off" | "recommend" | "enforce";
+  /** Consecutive non-escalated turns before an agent steps back down one tier. Default 3. */
+  decay_after_stable_turns?: number;
+  /** Agent budget percentage that triggers an in-place tier escalation. Default 70. */
+  proactive_escalation_percent?: number;
   tiers?: Partial<Record<AgentType, Partial<Record<ModelTier, Partial<TierModelConfig>>>>>;
   /** Optional USD per million tokens, keyed by provider model name. */
   pricing?: Record<string, { input: number; output: number; cached_input?: number }>;
@@ -67,6 +71,11 @@ export interface ResolvedModelPolicy {
   auto_escalate: boolean;
   classification: TaskClassification;
   escalation_count: number;
+  /**
+   * Consecutive completed turns without an escalation. Reset on escalation and
+   * on decay; once it reaches `decay_after_stable_turns` the tier steps down.
+   */
+  stable_turns: number;
 }
 
 /** Message types for routing and formatting */
@@ -494,6 +503,8 @@ export interface KnowledgeEntry {
   created_by_name: string | null;
   created_at: number;
   updated_at: number;
+  /** Set only on /knowledge/list results whose `value` was shortened to a preview. */
+  truncated?: boolean;
 }
 
 export interface KnowledgePutRequest {
@@ -514,6 +525,12 @@ export interface KnowledgePutResponse {
 export interface KnowledgeListRequest {
   session_id: string;
   category?: KnowledgeCategory;
+  /** Max entries to return. Defaults to KNOWLEDGE_LIST_DEFAULT_LIMIT, clamped to KNOWLEDGE_LIST_MAX_LIMIT. */
+  limit?: number;
+  /** Cutoff — only entries with updated_at >= since. Ms-epoch number or ISO timestamp string. */
+  since?: number | string;
+  /** Return untruncated values instead of KNOWLEDGE_VALUE_PREVIEW_CHARS previews. */
+  full?: boolean;
 }
 
 export interface KnowledgeGetRequest {
