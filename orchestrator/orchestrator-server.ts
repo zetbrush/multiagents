@@ -156,12 +156,25 @@ function handleEvent(event: AgentEvent): void {
     return;
   }
 
-  // Auto-respawn on crash (unless flapping)
+  // Auto-respawn on crash (unless flapping, or the slot was intentionally removed/released —
+  // e.g. via remove_agent — in which case the exit is expected and must NOT respawn a bare
+  // "unassigned" ghost agent).
   if (event.type === "agent_crashed" && event.data && !event.data.is_flapping) {
     const sessionMeta = activeSessions.get(event.sessionId);
     if (sessionMeta) {
       const brokerClient = new BrokerClient(BROKER_URL);
-      handleAgentCrash(event.slotId, event.data.exit_code as number, event.sessionId, brokerClient)
+      (async () => {
+        try {
+          const slot = await brokerClient.getSlot(event.slotId);
+          if (slot?.task_state === "released") {
+            log(LOG_PREFIX, `Slot ${event.slotId} exited after being released — not respawning.`);
+            return;
+          }
+        } catch {
+          // If we can't confirm the slot's state, fall through to existing crash handling
+          // rather than silently dropping a real crash.
+        }
+        return handleAgentCrash(event.slotId, event.data!.exit_code as number, event.sessionId, brokerClient)
         .then(async (crashEvent) => {
           pendingEvents.push(crashEvent);
           if (!crashEvent.data?.is_flapping) {
@@ -213,6 +226,7 @@ function handleEvent(event: AgentEvent): void {
           }
         })
         .catch((err) => log(LOG_PREFIX, `Crash handler error: ${err}`));
+      })().catch((err) => log(LOG_PREFIX, `Crash handler error: ${err}`));
     }
   } else if (event.type === "agent_completed" && event.data) {
     // Codex agents exit with code 0 when they finish their turn, but they may
@@ -1195,6 +1209,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: `Could not find agent matching "${target}".` }] };
         }
 
+        // Mark as released BEFORE killing so the exit handler (agent_crashed) and the
+        // stale-message watchdog both see "released" and skip auto-respawn. Without this
+        // ordering, killing the process races the crash handler and the slot respawns as
+        // a bare "unassigned" ghost agent (see recovery.ts / handleEvent's agent_crashed path).
+        await brokerClient.updateSlot({ id: slot.id, status: "disconnected", task_state: "released" });
+
         // Kill the process if we have it
         const sessionProcs = activeProcesses.get(session_id);
         if (sessionProcs) {
@@ -1205,8 +1225,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         }
 
-        // Update slot to disconnected
-        await brokerClient.updateSlot({ id: slot.id, status: "disconnected" });
+        // Codex agents run under a CodexDriver, not a plain Subprocess — kill that too and
+        // stop tracking it, otherwise its own onExit handler fires agent_crashed independently.
+        const sessionDrivers = activeCodexDrivers.get(session_id);
+        const driverState = sessionDrivers?.get(slot.id);
+        if (driverState) {
+          driverState.driver.kill().catch(() => { /* already dead */ });
+          sessionDrivers?.delete(slot.id);
+        }
+
+        clearSlotTracking(slot.id);
 
         // Notify remaining team
         const slots = await brokerClient.listSlots(session_id);
