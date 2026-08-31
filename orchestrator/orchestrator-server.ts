@@ -27,7 +27,7 @@ import {
   FLAP_WINDOW_MS,
 } from "../shared/constants.ts";
 
-import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
+import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, killProcessTree } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
 import { monitorProcess, monitorCodexDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
@@ -1220,6 +1220,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionProcs) {
           const proc = sessionProcs.get(slot.id);
           if (proc) {
+            killProcessTree(proc.pid);
             proc.kill();
             sessionProcs.delete(slot.id);
           }
@@ -1230,6 +1231,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const sessionDrivers = activeCodexDrivers.get(session_id);
         const driverState = sessionDrivers?.get(slot.id);
         if (driverState) {
+          killProcessTree(driverState.driver.pid);
           driverState.driver.kill().catch(() => { /* already dead */ });
           sessionDrivers?.delete(slot.id);
         }
@@ -1435,7 +1437,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionProcs) {
           for (const [slotId, proc] of sessionProcs) {
             log(LOG_PREFIX, `Stopping agent in slot ${slotId}`);
-            try { proc.kill(); } catch { /* already dead */ }
+            try { killProcessTree(proc.pid); proc.kill(); } catch { /* already dead */ }
           }
           sessionProcs.clear();
           activeProcesses.delete(session_id);
@@ -1446,7 +1448,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionDrivers) {
           for (const [slotId, state] of sessionDrivers) {
             log(LOG_PREFIX, `Stopping Codex driver in slot ${slotId}`);
-            try { state.driver.kill(); } catch { /* already dead */ }
+            try { killProcessTree(state.driver.pid); state.driver.kill(); } catch { /* already dead */ }
           }
           sessionDrivers.clear();
           activeCodexDrivers.delete(session_id);
@@ -2160,7 +2162,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             const sessionProcs = activeProcesses.get(sessionId);
             if (sessionProcs) {
               for (const [slotId, proc] of sessionProcs) {
-                try { proc.kill(); } catch { /* already dead */ }
+                try { killProcessTree(proc.pid); proc.kill(); } catch { /* already dead */ }
               }
               sessionProcs.clear();
               activeProcesses.delete(sessionId);
@@ -2168,7 +2170,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             const sessionDrivers = activeCodexDrivers.get(sessionId);
             if (sessionDrivers) {
               for (const [, state] of sessionDrivers) {
-                try { state.driver.kill(); } catch { /* already dead */ }
+                try { killProcessTree(state.driver.pid); state.driver.kill(); } catch { /* already dead */ }
               }
               sessionDrivers.clear();
               activeCodexDrivers.delete(sessionId);

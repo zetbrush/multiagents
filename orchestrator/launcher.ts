@@ -21,6 +21,52 @@ const LOG_PREFIX = "launcher";
 const CLI_PATH = path.resolve(import.meta.dir, "..", "cli.ts");
 
 /**
+ * Kill a process and every descendant it spawned (e.g. the `bun cli.ts
+ * mcp-server --agent-type <x>` grandchild each agent CLI spawns on its own
+ * to talk to multiagents-peer tools — see the `.multiagents/slots/<ppid>.json`
+ * handoff below, which relies on that process being a direct child of the
+ * agent CLI's PID).
+ *
+ * `Subprocess.kill()` only signals the one PID; it does not cascade to
+ * children the process spawned itself, and those grandchildren have been
+ * observed to survive their parent's death indefinitely (they don't inherit
+ * a SIGTERM/SIGHUP from losing their parent on Linux unless explicitly
+ * process-grouped). Every call site that terminates an agent process
+ * (`remove_agent`, `end_session`, the all-approved auto-end) must use this
+ * instead of `proc.kill()` alone, or it leaks one `mcp-server` process (plus
+ * whatever that spawns) per agent every time a session ends.
+ *
+ * Linux-only (`pgrep -P`); best-effort — failures are swallowed since this
+ * is cleanup, not correctness-critical.
+ */
+export function killProcessTree(pid: number): void {
+  const toVisit = [pid];
+  const descendants: number[] = [];
+
+  while (toVisit.length > 0) {
+    const current = toVisit.pop()!;
+    try {
+      const result = Bun.spawnSync(["pgrep", "-P", String(current)]);
+      const output = new TextDecoder().decode(result.stdout).trim();
+      if (!output) continue;
+      for (const line of output.split("\n")) {
+        const childPid = parseInt(line, 10);
+        if (!isNaN(childPid)) {
+          descendants.push(childPid);
+          toVisit.push(childPid);
+        }
+      }
+    } catch { /* pgrep unavailable or process gone — best effort */ }
+  }
+
+  // Kill leaves-first (reverse discovery order) so a parent isn't gone before
+  // we've had a chance to find its own children via pgrep.
+  for (const descendantPid of descendants.reverse()) {
+    try { process.kill(descendantPid, "SIGTERM"); } catch { /* already dead */ }
+  }
+}
+
+/**
  * Build a PATH that includes common CLI installation directories.
  * GUI apps (like Claude Desktop) don't load shell profiles, so their PATH
  * is minimal (just /usr/bin:/bin:/usr/sbin:/sbin). This ensures `which`
