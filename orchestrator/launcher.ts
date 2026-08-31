@@ -67,6 +67,44 @@ export function killProcessTree(pid: number): void {
 }
 
 /**
+ * Sweep for `cli.ts mcp-server` processes belonging to this session and kill
+ * them, regardless of current parentage.
+ *
+ * killProcessTree(pid) above only helps if the top-level agent process is
+ * still alive (or was just alive) when we walk `pgrep -P`. For agy — unlike
+ * claude/codex, which bake `--session <id>` into the mcp-server's own args —
+ * the agent CLI exits and its mcp-server grandchild gets reparented (often
+ * to PID 1) well before end_session/auto-end ever runs, especially since agy
+ * turns tend to finish fast. By then `pgrep -P <original top-level pid>`
+ * finds nothing: the grandchild's parent link is already gone.
+ *
+ * MULTIAGENTS_SESSION is set in spawnEnv on the top-level process and
+ * inherited by every descendant it spawns — that inheritance is a property
+ * of the process's own environment block, unaffected by reparenting. So
+ * instead of walking ancestry, scan every running mcp-server process's
+ * environment for this session's id.
+ *
+ * Linux-only (/proc/<pid>/environ), best-effort.
+ */
+export function killSessionMcpServers(sessionId: string): void {
+  try {
+    const result = Bun.spawnSync(["pgrep", "-f", "cli.ts mcp-server"]);
+    const output = new TextDecoder().decode(result.stdout).trim();
+    if (!output) return;
+    for (const line of output.split("\n")) {
+      const pid = parseInt(line, 10);
+      if (isNaN(pid)) continue;
+      try {
+        const environ = fs.readFileSync(`/proc/${pid}/environ`, "latin1");
+        if (environ.split("\0").includes(`MULTIAGENTS_SESSION=${sessionId}`)) {
+          process.kill(pid, "SIGTERM");
+        }
+      } catch { /* process exited mid-scan, or /proc unavailable — skip */ }
+    }
+  } catch { /* pgrep unavailable — best effort */ }
+}
+
+/**
  * Build a PATH that includes common CLI installation directories.
  * GUI apps (like Claude Desktop) don't load shell profiles, so their PATH
  * is minimal (just /usr/bin:/bin:/usr/sbin:/sbin). This ensures `which`

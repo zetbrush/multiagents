@@ -27,7 +27,7 @@ import {
   FLAP_WINDOW_MS,
 } from "../shared/constants.ts";
 
-import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, killProcessTree } from "./launcher.ts";
+import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, killProcessTree, killSessionMcpServers } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
 import { monitorProcess, monitorCodexDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
@@ -1454,6 +1454,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           activeCodexDrivers.delete(session_id);
         }
 
+        // Catch mcp-server grandchildren whose top-level agent process already
+        // exited on its own before the kills above ran (common with agy —
+        // see killSessionMcpServers's docstring) and so were never reachable
+        // via killProcessTree's ancestry walk.
+        killSessionMcpServers(session_id);
+
         // Clean driver-mode sentinel file
         try {
           const session = await brokerClient.getSession(session_id);
@@ -2175,6 +2181,8 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
               sessionDrivers.clear();
               activeCodexDrivers.delete(sessionId);
             }
+
+            killSessionMcpServers(sessionId);
 
             // Mark all connected slots as disconnected
             for (const slot of slots) {
