@@ -27,7 +27,7 @@ import {
   FLAP_WINDOW_MS,
 } from "../shared/constants.ts";
 
-import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, killProcessTree, killSessionMcpServers } from "./launcher.ts";
+import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, killPidTreeVerified, killSessionMcpServers } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
 import { monitorProcess, monitorCodexDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
@@ -400,6 +400,16 @@ async function autoRestartIfIncomplete(
         log(LOG_PREFIX, `No session metadata for ${sessionId}, cannot restart`);
         return false;
       }
+
+      // The exiting process reported code 0, but its own children (notably the
+      // `cli.ts mcp-server` grandchild each agent CLI spawns) can outlive it as
+      // orphans. Kill the previous generation's tree before overwriting the
+      // tracked handle below, or that orphan is never reachable again — it was
+      // the source of ghost processes surviving end_session entirely.
+      const priorDriver = activeCodexDrivers.get(sessionId)?.get(slotId);
+      if (priorDriver) { void killPidTreeVerified(priorDriver.driver.pid); }
+      const priorProc = activeProcesses.get(sessionId)?.get(slotId);
+      if (priorProc) { void killPidTreeVerified(priorProc.pid); }
 
       const { respawnAgent } = await import("./recovery.ts");
       const result = await respawnAgent(sessionId, slotId, brokerClient, sessionMeta.projectDir);
@@ -1220,8 +1230,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionProcs) {
           const proc = sessionProcs.get(slot.id);
           if (proc) {
-            killProcessTree(proc.pid);
-            proc.kill();
+            await killPidTreeVerified(proc.pid);
             sessionProcs.delete(slot.id);
           }
         }
@@ -1231,7 +1240,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const sessionDrivers = activeCodexDrivers.get(session_id);
         const driverState = sessionDrivers?.get(slot.id);
         if (driverState) {
-          killProcessTree(driverState.driver.pid);
+          await killPidTreeVerified(driverState.driver.pid);
           driverState.driver.kill().catch(() => { /* already dead */ });
           sessionDrivers?.delete(slot.id);
         }
@@ -1437,7 +1446,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionProcs) {
           for (const [slotId, proc] of sessionProcs) {
             log(LOG_PREFIX, `Stopping agent in slot ${slotId}`);
-            try { killProcessTree(proc.pid); proc.kill(); } catch { /* already dead */ }
+            try { await killPidTreeVerified(proc.pid); } catch { /* already dead */ }
           }
           sessionProcs.clear();
           activeProcesses.delete(session_id);
@@ -1448,7 +1457,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionDrivers) {
           for (const [slotId, state] of sessionDrivers) {
             log(LOG_PREFIX, `Stopping Codex driver in slot ${slotId}`);
-            try { killProcessTree(state.driver.pid); state.driver.kill(); } catch { /* already dead */ }
+            try { await killPidTreeVerified(state.driver.pid); state.driver.kill(); } catch { /* already dead */ }
           }
           sessionDrivers.clear();
           activeCodexDrivers.delete(session_id);
@@ -2168,7 +2177,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             const sessionProcs = activeProcesses.get(sessionId);
             if (sessionProcs) {
               for (const [slotId, proc] of sessionProcs) {
-                try { killProcessTree(proc.pid); proc.kill(); } catch { /* already dead */ }
+                try { await killPidTreeVerified(proc.pid); } catch { /* already dead */ }
               }
               sessionProcs.clear();
               activeProcesses.delete(sessionId);
@@ -2176,7 +2185,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             const sessionDrivers = activeCodexDrivers.get(sessionId);
             if (sessionDrivers) {
               for (const [, state] of sessionDrivers) {
-                try { killProcessTree(state.driver.pid); state.driver.kill(); } catch { /* already dead */ }
+                try { await killPidTreeVerified(state.driver.pid); state.driver.kill(); } catch { /* already dead */ }
               }
               sessionDrivers.clear();
               activeCodexDrivers.delete(sessionId);
@@ -2289,8 +2298,16 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             const sessionProcs = activeProcesses.get(sessionId);
             const proc = sessionProcs?.get(slot.id);
             if (proc) {
-              try { proc.kill(); } catch { /* ok */ }
+              await killPidTreeVerified(proc.pid);
               sessionProcs?.delete(slot.id);
+            }
+            // Codex agents run under a CodexDriver, not a plain Subprocess — same
+            // orphaned-grandchild risk applies here, kill it before respawning too.
+            const staleDriver = activeCodexDrivers.get(sessionId)?.get(slot.id);
+            if (staleDriver) {
+              await killPidTreeVerified(staleDriver.driver.pid);
+              staleDriver.driver.kill().catch(() => { /* already dead */ });
+              activeCodexDrivers.get(sessionId)?.delete(slot.id);
             }
             // Brief wait for broker to register disconnect
             await new Promise((r) => setTimeout(r, 1000));

@@ -21,56 +21,10 @@ const LOG_PREFIX = "launcher";
 const CLI_PATH = path.resolve(import.meta.dir, "..", "cli.ts");
 
 /**
- * Kill a process and every descendant it spawned (e.g. the `bun cli.ts
- * mcp-server --agent-type <x>` grandchild each agent CLI spawns on its own
- * to talk to multiagents-peer tools — see the `.multiagents/slots/<ppid>.json`
- * handoff below, which relies on that process being a direct child of the
- * agent CLI's PID).
- *
- * `Subprocess.kill()` only signals the one PID; it does not cascade to
- * children the process spawned itself, and those grandchildren have been
- * observed to survive their parent's death indefinitely (they don't inherit
- * a SIGTERM/SIGHUP from losing their parent on Linux unless explicitly
- * process-grouped). Every call site that terminates an agent process
- * (`remove_agent`, `end_session`, the all-approved auto-end) must use this
- * instead of `proc.kill()` alone, or it leaks one `mcp-server` process (plus
- * whatever that spawns) per agent every time a session ends.
- *
- * Linux-only (`pgrep -P`); best-effort — failures are swallowed since this
- * is cleanup, not correctness-critical.
- */
-export function killProcessTree(pid: number): void {
-  const toVisit = [pid];
-  const descendants: number[] = [];
-
-  while (toVisit.length > 0) {
-    const current = toVisit.pop()!;
-    try {
-      const result = Bun.spawnSync(["pgrep", "-P", String(current)]);
-      const output = new TextDecoder().decode(result.stdout).trim();
-      if (!output) continue;
-      for (const line of output.split("\n")) {
-        const childPid = parseInt(line, 10);
-        if (!isNaN(childPid)) {
-          descendants.push(childPid);
-          toVisit.push(childPid);
-        }
-      }
-    } catch { /* pgrep unavailable or process gone — best effort */ }
-  }
-
-  // Kill leaves-first (reverse discovery order) so a parent isn't gone before
-  // we've had a chance to find its own children via pgrep.
-  for (const descendantPid of descendants.reverse()) {
-    try { process.kill(descendantPid, "SIGTERM"); } catch { /* already dead */ }
-  }
-}
-
-/**
  * Sweep for `cli.ts mcp-server` processes belonging to this session and kill
  * them, regardless of current parentage.
  *
- * killProcessTree(pid) above only helps if the top-level agent process is
+ * killPidTreeVerified(pid) below only helps if the top-level agent process is
  * still alive (or was just alive) when we walk `pgrep -P`. For agy — unlike
  * claude/codex, which bake `--session <id>` into the mcp-server's own args —
  * the agent CLI exits and its mcp-server grandchild gets reparented (often
@@ -86,6 +40,63 @@ export function killProcessTree(pid: number): void {
  *
  * Linux-only (/proc/<pid>/environ), best-effort.
  */
+/**
+ * Kill a process and its full descendant tree (including the root pid itself),
+ * verifying each target actually died and escalating to SIGKILL after a grace
+ * period for any that ignored SIGTERM.
+ *
+ * Replaces the old pattern of `killProcessTree(pid); proc.kill()` at every
+ * termination call site (remove_agent, end_session, auto-end): that pattern
+ * fires-and-forgets SIGTERM with no verification, so a process that's
+ * mid-syscall or otherwise slow to handle the signal is silently left running
+ * — which is how ghost `codex app-server`/`mcp-server` processes were
+ * observed surviving `end_session` even though the kill code "succeeded"
+ * with no error. This is the single call site every terminator should use.
+ *
+ * Linux-only (`pgrep -P`, `/proc` not required here); best-effort — failures
+ * are swallowed since this is cleanup, not correctness-critical.
+ */
+export async function killPidTreeVerified(rootPid: number): Promise<void> {
+  const toVisit = [rootPid];
+  const targets = new Set<number>([rootPid]);
+
+  while (toVisit.length > 0) {
+    const current = toVisit.pop()!;
+    try {
+      const result = Bun.spawnSync(["pgrep", "-P", String(current)]);
+      const output = new TextDecoder().decode(result.stdout).trim();
+      if (!output) continue;
+      for (const line of output.split("\n")) {
+        const childPid = parseInt(line, 10);
+        if (!isNaN(childPid) && !targets.has(childPid)) {
+          targets.add(childPid);
+          toVisit.push(childPid);
+        }
+      }
+    } catch { /* pgrep unavailable or process gone — best effort */ }
+  }
+
+  const isAlive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+
+  // Leaves-first-ish ordering doesn't matter for SIGTERM (unlike the old
+  // discovery-order kill) since we verify and escalate below regardless.
+  for (const pid of targets) {
+    try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const survivors = [...targets].filter(isAlive);
+  if (survivors.length > 0) {
+    log(LOG_PREFIX, `SIGTERM ignored by pid(s) ${survivors.join(", ")} (rooted at ${rootPid}) — escalating to SIGKILL`);
+    for (const pid of survivors) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }
+    }
+  }
+}
+
 export function killSessionMcpServers(sessionId: string): void {
   try {
     const result = Bun.spawnSync(["pgrep", "-f", "cli.ts mcp-server"]);
