@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { validateExecutionPlan, type ExecutionStep } from "../shared/plan-execution.ts";
 // ============================================================================
 // multiagents — Orchestrator MCP Server
 // ============================================================================
@@ -37,7 +38,7 @@ import { controlSession, broadcastToTeam, resolveTarget } from "./session-contro
 import { buildOptimizationReport, formatOptimizationReport, getOptimizationConfig } from "./token-optimizer.ts";
 
 const LOG_PREFIX = "orchestrator";
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
+const BROKER_URL = `http://${BROKER_HOSTNAME}:${process.env.MULTIAGENTS_PORT ?? DEFAULT_BROKER_PORT}`;
 
 // Track active processes per session
 const activeProcesses: Map<string, Map<number, Subprocess>> = new Map();
@@ -166,7 +167,7 @@ function handleEvent(event: AgentEvent): void {
       (async () => {
         try {
           const slot = await brokerClient.getSlot(event.slotId);
-          if (slot?.task_state === "released") {
+          if (slot?.task_state === "released" || slot?.paused) {
             log(LOG_PREFIX, `Slot ${event.slotId} exited after being released — not respawning.`);
             return;
           }
@@ -367,6 +368,7 @@ async function autoRestartIfIncomplete(
   brokerClient: BrokerClient,
 ): Promise<boolean> {
   try {
+    if ((await brokerClient.getSlot(slotId)).paused) return false;
     const taskInfo = await brokerClient.getTaskState(slotId);
     const state = taskInfo.task_state;
     const name = taskInfo.display_name ?? `Slot ${slotId}`;
@@ -488,6 +490,7 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
         type: "object" as const,
         properties: {
           project_dir: { type: "string", description: "Absolute path where agents will work. Will be created if it does not exist." },
+          execution_mode: { type: "string", enum: ["team", "plan_execution"], description: "plan_execution runs one explicitly selected model through a verified sequential plan, with coordinator decisions and final approval." },
           session_name: { type: "string", description: "Short name for this session. Used to generate session_id." },
           agents: {
             type: "array",
@@ -522,6 +525,12 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
             items: {
               type: "object",
               properties: {
+                key: { type: "string" },
+                files: { type: "array", items: { type: "string" } },
+                depends_on: { type: "array", items: { type: "string" } },
+                acceptance: { type: "array", items: { type: "string" } },
+                decision_required: { type: "string" },
+                checks: { type: "array", items: { type: "object", properties: { argv: { type: "array", items: { type: "string" } }, cwd: { type: "string" }, timeout_ms: { type: "number" } }, required: ["argv", "cwd"] } },
                 label: { type: "string", description: "What needs to be done" },
                 agent_name: { type: "string", description: "Name of the agent assigned to this item" },
               },
@@ -544,6 +553,21 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
         },
         required: ["project_dir", "session_name", "agents"],
       },
+    },
+    {
+      name: "get_execution_plan",
+      description: "Get the durable execution plan, step IDs, blockers, decisions and verification evidence for coordinator review. Detailed logs remain on disk.",
+      inputSchema: { type: "object" as const, properties: { session_id: { type: "string" } }, required: ["session_id"] },
+    },
+    {
+      name: "resolve_plan_blocker",
+      description: "Coordinator decision for a blocked step or pre-execution gate. Describe the decision; optionally reopen a completed step after final review (later steps are invalidated).",
+      inputSchema: { type: "object" as const, properties: { session_id: { type: "string" }, item_id: { type: "number" }, decision: { type: "string" }, reopen: { type: "boolean" } }, required: ["session_id", "item_id", "decision"] },
+    },
+    {
+      name: "approve_execution",
+      description: "Explicit final coordinator approval after reviewing the diff and verification evidence of an autonomous plan.",
+      inputSchema: { type: "object" as const, properties: { session_id: { type: "string" }, message: { type: "string" } }, required: ["session_id", "message"] },
     },
     {
       name: "get_team_status",
@@ -789,19 +813,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
+      case "get_execution_plan": {
+        const { session_id } = args as { session_id: string };
+        const plan = await brokerClient.getPlan(session_id);
+        return { content: [{ type: "text", text: JSON.stringify(plan) }] };
+      }
+      case "resolve_plan_blocker": {
+        const req = args as { session_id: string; item_id: number; decision: string; reopen?: boolean };
+        const plan = await brokerClient.resolvePlanBlocker(req);
+        const item = plan.items.find(i => i.id === req.item_id);
+        if (item?.assigned_to_slot) await brokerClient.sendMessage({ from_id: "orchestrator", to_slot_id: item.assigned_to_slot, session_id: req.session_id, text: `Coordinator decision: ${req.decision}\nCall get_plan and continue from the first unfinished step.`, msg_type: "system" });
+        return { content: [{ type: "text", text: JSON.stringify(plan) }] };
+      }
+      case "approve_execution": {
+        const req = args as { session_id: string; message: string };
+        const session = await brokerClient.getSession(req.session_id);
+        if (JSON.parse(session.config || "{}").execution_mode !== "plan_execution") throw new Error("Not an execution session");
+        if (!req.message?.trim()) throw new Error("Provide final review findings");
+        const slots = await brokerClient.listSlots(req.session_id);
+        if (slots.length !== 1) throw new Error("Expected one execution worker");
+        const result = await brokerClient.approve({ peer_id: "orchestrator", session_id: req.session_id, target_slot_id: slots[0]!.id, message: req.message });
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      }
       // ---- create_team ----
       case "create_team": {
-        const { project_dir, session_name, agents, plan: planItems, optimization } = args as {
+        const { project_dir, session_name, agents, plan: planItems, optimization, execution_mode = "team" } = args as {
           project_dir: string;
           session_name: string;
           agents: AgentLaunchConfig[];
-          plan?: { label: string; agent_name?: string }[];
+          execution_mode?: "team" | "plan_execution";
+          plan?: (Partial<ExecutionStep> & { label: string; agent_name?: string })[];
           optimization?: TokenOptimizationConfig;
         };
+        const autonomous = execution_mode === "plan_execution";
+        if (!["team", "plan_execution"].includes(execution_mode)) throw new Error("Invalid execution mode");
+        if (autonomous) {
+          if (agents.length !== 1 || !agents[0]?.model_policy?.model?.trim()) throw new Error("Plan execution requires one worker with an explicit model");
+          validateExecutionPlan(planItems as ExecutionStep[]);
+          agents[0].model_policy = { ...agents[0].model_policy, auto_escalate: false };
+        }
         const optimizationConfig: TokenOptimizationConfig = {
           ...DEFAULT_OPTIMIZATION,
           ...(optimization ?? {}),
         };
+        if (autonomous) Object.assign(optimizationConfig, { enabled: true, auto_escalate: false, right_size: "off", decay_after_stable_turns: 0 });
         if (optimizationConfig.enabled === false) optimizationConfig.right_size = "off";
         const recommendedCount = recommendedTeamSize(agents);
         const agentsToLaunch = optimizationConfig.right_size === "enforce" && agents.length > recommendedCount
@@ -873,8 +928,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           name: session_name,
           project_dir,
           git_root: gitRoot,
-          config: { optimization: optimizationConfig },
+          config: { optimization: optimizationConfig, execution_mode },
         });
+
+        if (autonomous) await brokerClient.createPlan({ session_id: sessionId, title: session_name, items: planItems!.map(item => ({ label: item.label, execution: item as ExecutionStep })) });
 
         const sessionProcs = new Map<number, Subprocess>();
         activeProcesses.set(sessionId, sessionProcs);
@@ -934,8 +991,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // Create plan if provided, then broadcast to each agent with their assigned items
-        let planSummary = "";
-        if (planItems && planItems.length > 0) {
+        let planSummary = autonomous ? `\nAutonomous plan: ${planItems!.length} verified steps. Use resolve_plan_blocker for decisions and approve_execution for final review.` : "";
+        if (!autonomous && planItems && planItems.length > 0) {
           const slotByName = new Map(launchedAgents.map((a) => [a.name, a.slot_id]));
           const lastAgentSlot = launchedAgents[launchedAgents.length - 1]?.slot_id;
 
@@ -991,8 +1048,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           : `Optimizer team-size recommendation: ${recommendedCount} agent(s).`;
 
         // Auto-launch dashboards (TUI in terminal + web in browser)
-        launchDashboard(sessionId, project_dir);
-        launchWebDashboard(sessionId, project_dir);
+        if (!autonomous) {
+          launchDashboard(sessionId, project_dir);
+          launchWebDashboard(sessionId, project_dir);
+        }
 
         return {
           content: [{
@@ -1008,7 +1067,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "They will show as 'starting' until they register. This is NORMAL — do NOT call cleanup_dead_slots",
               "or assume agents have crashed. Wait at least 60 seconds before checking status.",
               "",
-              `Dashboard launched — run \`multiagents dashboard ${sessionId}\` to reopen.`,
+              autonomous ? `Monitor with multiagents dashboard ${sessionId}.` : `Dashboard launched — run \`multiagents dashboard ${sessionId}\` to reopen.`,
             ].join("\n"),
           }],
         };
@@ -1057,7 +1116,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           completionText = `\n\nCompletion: ${connectedAgents.length - needsWork.length}/${connectedAgents.length} agents approved. Still working: ${needsWork.map((a) => `${a.name} (${a.task_state})`).join(", ")}`;
         }
 
-        return { content: [{ type: "text", text: display + eventText + blockedText + completionText }] };
+        const session = await brokerClient.getSession(session_id);
+        let executionText = "";
+        if (JSON.parse(session.config || "{}").execution_mode === "plan_execution") {
+          const plan = await brokerClient.getPlan(session_id);
+          const current = plan.items.find(i => i.status !== "done");
+          executionText = current
+            ? `\nExecution step #${current.id}: ${current.label} (${current.status})${current.execution?.blocker ? " — " + current.execution.blocker : ""}${current.execution?.decision_required && !current.execution.decision ? " — Decision required: " + current.execution.decision_required : ""}`
+            : "\nAll steps verified. Review with get_execution_plan before approve_execution.";
+        }
+        return { content: [{ type: "text", text: display + eventText + blockedText + completionText + executionText }] };
       }
 
       // ---- get_optimization_report ----
@@ -1167,6 +1235,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const session = await brokerClient.getSession(session_id);
+        if (JSON.parse(session.config || "{}").execution_mode === "plan_execution") throw new Error("Execution mode supports one worker; create another session for a different plan");
         const config: AgentLaunchConfig = {
           agent_type,
           name: agentName,
@@ -1622,6 +1691,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const disconnected = slots.filter((s: any) =>
           s.status === "disconnected" &&
           s.task_state !== "released" &&
+          !(JSON.parse(session.config || "{}").execution_mode === "plan_execution" && (s.paused || s.task_state === "approved" || s.task_state === "done_pending_review")) &&
           !skipSet.has((s.display_name ?? "").toLowerCase()) &&
           !skipSet.has((s.role ?? "").toLowerCase())
         );
@@ -1669,7 +1739,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const myItems = plan.items.filter((i: any) => i.assigned_to_slot === slot.id);
                 planItemLines = myItems.map((i: any) => {
                   const marker = i.status === "done" ? "[x]" : i.status === "in_progress" ? "[~]" : "[ ]";
-                  return `  ${marker} ${i.label}`;
+                  return `  ${marker} #${i.id} ${i.label}${i.execution ? " " + JSON.stringify(i.execution) : ""}`;
                 });
               }
             } catch { /* ok */ }
@@ -1682,6 +1752,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "",
               `Your role: ${slot.role ?? "unassigned"}`,
               slot.role_description ? `Role description: ${slot.role_description}` : "",
+              snapshot.original_task ? `Original task: ${snapshot.original_task}` : "",
               snapshot.last_summary ? `Your last status: ${snapshot.last_summary}` : "",
               snapshot.task_state ? `Your task state when you left: ${snapshot.task_state}` : "",
               "",
@@ -1815,12 +1886,12 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           pendingEvents.push({ type: "guardrail_triggered", severity: "warning", slotId, sessionId, message });
         };
 
-        if (report.session_token_budget > 0 && report.total_tokens >= report.session_token_budget) {
+        if (report.session_token_budget > 0 && report.total_tokens !== null && report.total_tokens >= report.session_token_budget) {
           for (const agent of report.agents) await stopSlot(agent.slot_id, `Session token budget exhausted (${report.total_tokens}/${report.session_token_budget}).`);
           await brokerClient.updateSession({ id: sessionId, status: "paused", pause_reason: "Token budget exhausted", paused_at: Date.now() });
         } else {
           for (const agent of report.agents) {
-            if (agent.token_budget > 0 && agent.total_tokens >= agent.token_budget) {
+            if (agent.token_budget > 0 && agent.total_tokens !== null && agent.total_tokens >= agent.token_budget) {
               await stopSlot(agent.slot_id, `${agent.name} token budget exhausted (${agent.total_tokens}/${agent.token_budget}).`);
             }
           }
@@ -1881,14 +1952,13 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     for (const [sessionId, drivers] of activeCodexDrivers) {
       for (const [slotId, state] of drivers) {
         if (!state.driver.alive) continue;
+        try { if ((await brokerClient.getSlot(slotId)).paused) continue; } catch { continue; }
         const threadId = state.threadId ?? state.driver.threadId;
         if (!threadId) continue; // First turn hasn't completed yet
 
-        // --- Interrupt + signal_done turn: if Codex turn is active but idle for >60s ---
-        // The Codex LLM can get stuck in a single long inference call after completing work.
-        // turn/steer only works between loop iterations — it can't interrupt mid-generation.
-        // Instead: interrupt the stuck turn, then start a new focused turn for signal_done.
-        const INTERRUPT_IDLE_MS = 60_000;
+        // After five minutes without activity, diagnose progress. Never infer
+        // completion from silence or instruct an unfinished agent to signal done.
+        const INTERRUPT_IDLE_MS = 300_000;
         const now = Date.now();
         if (
           state.driver.activeTurnId &&
@@ -1896,7 +1966,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           now - state.lastNudge > INTERRUPT_IDLE_MS
         ) {
           state.lastNudge = now;
-          log(LOG_PREFIX, `Codex slot ${slotId} stuck for ${Math.round((now - state.driver.lastNotificationActivity) / 1000)}s — interrupting turn and requesting signal_done`);
+          log(LOG_PREFIX, `Codex slot ${slotId} stuck for ${Math.round((now - state.driver.lastNotificationActivity) / 1000)}s — interrupting turn and requesting a progress diagnosis`);
           try {
             await state.driver.interrupt(threadId);
           } catch {
@@ -1904,18 +1974,18 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           }
           // Wait a moment for the turn to fully complete after interrupt
           await new Promise(r => setTimeout(r, 2000));
-          // Start a new focused turn asking only for signal_done
+          // Ask the worker to inspect actual progress before deciding what to do.
           if (!state.driver.activeTurnId && !state.busy) {
             state.busy = true;
-            state.driver.reply(threadId, "Your previous task is complete. Call signal_done NOW with a summary of what you accomplished. This is the ONLY thing you need to do.")
+            state.driver.reply(threadId, "No recent activity was observed. Inspect your actual progress and the plan. If work remains, continue it. If blocked, report the blocker. Only call signal_done if implementation and verification are complete; silence is not evidence of completion.")
               .then(async (result) => {
                 state.threadId = result.threadId;
                 state.busy = false;
-                log(LOG_PREFIX, `Codex slot ${slotId} signal_done turn completed`);
+                log(LOG_PREFIX, `Codex slot ${slotId} progress diagnosis completed`);
               })
               .catch((err) => {
                 state.busy = false;
-                log(LOG_PREFIX, `Codex slot ${slotId} signal_done turn failed: ${err}`);
+                log(LOG_PREFIX, `Codex slot ${slotId} progress diagnosis failed: ${err}`);
               });
           }
         }
@@ -1990,6 +2060,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           // Skip agents in truly terminal task states — no point nudging them
           const taskState = (slot as any).task_state;
           if (taskState === "approved" || taskState === "released") continue;
+          if (taskState === "done_pending_review" && JSON.parse((await brokerClient.getSession(sessionId)).config || "{}").execution_mode === "plan_execution") continue;
           // Note: done_pending_review agents are NOT skipped — they may need
           // to respond to feedback or review requests from teammates.
 
@@ -2127,31 +2198,8 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
         const slots = await brokerClient.listSlots(sessionId);
         if (slots.length === 0) continue;
 
-        // --- Auto-approve orphaned done_pending_review agents ---
-        // When all reviewer/QA agents are approved/released/disconnected but some
-        // non-reviewer agents are still at done_pending_review, there's nobody left
-        // to approve them. Auto-approve to unblock session completion.
-        const reviewerSlots = slots.filter((s) => s.role && /qa|review|test|lead/i.test(s.role));
-        const allReviewersDone = reviewerSlots.length > 0 && reviewerSlots.every(
-          (s) => (s as any).task_state === "approved" || (s as any).task_state === "released" || s.status === "disconnected"
-        );
-        if (allReviewersDone) {
-          const orphaned = slots.filter(
-            (s) => (s as any).task_state === "done_pending_review" && !(s.role && /qa|review|test|lead/i.test(s.role))
-          );
-          for (const slot of orphaned) {
-            log(LOG_PREFIX, `Auto-approving orphaned ${slot.display_name ?? `slot ${slot.id}`} (all reviewers done, no one left to approve)`);
-            await brokerClient.updateSlot({ id: slot.id, task_state: "approved" } as any);
-            pendingEvents.push({
-              type: "auto_approved",
-              severity: "info",
-              slotId: slot.id,
-              sessionId,
-              message: `${slot.display_name ?? `slot ${slot.id}`} auto-approved: all reviewers finished, no pending review possible.`,
-            });
-          }
-        }
-
+        // Reviewer absence is not evidence of correctness. Keep work pending
+        // until a reviewer or the coordinator explicitly approves it.
         const allDone = slots.every(
           (s) => (s as any).task_state === "approved" || (s as any).task_state === "released" || s.status === "disconnected"
         );
@@ -2254,7 +2302,9 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
         const slots = await brokerClient.listSlots(sessionId);
         for (const slot of slots) {
           const taskState = (slot as any).task_state;
-          if (taskState === "released") continue;
+          if (taskState === "released" || slot.paused) continue;
+
+          if (slot.status === "connected" && JSON.parse((await brokerClient.getSession(sessionId)).config || "{}").execution_mode === "plan_execution") continue;
 
           // Skip Codex — driver-managed via forwarding loop
           const drivers = activeCodexDrivers.get(sessionId);

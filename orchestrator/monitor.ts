@@ -38,11 +38,12 @@ async function updateTokenUsage(
 
   lastTokenTotals.set(slotId, tokens);
 
-  if (deltaInput === 0 && deltaOutput === 0 && deltaCacheRead === 0) return;
+
 
   try {
     await brokerClient.updateSlot({
       id: slotId,
+      context_snapshot: JSON.stringify({ usage_reported: true }),
       input_tokens: deltaInput,
       output_tokens: deltaOutput,
       cache_read_tokens: deltaCacheRead,
@@ -76,10 +77,11 @@ export function monitorProcess(
   brokerClient: BrokerClient,
   onEvent: (event: AgentEvent) => void,
 ): void {
-  // Read stdout for JSON progress lines
-  if (isReadableStream(proc.stdout)) {
-    readStream(proc.stdout, slotId, sessionId, brokerClient, onEvent);
-  }
+  // A fresh process reports totals for its own run, not previous executions.
+  lastTokenTotals.delete(slotId);
+  const stdoutDone = isReadableStream(proc.stdout)
+    ? readStream(proc.stdout, slotId, sessionId, brokerClient, onEvent)
+    : Promise.resolve();
 
   // Read stderr for error output
   if (isReadableStream(proc.stderr)) {
@@ -87,8 +89,9 @@ export function monitorProcess(
   }
 
   // Monitor process exit
-  proc.exited.then((exitCode) => {
-    handleExit(exitCode, slotId, sessionId, brokerClient, onEvent);
+  proc.exited.then(async (exitCode) => {
+    await stdoutDone;
+    await handleExit(exitCode, slotId, sessionId, brokerClient, onEvent);
   });
 }
 
@@ -119,6 +122,7 @@ async function readStream(
         await processLine(trimmed, slotId, sessionId, brokerClient, onEvent);
       }
     }
+    if (buffer.trim()) await processLine(buffer.trim(), slotId, sessionId, brokerClient, onEvent);
   } catch (err) {
     log(LOG_PREFIX, `stdout reader error for slot ${slotId}: ${err}`);
   }
@@ -164,8 +168,14 @@ async function processLine(
   try {
     const parsed = JSON.parse(line);
 
+    if (parsed.event === "step_update") {
+      // Native AGY activity keeps a long implementation from looking idle.
+      await autoTransitionToWorking(slotId, brokerClient);
+      await brokerClient.updateSlot({ id: slotId, context_snapshot: JSON.stringify({ updated_at: Date.now() }) });
+    }
+
     // Claude stream-json result message (includes final token usage)
-    if (parsed.type === "result" && parsed.result) {
+    if ((parsed.type === "result" || parsed.event === "result") && parsed.result) {
       onEvent({
         type: "agent_output",
         severity: "info",
@@ -181,7 +191,7 @@ async function processLine(
         await updateTokenUsage(slotId, {
           input: usage.input_tokens ?? 0,
           output: usage.output_tokens ?? 0,
-          cacheRead: usage.cache_read_input_tokens ?? usage.cache_creation_input_tokens ?? 0,
+          cacheRead: usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? usage.cache_creation_input_tokens ?? 0,
         }, brokerClient);
       }
     }

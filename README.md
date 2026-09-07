@@ -88,7 +88,7 @@ Codex CLI uses the **app-server protocol** — a JSON-RPC stdio interface with t
 1. Spawns a persistent `codex app-server` process with JSON-RPC handshake
 2. Creates a thread (`thread/start`) and drives turns (`turn/start`) for task execution
 3. Injects messages mid-turn via `turn/steer` — no waiting for the current turn to finish
-4. Interrupts stuck turns via `turn/interrupt` when agents go idle for >60s
+4. Interrupts turns with no activity for >5 minutes via `turn/interrupt` and requests a progress diagnosis
 5. Auto-approves all server-initiated requests (command execution, file changes, MCP elicitations)
 6. Tracks token usage from `turn/completed` notifications
 
@@ -381,3 +381,107 @@ multiagents/
 ## License
 
 MIT
+
+## Autonomous plan execution (Codex → Gemini)
+
+Use `execution_mode: "plan_execution"` when you want to discuss and approve a
+plan with Codex, then let one Gemini worker implement it. Codex handles decisions
+and final review. The existing team mode remains the default.
+
+From a Codex session with the orchestrator MCP configured, call `create_team`
+with a payload like this (replace the project path and select a model actually
+available in your Antigravity account):
+
+```json
+{
+  "project_dir": "/absolute/path/to/project",
+  "session_name": "Document setup",
+  "execution_mode": "plan_execution",
+  "agents": [{
+    "agent_type": "agy",
+    "name": "Gemini",
+    "role": "Software Engineer",
+    "role_description": "Implement the approved plan autonomously. Escalate decisions that change its scope.",
+    "initial_task": "Document the project's actual setup commands in docs/setup.md.",
+    "model_policy": { "model": "gemini-3.8-flash" }
+  }],
+  "plan": [{
+    "key": "setup_doc",
+    "label": "Write the setup guide",
+    "files": ["docs/setup.md"],
+    "depends_on": [],
+    "acceptance": ["Commands match the project's existing scripts", "Guide explains installation and how to run tests"],
+    "checks": [{
+      "argv": ["bun", "-e", "const s = await Bun.file('docs/setup.md').text(); if (s.trim().length < 100) process.exit(1)"],
+      "cwd": ".",
+      "timeout_ms": 10000
+    }]
+  }]
+}
+```
+
+The example check only verifies that a substantive document exists. Codex still
+reviews its accuracy. For code changes, specify the project's relevant test,
+type-check and build commands in `checks`.
+
+- Each step needs a unique `key`, `label`, `files`, `depends_on`, `acceptance` and
+  1–10 executable `checks`. Dependencies must name earlier steps. Execution is
+  sequential even when two steps have no dependency.
+- Checks use argument arrays, without implicit shell expansion. Their `cwd` is
+  relative to the project and must resolve inside it. Default timeout is 60 seconds;
+  maximum is 300 seconds per check. Checks run with the broker's environment and
+  permissions, so include only commands you intend to run in the approved plan.
+- The plan is stored before the worker starts. `get_plan` returns the step IDs,
+  criteria, decisions and recorded check results. The worker calls `update_plan`
+  with `in_progress`, implements the step, then calls `verify_plan_step` with its
+  `item_id` and a concise implementation/acceptance `summary`.
+- The broker runs checks and records exit codes. Only successful checks mark the
+  step `done`; an agent cannot bypass them through `update_plan(status: "done")`.
+  Logs stay in `.multiagents/verification/<item-id>/`, capped at 1 MiB per check.
+  Consider ignoring `.multiagents/` in your target repository.
+- Two failed verification attempts pause the worker. For other persistent
+  problems, the worker reports `update_plan` with `status: "blocked"` and a
+  `reason` explaining the attempts and decision needed. Arbitrary reasoning
+  attempts are self-reported; executable verification attempts are counted by
+  the program.
+- Optional `decision_required` text gates an individual step. The coordinator
+  calls `resolve_plan_blocker({session_id, item_id, decision})` to allow progress.
+  The resolution is persisted and a continuation message is sent to the worker.
+- The coordinator uses `get_execution_plan({session_id})` for step IDs, blockers,
+  decisions and verification evidence, and `get_team_status` for a compact summary.
+- After all steps pass, the worker calls `signal_done`. Codex reviews the diff,
+  qualitative criteria and check evidence, then calls
+  `approve_execution({session_id, message})`. Missing reviewers and silence never
+  imply approval. Use `release_agent` after approval, or let normal session
+  completion release the worker.
+- To request corrections at final review, call `resolve_plan_blocker` with
+  `reopen: true` and the feedback in `decision`. That step and all later steps
+  become pending and must be verified again; existing files are preserved.
+- The explicit model is retained through retries and resumes. Automatic model
+  escalation/decay and team expansion are disabled in this mode. Technical
+  process restarts retain the existing bounded retry controls.
+- Pausing or archiving a session cancels its active checks. Cancellation does not
+  count as a failed implementation attempt. Interrupted verification must run again. On POSIX, verification subprocess
+  groups are terminated when the broker dies, including abrupt termination.
+  Windows descendant cleanup does not provide the same process-group guarantee.
+  Incomplete execution slots are retained for resume. Use `end_session` or
+  `delete_session` to cancel the session rather than releasing unfinished work.
+
+This is a cooperative local workflow, not an authorization boundary against an
+agent with arbitrary shell access. `files` describes the intended scope; it is
+not an operating-system sandbox. The coordinator's final diff review remains
+necessary. No additional dashboard is launched automatically in execution mode;
+use `multiagents dashboard <session-id>` or `multiagents web <session-id>`.
+
+Antigravity must be installed and authenticated before starting. Its official
+[headless mode documentation](https://www.antigravity.google/docs/cli/headless)
+describes cached authentication, model selection and streaming results. Model
+availability and subscription quotas depend on your account; this package does
+not convert a Google subscription into API credits. Reported token usage is
+separate from subscription quotas. Unknown usage appears as `null` in optimization
+reports and `unknown` in their text output; token budgets cannot be fully enforced
+without provider usage. Antigravity terminal usage is recorded when supplied.
+
+Development verification: `bun test` covers real broker persistence, subprocess
+checks, abrupt shutdown and an end-to-end MCP flow with a fake `agy` executable.
+That test does not establish live Google authentication or model availability.

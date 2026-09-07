@@ -1,3 +1,4 @@
+import { AUTONOMOUS_INSTRUCTIONS } from "../shared/plan-execution.ts";
 // ============================================================================
 // multiagents — Crash Recovery
 // ============================================================================
@@ -142,10 +143,14 @@ export async function respawnAgent(
     {},
   );
   let optimizationConfig: TokenOptimizationConfig = {};
+  let autonomous = false;
   try {
     const session = await brokerClient.getSession(sessionId);
+    autonomous = JSON.parse(session.config || "{}").execution_mode === "plan_execution";
     optimizationConfig = safeJsonParse<{ optimization?: TokenOptimizationConfig }>(session.config, {}).optimization ?? {};
   } catch { /* defaults are safe */ }
+  if (autonomous && slot.paused) throw new Error("Execution paused pending coordinator decision");
+  if (autonomous && snapshot.optimization) snapshot.optimization.auto_escalate = false;
   const previousEscalationCount = snapshot.optimization?.escalation_count ?? 0;
   const escalatedPolicy = snapshot.optimization && optimizationConfig.enabled !== false
     ? escalateModelPolicy(snapshot.optimization, slot.agent_type, optimizationConfig)
@@ -181,6 +186,9 @@ export async function respawnAgent(
     "",
     `Role: ${slot.role ?? "unassigned"}`,
     slot.role_description ? `Role description: ${slot.role_description}` : "",
+    snapshot.original_task ? `Original task: ${snapshot.original_task}` : "",
+    autonomous ? AUTONOMOUS_INSTRUCTIONS : "",
+    autonomous ? `Durable plan: ${JSON.stringify(await brokerClient.getPlan(sessionId))}` : "",
     snapshot.last_summary ? `Last known status: ${snapshot.last_summary}` : "",
     "",
     teamContext,

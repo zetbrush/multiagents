@@ -311,11 +311,17 @@ const TOOLS = [
         status: {
           type: "string" as const,
           enum: ["pending", "in_progress", "done", "blocked"],
-          description: "New status for the plan item",
+          description: "New status for the plan item. In plan_execution use verify_plan_step for completion.",
         },
+        reason: { type: "string", description: "For blocked steps: problem, attempts and decision needed." },
       },
       required: ["item_id", "status"],
     },
+  },
+  {
+    name: "verify_plan_step",
+    description: "Run the approved checks for an execution step. Provide concise implementation and acceptance evidence. Only passing checks complete the step; two failures require a coordinator decision. Logs stay local.",
+    inputSchema: { type: "object" as const, properties: { item_id: { type: "number" }, summary: { type: "string" } }, required: ["item_id", "summary"] },
   },
   // --- Knowledge Store ---
   {
@@ -416,6 +422,7 @@ import { getRolePractices, getStructuredRolePractices, getRoleHandoffProtocol } 
 export abstract class BaseAdapter {
   // --- Identity & state ---
   protected myId: PeerId | null = null;
+  protected brokerReady: Promise<void> = Promise.resolve();
   protected myCwd: string = process.cwd();
   protected myGitRoot: string | null = null;
   protected myTty: string | null = null;
@@ -523,6 +530,7 @@ export abstract class BaseAdapter {
     //    Without registration, this.myId stays null and ALL tool handlers return
     //    "Not registered with broker yet" — making every MCP call a silent no-op.
     const brokerPromise = driverMode ? this.registerDriverModePeer() : this.registerWithBroker();
+    this.brokerReady = brokerPromise;
 
     // 5. Connect MCP over stdio — blocks until parent sends `initialize`
     //    Broker registration runs concurrently with this wait.
@@ -890,6 +898,7 @@ export abstract class BaseAdapter {
     }));
 
     this.mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+      await this.brokerReady;
       const { name, arguments: args } = req.params;
 
       switch (name) {
@@ -923,6 +932,12 @@ export abstract class BaseAdapter {
           return this.handleCheckTeamStatus();
         case "get_plan":
           return this.handleGetPlan();
+        case "verify_plan_step": {
+          if (!this.sessionId || !this.myId) throw new Error("No active session");
+          const result = await this.broker.verifyPlanStep({ ...(args as { item_id: number; summary: string }), session_id: this.sessionId, peer_id: this.myId });
+          const item = result.items.find(i => i.id === (args as any).item_id);
+          return { content: [{ type: "text", text: JSON.stringify({ completion: result.completion, item }) }] };
+        }
         case "update_plan":
           return this.handleUpdatePlan(args as { item_id: number; status: string });
         case "store_knowledge":
@@ -1402,6 +1417,7 @@ export abstract class BaseAdapter {
         const isMe = item.assigned_to_slot === mySlotId;
         const youTag = isMe ? " ← YOU" : "";
         lines.push(`  ${marker} #${item.id}: ${item.label} (${assignee})${youTag}`);
+        if (item.execution) lines.push(JSON.stringify(item.execution));
       }
       lines.push(`\nTo update: call update_plan with item_id and status ("in_progress" or "done")`);
 
@@ -1411,7 +1427,7 @@ export abstract class BaseAdapter {
     }
   }
 
-  protected async handleUpdatePlan(args: { item_id: number; status: string }) {
+  protected async handleUpdatePlan(args: { item_id: number; status: string; reason?: string }) {
     if (!this.sessionId) {
       return { content: [{ type: "text", text: "No active session — cannot update plan." }] };
     }
@@ -1419,6 +1435,8 @@ export abstract class BaseAdapter {
       const result = await this.broker.updatePlanItem({
         item_id: args.item_id,
         status: args.status,
+        reason: args.reason,
+        peer_id: this.myId ?? undefined,
         session_id: this.sessionId,
       }) as any;
 

@@ -1,3 +1,4 @@
+import type { ExecutionStep, ExecutionProgress } from "./plan-execution.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -46,9 +47,9 @@ import type {
 export class BrokerClient {
   constructor(private baseUrl: string) {}
 
-  private async post<T>(path: string, body: unknown): Promise<T> {
+  private async post<T>(path: string, body: unknown, timeoutMs = 5000): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await globalThis.fetch(`${this.baseUrl}${path}`, {
         method: "POST",
@@ -230,9 +231,19 @@ export class BrokerClient {
     return this.post("/lifecycle/get-task-state", { slot_id: slotId });
   }
 
+  verifyPlanStep(req: { session_id: string; item_id: number; peer_id: string; summary: string }): Promise<PlanState> {
+    return this.post("/plan/verify", req, 3_100_000);
+  }
+  resolvePlanBlocker(req: { session_id: string; item_id: number; decision: string; reopen?: boolean }): Promise<PlanState> {
+    return this.post("/plan/resolve", { ...req, from_id: "orchestrator" });
+  }
+  assignExecutionPlan(session_id: string, slot_id: number): Promise<{ ok: boolean }> {
+    return this.post("/plan/assign", { session_id, slot_id });
+  }
+
   // --- Plans ---
 
-  createPlan(req: { session_id: string; title: string; items: { label: string; assigned_to_slot?: number }[] }): Promise<PlanState> {
+  createPlan(req: { session_id: string; title: string; items: { label: string; assigned_to_slot?: number; execution?: ExecutionStep }[] }): Promise<PlanState> {
     return this.post("/plan/create", req);
   }
 
@@ -240,7 +251,7 @@ export class BrokerClient {
     return this.post("/plan/get", { session_id: sessionId });
   }
 
-  updatePlanItem(req: { item_id: number; status: string; session_id?: string }): Promise<PlanState | { ok: boolean }> {
+  updatePlanItem(req: { item_id: number; status: string; session_id?: string; peer_id?: string; reason?: string }): Promise<PlanState | { ok: boolean }> {
     return this.post("/plan/update-item", req);
   }
 
@@ -280,6 +291,7 @@ export class BrokerClient {
 }
 
 export interface PlanItem {
+  execution?: ExecutionProgress;
   id: number;
   plan_id: number;
   parent_id: number | null;

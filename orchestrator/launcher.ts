@@ -1,3 +1,4 @@
+import { AUTONOMOUS_INSTRUCTIONS } from "../shared/plan-execution.ts";
 // ============================================================================
 // multiagents — Agent Launcher
 // ============================================================================
@@ -365,7 +366,13 @@ export async function launchAgent(
   await ensureMcpConfigs(projectDir, sessionId);
 
   // Enrich role_description with auto-detected platform context
-  const enrichedDescription = enrichRoleDescription(config, projectDir);
+  const session = await brokerClient.getSession(sessionId);
+  const autonomous = JSON.parse(session.config || "{}").execution_mode === "plan_execution";
+  if (autonomous) {
+    config = { ...config, model_policy: { ...config.model_policy, auto_escalate: false } };
+    if (!config.model_policy?.model) throw new Error("Plan execution requires an explicit model");
+  }
+  const enrichedDescription = enrichRoleDescription(config, projectDir) + (autonomous ? `\n\n${AUTONOMOUS_INSTRUCTIONS}` : "");
 
   // Create a slot in the broker for this agent
   const slot = await brokerClient.createSlot({
@@ -375,6 +382,8 @@ export async function launchAgent(
     role: config.role,
     role_description: enrichedDescription,
   });
+
+  if (autonomous) await brokerClient.assignExecutionPlan(sessionId, slot.id);
 
   log(LOG_PREFIX, `Created slot ${slot.id} for ${config.name} (${config.agent_type})`);
 

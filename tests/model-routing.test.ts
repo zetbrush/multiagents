@@ -104,3 +104,12 @@ describe("budgets and reporting", () => {
     expect(report.agents[0]?.tier).toBe("economy");
   });
 });
+
+test('unreported usage is unknown instead of a zero-cost success', () => {
+  const session = { config: '{}' } as Session;
+  const slot = { id: 1, input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, task_state: 'working', context_snapshot: null } as Slot;
+  const report = buildOptimizationReport(session, [slot]);
+  expect(report.total_tokens).toBeNull();
+  expect(report.agents[0]?.total_tokens).toBeNull();
+  expect(report.budget_percent).toBeNull();
+});
