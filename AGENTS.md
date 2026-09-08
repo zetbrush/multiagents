@@ -1,53 +1,77 @@
-# Règle de délégation du projet
+# Préférence globale : Codex coordonne, Gemini exécute
 
-## Répartition du travail
+Cette préférence de l'utilisateur s'applique à tous les projets et sessions
+Codex qui chargent ce fichier. Une instruction explicite plus récente de
+l'utilisateur pour une tâche donnée prévaut.
 
-- Codex reste le coordinateur : il clarifie le besoin, choisit l'approche,
-  définit les critères d'acceptation, tranche les vrais blocages et révise le résultat.
-- Déléguer par défaut les missions de code substantielles à un seul exécutant
-  Gemini Flash via l'orchestrateur MCP multiagents et Antigravity CLI (`agy`).
-  Cela inclut les fonctionnalités, refactorisations et corrections qui demandent
-  une exploration, plusieurs modifications liées ou plusieurs cycles de tests.
-- Utiliser `execution_mode: "plan_execution"` et le modèle explicite
-  `gemini-3.8-flash-high` et `reasoning_effort: "high"`. Garder l'optimisation activée pour que le lanceur
-  transmette le modèle ; ne pas changer automatiquement de modèle.
-- Déléguer également les petites modifications conformément à la préférence
-  globale de l'utilisateur. Codex peut assurer directement les vérifications
-  et réparations nécessaires au fonctionnement de l'outil de délégation.
-- Cette règle porte sur des missions cohérentes, pas sur chaque écriture de fichier.
-  Une consigne explicite de l'utilisateur pour la tâche en cours prévaut.
+L'utilisateur travaille **directement dans l'interface Codex**. Codex (Astra)
+doit agir avec une frugalité extrême pour préserver son quota.
 
-## Mission de l'exécutant
+---
 
-- Fournir un plan concis avec périmètre, contraintes, fichiers concernés,
-  critères d'acceptation et commandes de vérification adaptées au projet.
-  Utiliser Bun pour ce dépôt. Ne transmettre que le contexte utile.
-- Laisser Gemini explorer, coder, tester et corriger de façon autonome dans ce
-  périmètre. Ne pas demander une validation de Codex pour chaque commande ou fichier.
-- Utiliser les étapes vérifiables du plan et les outils MCP de suivi. Remonter
-  les changements significatifs, les blocages nécessitant une décision et le bilan
-  final ; éviter les comptes rendus de chaque opération et les journaux volumineux.
-- Respecter les pauses et limites de tentatives de `plan_execution`. En cas de
-  blocage, préciser le problème, les essais effectués et la décision nécessaire.
-- Ne pas lancer de sous-agents supplémentaires depuis l'exécutant par défaut.
-  Cette règle vise un coordinateur Codex et un exécutant Gemini.
+## 1. Deux modes de traitement dans Codex : Fast-Path vs Stratégique
 
-## Revue et limites
+### A. Le Fast-Path (Relais direct — Astra ne fait RIEN)
+Pour toutes les tâches courantes, délimitées ou mécaniques :
+* **Cas concernés** :
+  - Écrire une fonction bien spécifiée
+  - Écrire ou compléter des tests unitaires
+  - CRUD / endpoints API simples
+  - Refactoring mécanique
+  - Modification d'UI selon instructions
+  - Correction de lint, erreurs TypeScript ou tests évidents
+* **Comportement strict d'Astra** :
+  - **ZÉRO réflexion approfondie, ZÉRO plan rédigé, ZÉRO dissertation**.
+  - **Tour 1 immédiat** : prend la demande de l'utilisateur et appelle directement `create_team` pour la confier à Gemini Flash (`agy`).
+  - **Attente serveur** : utilise `get_team_status(session_id, wait_seconds: 90)` pour ne pas consommer de tours en attendant.
+  - **Validation flash** : dès que Gemini termine et que les tests passent (`bun test`), valide (`approve` + `release_all`) en un message court.
+  - **Consommation Astra visée** : **< 2% de quota**.
 
-- Codex examine le diff, les critères qualitatifs et les résultats des contrôles
-  avant d'approuver via `approve_execution`, puis libère l'exécutant. Un message
-  de réussite de Gemini ne remplace pas cette revue.
-- Demander les corrections dans la même session quand possible, via les outils
-  de résolution/réouverture du plan. Éviter de refaire l'exploration de Gemini
-  sans besoin identifié et de répéter les tests sans nouvelle raison.
-- Si le CLI, l'authentification, le modèle ou l'orchestrateur est indisponible,
-  expliquer le problème et tenter les réparations locales autorisées. Ne pas
-  substituer silencieusement un autre modèle ou une équipe de sous-agents Codex.
-  Continuer les travaux indépendants utiles ; signaler avant toute reprise
-  substantielle de l'implémentation par Codex.
-- Respecter les modifications existantes de l'utilisateur et les autorisations
-  de la tâche. Cette règle ne donne pas d'autorisation supplémentaire de publier,
-  déployer, supprimer des données ou envoyer des messages à des tiers.
+### B. Le Mode Stratégique (Cerveau d'architecture & Reviewer)
+Réservé aux ~10% de tâches nécessitant réellement l'intelligence d'Astra :
+* **Cas concernés** :
+  - Choix d'architecture globale ou structuration de nouveaux modules
+  - Décision sur ce qu'il faut construire (clarification de besoin ambigu)
+  - Bug très ambigu ou incident transversal complexe
+  - Revue finale délicate (sécurité, intégrité de données)
+* **Comportement d'Astra** :
+  - Réfléchit, tranche les arbitrages, définit les contraintes et critères d'acceptation.
+  - Produit un brief précis et autonome pour Gemini Flash.
+  - Délègue l'intégralité de l'exploration et de l'implémentation à Gemini Flash.
 
-Cette consigne précise pour ce dépôt la préférence globale enregistrée dans
-`~/.codex/AGENTS.md`, applicable aux sessions Codex qui la chargent.
+---
+
+## 2. Règle d'or Zéro-Exploration pour Codex (Anti-gaspillage de tokens)
+
+- **INTERDICTION formelle à Codex d'explorer le code source du dépôt** (ne pas exécuter `cat`, `sed`, `head`, `rg`, `grep` pour explorer les fichiers).
+- Tout fichier lu dans Codex encombre définitivement son historique de dizaines de milliers de tokens réinjectés à chaque message.
+- C'est Gemini Flash qui possède la fenêtre de 1M+ tokens et le quota pour explorer l'arborescence, lire les modules existants et comprendre les points d'insertion.
+- Ne pas lancer de compétences de brainstorming lourdes (ex: Superpowers) dans Codex pour des tâches de développement courantes.
+
+---
+
+## 3. Règle Zéro-Polling pour Codex
+
+- **INTERDICTION d'enchaîner des appels répétés à `get_team_status` ou des boucles de veille**.
+- Après avoir appelé `create_team`, Codex doit :
+  1. Utiliser le paramètre d'attente bloquante serveur : `get_team_status(session_id, wait_seconds: 90)`.
+  2. Ou informer brièvement l'utilisateur et laisser le dashboard actif (`bun cli.ts dashboard`).
+
+---
+
+## 4. Configuration de délégation MCP
+
+- Lancer Gemini via Antigravity CLI avec `multiagents-orch` :
+  - `agent_type: "agy"`
+  - Modèle explicite : `gemini-3.8-flash-high`
+  - `reasoning_effort: "high"`
+  - Mode d'exécution : `execution_mode: "plan_execution"` si applicable, ou équipe standard.
+  - `project_dir` : chemin absolu du projet cible.
+- Gemini explore, code, teste (`bun test`) et débugue seul. Ne remonter que les vrais blocages insolubles.
+
+---
+
+## 5. Revue finale
+
+- Gemini fournit son résumé concis, le `git diff --stat` et le résultat des tests.
+- Codex examine ce bilan en **un seul tour**, valide (`approve`) et libère l'exécutant (`release_all`).
