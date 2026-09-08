@@ -66,7 +66,7 @@ async function createTestSession() {
   const designer = await post("/slots/create", {
     session_id: session.id,
     display_name: "Designer",
-    agent_type: "gemini",
+    agent_type: "agy",
     role: "UI/UX Designer",
   });
 
@@ -86,7 +86,7 @@ async function createTestSession() {
 
   // Register fake peers for each slot
   const designerPeer = await post("/register", {
-    agent_type: "gemini",
+    agent_type: "agy",
     pid: 10001 + testCounter,
     cwd: "/tmp/test-lifecycle",
     summary: "Designer starting",
@@ -242,6 +242,29 @@ describe("peek-undelivered", () => {
     const peek3 = await post("/peek-undelivered", { slot_id: engineer.slot.id });
     expect(peek3.count).toBe(0);
     expect(peek3.oldest_at).toBe(0);
+  });
+});
+
+describe("slot snapshot persistence", () => {
+  test("incremental summaries preserve optimizer metadata", async () => {
+    const session = await post("/sessions/create", {
+      id: uid("snapshot-session"), name: "snapshot", project_dir: "/tmp/snapshot",
+    });
+    const slot = await post("/slots/create", {
+      session_id: session.id, display_name: "Worker", agent_type: "codex", role: "Engineer",
+    });
+    await post("/slots/update", {
+      id: slot.id,
+      context_snapshot: JSON.stringify({ optimization: { tier: "economy", token_budget: 1000 } }),
+    });
+    await post("/slots/update", {
+      id: slot.id,
+      context_snapshot: JSON.stringify({ last_summary: "working", updated_at: Date.now() }),
+    });
+    const updated = await post("/slots/get", { id: slot.id });
+    const snapshot = JSON.parse(updated.context_snapshot);
+    expect(snapshot.optimization.tier).toBe("economy");
+    expect(snapshot.last_summary).toBe("working");
   });
 });
 

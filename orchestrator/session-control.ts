@@ -231,6 +231,16 @@ export async function resolveTarget(
     if (byId) return byId;
   }
 
+  // Try slot ID embedded in a display-style label, e.g. "Agent #71", "slot 71" —
+  // these are exactly the labels get_team_status prints for unassigned ghost slots,
+  // so they must round-trip back into a resolvable target.
+  const idMatch = lower.match(/(?:agent\s*#|slot\s*#?)\s*(\d+)/);
+  if (idMatch?.[1]) {
+    const embeddedId = parseInt(idMatch[1], 10);
+    const byEmbeddedId = slots.find((s) => s.id === embeddedId);
+    if (byEmbeddedId) return byEmbeddedId;
+  }
+
   // Try exact name match
   const byName = slots.find(
     (s) => s.display_name?.toLowerCase() === lower,

@@ -10,7 +10,73 @@
 export type PeerId = string;
 
 /** Supported agent CLI types */
-export type AgentType = "claude" | "codex" | "gemini" | "custom";
+export type AgentType = "claude" | "codex" | "agy" | "custom";
+
+/** Provider-independent capability band used by the token optimizer. */
+export type ModelTier = "economy" | "balanced" | "expert";
+
+/** Reasoning controls shared by the supported CLIs. */
+export type ReasoningEffort = "low" | "medium" | "high";
+
+export interface ModelPolicy {
+  /** Explicit tier override. Omit to classify the task locally. */
+  tier?: ModelTier;
+  /** Explicit provider model override. Omit to use the configured tier mapping. */
+  model?: string;
+  reasoning_effort?: ReasoningEffort;
+  /** Combined input + output token budget for this agent task. */
+  token_budget?: number;
+  /** Provider-side output ceiling when supported. */
+  max_output_tokens?: number;
+  /** Promote to the next tier after a verifiable incomplete run/crash. */
+  auto_escalate?: boolean;
+}
+
+export interface TierModelConfig {
+  model?: string;
+  reasoning_effort: ReasoningEffort;
+  max_output_tokens: number;
+}
+
+export interface TokenOptimizationConfig {
+  enabled?: boolean;
+  session_token_budget?: number;
+  default_agent_token_budget?: number;
+  auto_escalate?: boolean;
+  /** "recommend" reports excess agents; "enforce" keeps only the recommended count. */
+  right_size?: "off" | "recommend" | "enforce";
+  /** Consecutive non-escalated turns before an agent steps back down one tier. Default 3. */
+  decay_after_stable_turns?: number;
+  /** Agent budget percentage that triggers an in-place tier escalation. Default 70. */
+  proactive_escalation_percent?: number;
+  tiers?: Partial<Record<AgentType, Partial<Record<ModelTier, Partial<TierModelConfig>>>>>;
+  /** Optional USD per million tokens, keyed by provider model name. */
+  pricing?: Record<string, { input: number; output: number; cached_input?: number }>;
+}
+
+export interface TaskClassification {
+  tier: ModelTier;
+  score: number;
+  confidence: number;
+  reasons: string[];
+  recommended_agent_count: number;
+}
+
+export interface ResolvedModelPolicy {
+  tier: ModelTier;
+  model?: string;
+  reasoning_effort: ReasoningEffort;
+  token_budget: number;
+  max_output_tokens: number;
+  auto_escalate: boolean;
+  classification: TaskClassification;
+  escalation_count: number;
+  /**
+   * Consecutive completed turns without an escalation. Reset on escalation and
+   * on decay; once it reaches `decay_after_stable_turns` the tier steps down.
+   */
+  stable_turns: number;
+}
 
 /** Message types for routing and formatting */
 export type MessageType =
@@ -411,12 +477,14 @@ export interface AgentLaunchConfig {
   initial_task: string;
   file_ownership?: string[];
   report_to?: string;
+  model_policy?: ModelPolicy;
 }
 
 export interface TeamConfig {
   project_dir: string;
   session_name: string;
   agents: AgentLaunchConfig[];
+  optimization?: TokenOptimizationConfig;
 }
 
 // --- Knowledge Store ---
@@ -435,6 +503,8 @@ export interface KnowledgeEntry {
   created_by_name: string | null;
   created_at: number;
   updated_at: number;
+  /** Set only on /knowledge/list results whose `value` was shortened to a preview. */
+  truncated?: boolean;
 }
 
 export interface KnowledgePutRequest {
@@ -455,6 +525,12 @@ export interface KnowledgePutResponse {
 export interface KnowledgeListRequest {
   session_id: string;
   category?: KnowledgeCategory;
+  /** Max entries to return. Defaults to KNOWLEDGE_LIST_DEFAULT_LIMIT, clamped to KNOWLEDGE_LIST_MAX_LIMIT. */
+  limit?: number;
+  /** Cutoff — only entries with updated_at >= since. Ms-epoch number or ISO timestamp string. */
+  since?: number | string;
+  /** Return untruncated values instead of KNOWLEDGE_VALUE_PREVIEW_CHARS previews. */
+  full?: boolean;
 }
 
 export interface KnowledgeGetRequest {

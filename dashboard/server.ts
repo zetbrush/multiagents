@@ -15,6 +15,7 @@ import {
   DEFAULT_BROKER_PORT,
   BROKER_HOSTNAME,
   DASHBOARD_REFRESH,
+  KNOWLEDGE_LIST_MAX_LIMIT,
 } from "../shared/constants.ts";
 import type { Session, Slot, Peer, Message, GuardrailState, FileLock, FileOwnership } from "../shared/types.ts";
 import type { PlanState } from "../shared/broker-client.ts";
@@ -46,7 +47,7 @@ async function resolveSessionId(explicit?: string): Promise<string | null> {
     const active = sessions
       .filter((s: Session) => s.status === "active" || s.status === "paused")
       .sort((a: Session, b: Session) => (b.last_active_at ?? 0) - (a.last_active_at ?? 0));
-    if (active.length > 0) return active[0].id;
+    if (active[0]) return active[0].id;
   } catch { /* broker down */ }
 
   return null;
@@ -102,7 +103,8 @@ async function fetchState(sessionId: string | null): Promise<DashboardState> {
       broker.listFileLocks(sessionId).catch(() => []),
       broker.listFileOwnership(sessionId).catch(() => []),
       broker.getPlan(sessionId).catch(() => null),
-      broker.listKnowledge(sessionId).catch(() => []),
+      // Dashboard renders for a human, not an agent context window — take the full window.
+      broker.listKnowledge(sessionId, undefined, { limit: KNOWLEDGE_LIST_MAX_LIMIT, full: true }).catch(() => []),
     ]);
 
     // Get peers for slot enrichment
@@ -263,7 +265,7 @@ const server = Bun.serve({
         const result = await broker.updateGuardrail({
           session_id: body.session_id,
           guardrail_id: body.guardrail_id,
-          value: body.value,
+          new_value: body.value,
           reason: body.reason ?? "Adjusted via web dashboard",
           changed_by: "web-dashboard",
         });

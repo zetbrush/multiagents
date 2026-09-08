@@ -1,12 +1,12 @@
 /**
  * multiagents
  *
- * Multi-agent orchestration platform for Claude Code, Codex CLI, and Gemini CLI.
+ * Multi-agent orchestration platform for Claude Code, Codex CLI, and Antigravity CLI.
  *
  * Entry points:
  *   - server.ts                         — MCP server (one per agent instance)
  *   - broker.ts                         — Shared broker daemon (one per machine)
- *   - orchestrator/orchestrator-server.ts — Orchestrator MCP (for Claude Desktop)
+ *   - orchestrator/orchestrator-server.ts — Switchable orchestrator MCP
  *   - cli.ts                            — CLI tool (setup, dashboard, session mgmt)
  *
  * See README.md for setup and usage.
@@ -32,6 +32,8 @@ export type {
 } from "./shared/types.ts";
 
 export { BrokerClient } from "./shared/broker-client.ts";
+export type { OrchestratorHost } from "./shared/orchestrator-host.ts";
+export { readOrchestratorHost, writeOrchestratorHost } from "./shared/orchestrator-host.ts";
 
 export {
   DEFAULT_BROKER_PORT,

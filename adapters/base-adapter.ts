@@ -3,7 +3,7 @@
  * BaseAdapter — Abstract base class for all agent MCP adapters.
  *
  * Extracts ALL shared logic from the original server.ts into a reusable
- * base that Claude, Codex, Gemini, and custom adapters extend.
+ * base that Claude, Codex, AGY, and custom adapters extend.
  *
  * Subclasses override:
  *   - deliverMessage(msg)  — how inbound messages reach the agent
@@ -78,7 +78,7 @@ const TOOLS = [
         },
         agent_type: {
           type: "string" as const,
-          enum: ["claude", "codex", "gemini", "custom", "all"],
+          enum: ["claude", "codex", "agy", "custom", "all"],
           description: "Optional filter by agent type. Defaults to all.",
         },
       },
@@ -205,7 +205,7 @@ const TOOLS = [
       properties: {
         limit: {
           type: "number" as const,
-          description: "Max messages to return (default 50).",
+          description: "Max messages to return (default 20, max 100).",
         },
         with_peer: {
           type: "string" as const,
@@ -311,11 +311,17 @@ const TOOLS = [
         status: {
           type: "string" as const,
           enum: ["pending", "in_progress", "done", "blocked"],
-          description: "New status for the plan item",
+          description: "New status for the plan item. In plan_execution use verify_plan_step for completion.",
         },
+        reason: { type: "string", description: "For blocked steps: problem, attempts and decision needed." },
       },
       required: ["item_id", "status"],
     },
+  },
+  {
+    name: "verify_plan_step",
+    description: "Run the approved checks for an execution step. Provide concise implementation and acceptance evidence. Only passing checks complete the step; two failures require a coordinator decision. Logs stay local.",
+    inputSchema: { type: "object" as const, properties: { item_id: { type: "number" }, summary: { type: "string" } }, required: ["item_id", "summary"] },
   },
   // --- Knowledge Store ---
   {
@@ -347,7 +353,7 @@ const TOOLS = [
   {
     name: "query_knowledge",
     description:
-      "Query shared knowledge stored by any teammate. Call on startup to understand decisions already made. Call during work to check if a pattern was already discovered.",
+      "Query shared knowledge stored by any teammate. Call on startup to understand decisions already made. Call during work to check if a pattern was already discovered. Returns the 20 most recently updated entries unless you raise `limit`.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -359,6 +365,16 @@ const TOOLS = [
         key: {
           type: "string" as const,
           description: "Get a specific entry by key. Omit to list all.",
+        },
+        limit: {
+          type: "number" as const,
+          description:
+            "Max entries to return, most recently updated first. Default 20, max 100.",
+        },
+        since: {
+          type: "string" as const,
+          description:
+            "Only return entries updated after this time. ISO-8601 timestamp or milliseconds since epoch. Use it to poll for what changed since your last query.",
         },
       },
     },
@@ -381,10 +397,23 @@ const TOOLS = [
 ];
 
 // ---------------------------------------------------------------------------
+// Knowledge query bounds (contract shared with broker.ts /knowledge/list)
+// ---------------------------------------------------------------------------
+
+const KNOWLEDGE_LIMIT_DEFAULT = 20;
+const KNOWLEDGE_LIMIT_MAX = 100;
+
+/** Coerce a caller-supplied limit into [1, KNOWLEDGE_LIMIT_MAX], defaulting to 20. */
+function clampKnowledgeLimit(limit?: number): number {
+  if (typeof limit !== "number" || !Number.isFinite(limit)) return KNOWLEDGE_LIMIT_DEFAULT;
+  return Math.min(Math.max(Math.floor(limit), 1), KNOWLEDGE_LIMIT_MAX);
+}
+
+// ---------------------------------------------------------------------------
 // Role-specific best practices injection (from role-practices.ts module)
 // ---------------------------------------------------------------------------
 
-import { getRolePractices, getStructuredRolePractices } from "./role-practices.ts";
+import { getRolePractices, getStructuredRolePractices, getRoleHandoffProtocol } from "./role-practices.ts";
 
 // ---------------------------------------------------------------------------
 // BaseAdapter
@@ -393,6 +422,7 @@ import { getRolePractices, getStructuredRolePractices } from "./role-practices.t
 export abstract class BaseAdapter {
   // --- Identity & state ---
   protected myId: PeerId | null = null;
+  protected brokerReady: Promise<void> = Promise.resolve();
   protected myCwd: string = process.cwd();
   protected myGitRoot: string | null = null;
   protected myTty: string | null = null;
@@ -480,7 +510,7 @@ export abstract class BaseAdapter {
     // Merge resources capability — base-adapter registers a ListResources
     // handler (empty list) for all adapters, so the capability MUST be
     // declared or the MCP SDK rejects resources/list requests. Codex and
-    // Gemini CLIs send resources/list during init even if not advertised.
+    // AGY may send resources/list during init even if not advertised.
     const subclassCapabilities = this.getCapabilities();
     const mergedCapabilities = { resources: {}, ...subclassCapabilities };
     this.mcp = new Server(
@@ -500,6 +530,7 @@ export abstract class BaseAdapter {
     //    Without registration, this.myId stays null and ALL tool handlers return
     //    "Not registered with broker yet" — making every MCP call a silent no-op.
     const brokerPromise = driverMode ? this.registerDriverModePeer() : this.registerWithBroker();
+    this.brokerReady = brokerPromise;
 
     // 5. Connect MCP over stdio — blocks until parent sends `initialize`
     //    Broker registration runs concurrently with this wait.
@@ -709,7 +740,9 @@ export abstract class BaseAdapter {
         if (slotData.slot_id) {
           envSlot = String(slotData.slot_id);
           if (slotData.role && !envRole) process.env.MULTIAGENTS_ROLE = slotData.role;
+          if (slotData.role_description && !process.env.MULTIAGENTS_ROLE_DESCRIPTION) process.env.MULTIAGENTS_ROLE_DESCRIPTION = slotData.role_description;
           if (slotData.name && !envName) process.env.MULTIAGENTS_NAME = slotData.name;
+          if (slotData.tier && !process.env.MULTIAGENTS_TIER) process.env.MULTIAGENTS_TIER = slotData.tier;
           this.log(`Slot info from PID file (ppid=${ppid}): slot=${envSlot}`);
         }
       } catch { /* no per-PID file — ok */ }
@@ -865,6 +898,7 @@ export abstract class BaseAdapter {
     }));
 
     this.mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
+      await this.brokerReady;
       const { name, arguments: args } = req.params;
 
       switch (name) {
@@ -898,12 +932,18 @@ export abstract class BaseAdapter {
           return this.handleCheckTeamStatus();
         case "get_plan":
           return this.handleGetPlan();
+        case "verify_plan_step": {
+          if (!this.sessionId || !this.myId) throw new Error("No active session");
+          const result = await this.broker.verifyPlanStep({ ...(args as { item_id: number; summary: string }), session_id: this.sessionId, peer_id: this.myId });
+          const item = result.items.find(i => i.id === (args as any).item_id);
+          return { content: [{ type: "text", text: JSON.stringify({ completion: result.completion, item }) }] };
+        }
         case "update_plan":
           return this.handleUpdatePlan(args as { item_id: number; status: string });
         case "store_knowledge":
           return this.handleStoreKnowledge(args as { key: string; value: string; category?: string });
         case "query_knowledge":
-          return this.handleQueryKnowledge(args as { category?: string; key?: string });
+          return this.handleQueryKnowledge(args as { category?: string; key?: string; limit?: number; since?: string | number });
         case "remove_knowledge":
           return this.handleRemoveKnowledge(args as { key: string });
         default:
@@ -968,7 +1008,6 @@ export abstract class BaseAdapter {
         to_id: args.to_id,
         text: args.message,
         session_id: this.sessionId ?? undefined,
-        from_slot_id: this.mySlot?.id ?? undefined,
       });
       if (!result.ok) {
         return this.errorResult(`Failed to send: ${result.error}`);
@@ -1195,7 +1234,7 @@ export abstract class BaseAdapter {
     }
     try {
       const messages = await this.broker.getMessageLog(this.sessionId, {
-        limit: args.limit ?? 50,
+        limit: Math.min(Math.max(Math.floor(args.limit ?? 20), 1), 100),
         since: args.since,
       });
 
@@ -1378,6 +1417,7 @@ export abstract class BaseAdapter {
         const isMe = item.assigned_to_slot === mySlotId;
         const youTag = isMe ? " ← YOU" : "";
         lines.push(`  ${marker} #${item.id}: ${item.label} (${assignee})${youTag}`);
+        if (item.execution) lines.push(JSON.stringify(item.execution));
       }
       lines.push(`\nTo update: call update_plan with item_id and status ("in_progress" or "done")`);
 
@@ -1387,7 +1427,7 @@ export abstract class BaseAdapter {
     }
   }
 
-  protected async handleUpdatePlan(args: { item_id: number; status: string }) {
+  protected async handleUpdatePlan(args: { item_id: number; status: string; reason?: string }) {
     if (!this.sessionId) {
       return { content: [{ type: "text", text: "No active session — cannot update plan." }] };
     }
@@ -1395,6 +1435,8 @@ export abstract class BaseAdapter {
       const result = await this.broker.updatePlanItem({
         item_id: args.item_id,
         status: args.status,
+        reason: args.reason,
+        peer_id: this.myId ?? undefined,
         session_id: this.sessionId,
       }) as any;
 
@@ -1436,7 +1478,12 @@ export abstract class BaseAdapter {
     }
   }
 
-  protected async handleQueryKnowledge(args: { category?: string; key?: string }) {
+  protected async handleQueryKnowledge(args: {
+    category?: string;
+    key?: string;
+    limit?: number;
+    since?: string | number;
+  }) {
     if (!this.sessionId) {
       return { content: [{ type: "text" as const, text: "Not in a session — knowledge requires a session." }], isError: true };
     }
@@ -1450,16 +1497,30 @@ export abstract class BaseAdapter {
         return { content: [{ type: "text" as const, text: `[${entry.category}] ${entry.key}${by}:\n${entry.value}` }] };
       }
 
-      const entries = await this.broker.listKnowledge(this.sessionId, args.category as KnowledgeCategory | undefined);
+      // Clamp adapter-side too: the broker applies the same bounds, but an
+      // unbounded list is exactly the response-growth problem this guards.
+      const limit = clampKnowledgeLimit(args.limit);
+      const entries = await this.broker.listKnowledge(
+        this.sessionId,
+        args.category as KnowledgeCategory | undefined,
+        {
+          limit,
+          since: args.since,
+        },
+      );
       if (!entries.length) {
-        return { content: [{ type: "text" as const, text: "No knowledge entries found. You can add entries with store_knowledge." }] };
+        const scope = args.since ? ` updated after ${args.since}` : "";
+        return { content: [{ type: "text" as const, text: `No knowledge entries found${scope}. You can add entries with store_knowledge.` }] };
       }
 
       const lines = entries.map((e) => {
         const by = e.created_by_name ? ` (by ${e.created_by_name})` : "";
         return `[${e.category}] ${e.key}${by}: ${e.value}`;
       });
-      return { content: [{ type: "text" as const, text: `Shared knowledge (${entries.length} entries):\n\n${lines.join("\n\n")}` }] };
+      const more = entries.length >= limit
+        ? ` — capped at ${limit}, raise \`limit\` (max ${KNOWLEDGE_LIMIT_MAX}) or filter by category/since to see more`
+        : "";
+      return { content: [{ type: "text" as const, text: `Shared knowledge (${entries.length} entries${more}):\n\n${lines.join("\n\n")}` }] };
     } catch (e) {
       return { content: [{ type: "text" as const, text: `Failed to query knowledge: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
     }
@@ -1604,221 +1665,135 @@ export abstract class BaseAdapter {
     }
   }
 
+  // --- Shared system prompt ---
+
+  /**
+   * The team-membership preamble shared by every adapter.
+   *
+   * This used to be copy-pasted (and drift) across claude/codex/agy adapters.
+   * Adapters now pass only what actually differs: how inbound messages reach
+   * them, and any transport-specific "do not" lines. Role context is appended
+   * here so subclasses don't repeat that either.
+   */
+  protected getBaseTeamPrompt(opts?: {
+    /** Adapter-specific block describing how inbound messages arrive. */
+    transport?: string;
+    /** Extra bullets for the DO NOT list. */
+    extraDonts?: string[];
+  }): string {
+    const transport = opts?.transport ? `\n${opts.transport}\n` : "";
+    const extraDonts = (opts?.extraDonts ?? []).map(d => `  ✗ ${d}`).join("\n");
+
+    const base = `You are a multiagents team member. Use the multiagents-peer MCP tools; teammates see only what you publish through them.
+${transport}
+START: set_summary, check_team_status, get_plan, check_messages.
+WORK: batch related actions; check in only at meaningful milestones or when blocked. Reply promptly to teammate questions.
+DONE: call signal_done once with changes and verification evidence, then check_messages for review.
+DO NOT use CLI/HTTP instead of MCP, finish without signal_done, or ignore teammate messages.
+${extraDonts ? extraDonts + "\n" : ""}Keep summaries and messages concise; put durable decisions in shared knowledge.`;
+
+    if (this.roleContext) {
+      return `${base}\n\n--- ROLE CONTEXT ---\n${this.roleContext}`;
+    }
+    return base;
+  }
+
   // --- Lifecycle prompt ---
 
-  protected getLifecyclePromptSection(): string {
+  /**
+   * Compact operating-system prompt injected into every agent.
+   *
+   * Kept deliberately short: this text is a fixed per-agent token cost paid on
+   * every session. Role-specific handoff protocols live in role-practices.ts
+   * and are appended only for the matching role, and only for tiers that can
+   * afford them (see getLifecyclePromptSection).
+   */
+  protected getLifecycleCore(): string {
     return `
 
 === AGENT OPERATING SYSTEM ===
 
-You are a team member in a multi-agent session. The system enforces that you CANNOT disconnect until explicitly released. This is non-negotiable and enforced server-side.
+You are a team member in a multi-agent session. You CANNOT disconnect until explicitly released — this is enforced server-side.
 
---- 1. PLANNING ---
+--- 1. PLAN BEFORE YOU BUILD ---
+- 3+ steps: outline your approach before starting. Write a spec for non-trivial work.
+- Resolve unknowns FIRST: send_message the teammate who owns the answer, wait for the reply, ask follow-ups until zero questions remain. Do not guess.
+- If an approach fails: stop and re-plan. Do not brute-force.
+- Call update_plan when your items change status.
 
-Before writing any code, PLAN:
-- For tasks with 3+ steps: outline your approach in a message to the team before starting.
-- Write detailed specs for non-trivial work. Ambiguity causes rework.
-- If something breaks or your approach fails: STOP. Re-plan. Do not brute-force.
-- Update the plan as you learn: call update_plan when items change status.
-
---- 2. DEPENDENCY RESOLUTION & CLARIFICATION PROTOCOL ---
-
-BEFORE you begin implementation, verify you have everything you need:
-- Read the specs/requirements from your teammates carefully. Identify ANY unknowns, ambiguities, missing details, or assumptions.
-- For EACH unknown: send a specific question to the relevant teammate via send_message. Do NOT guess or assume.
-- WAIT for their response. Check check_messages repeatedly until you get answers.
-- If the answer raises new questions, ask follow-up questions. Continue this loop until EVERY unknown is resolved.
-- Only begin implementation once you have zero open questions.
-
-This applies in BOTH directions:
-- If YOU receive questions from a teammate: respond IMMEDIATELY with clear, specific answers. If you need to research or think, say so and give a timeline.
-- If a teammate's answer is unclear: say so and ask them to clarify. Do NOT proceed with ambiguous information.
-
-The pattern is: ASK → RECEIVE → VERIFY → (if unclear) ASK AGAIN → RECEIVE → VERIFY → ... → ALL CLEAR → PROCEED.
-
---- 3. EXECUTION ---
-
-Work autonomously and decisively:
-- Break your task into steps. Complete each fully before moving on.
-- Use acquire_file BEFORE editing any shared file. Release when done.
-- Prefer simple, clean solutions. Ask yourself: "Is there a simpler way?"
-- No TODO comments, no placeholder logic, no "fix later" patterns.
+--- 2. EXECUTION ---
+- Break the task into steps and finish each one fully.
+- acquire_file before editing a shared file; release_file when done.
+- Prefer the simple solution. No TODO comments, no placeholder logic, no "fix later".
 - Match complexity to the task — don't overengineer small changes, don't underengineer critical ones.
 
---- 4. VERIFICATION BEFORE DONE ---
-
+--- 3. VERIFY BEFORE DONE ---
 NEVER call signal_done without proof your work is correct:
-- Run the code. Check the output. Test edge cases.
-- Compare expected vs actual behavior.
-- Check for: missing error handling, untested paths, hardcoded values, security issues.
-- Ask yourself: "Would a senior engineer approve this as production-ready?"
-- If you cannot verify (no test runner, no simulator), explain what you verified manually.
+- Run the code. Check the output. Test edge cases and error paths.
+- Look for missing error handling, hardcoded values, security issues.
+- If you cannot run it, state exactly what you verified by hand.
+Your signal_done summary MUST say: what changed, what was tested, what the results were.
+signal_done is MANDATORY. Your work is not registered as complete without it — never finish without calling it once.
 
-signal_done summary MUST include: what changed, what was tested, what the results were.
+--- 4. FEEDBACK LOOPS ---
+- Address EVERY feedback item. Fix root causes, not symptoms.
+- Re-check all prior feedback before re-submitting, then signal_done again.
+- When YOU give feedback: cite file:line, repro steps, severity, and mark blocking vs suggestion. "Looks good" is not feedback.
+- The loop is signal_done → review → fix → signal_done, until a reviewer/QA calls approve(). Never assume approval.
 
---- 5. FEEDBACK & REVIEW LOOPS ---
+--- 5. COMMUNICATION CADENCE ---
+Teammates can see ONLY your set_summary text, your send_message calls, and your signal_done / submit_feedback / approve calls. They cannot see your file writes, shell output, or reasoning. If you don't call these tools, you are invisible to the team.
 
-When you receive feedback:
-- Address EVERY item. Do not skip or defer.
-- Trace the root cause — don't patch symptoms.
-- Before re-submitting, review ALL prior feedback to ensure you haven't reintroduced old issues.
-- Internalize patterns: if you made a mistake, don't repeat it in this session.
-- Then call signal_done again with a clear diff of what you fixed.
+Check in at MEANINGFUL MILESTONES — not after every command:
+- Before or after a batch of related actions (a group of edits, a build, a test run).
+- When you finish a step, change direction, hit a blocker, or learn something a teammate needs.
+- When a teammate messages you or is blocked on you: reply via send_message right away.
+Batch your work between check-ins. Don't spend a tool call on a status update that says nothing new.
+Do NOT go silent for 1+ minute of active work — one short set_summary or check_messages is enough to stay visible.
+While idle or waiting: poll check_messages / check_team_status periodically and set_summary("Idle — waiting for <what>. Ready to help with <skills>").
 
-When you give feedback (reviewers/QA):
-- Be specific: file paths, line numbers, reproduction steps, severity.
-- Distinguish blocking issues (actionable=true) from suggestions (actionable=false).
-- "Looks good" is not feedback. Cite specific files, line numbers, test results, and what you verified.
+--- 6. ESCALATION ---
+Blocked by something outside your control — missing infrastructure or credentials, a teammate unresponsive after 3+ messages, requirements nobody can answer?
+→ send_message(to_id="orchestrator", message="BLOCKED: <what you need and why>")
 
-The review loop is: signal_done → review → feedback (actionable) → fix → signal_done → re-review → ... → approve.
-This loop MUST continue until the reviewer/QA explicitly calls approve(). Do NOT assume approval.
+--- 7. SHARED KNOWLEDGE ---
+- On start: call query_knowledge() to read prior decisions before making your own.
+- During work: store_knowledge(key, value, category) for decisions, discoveries, and blockers. Keep entries to 1-3 sentences.
+- Contradicting an existing decision without discussing it wastes everyone's time.
 
---- 6. TEAM AWARENESS (MANDATORY COMMUNICATION CADENCE) ---
-
-You MUST maintain continuous communication. Your teammates are BLOCKED if you go silent.
-
-MANDATORY CADENCE — follow this rhythm without exception:
-- AFTER EVERY shell command: call check_messages + set_summary
-- AFTER EVERY file write: call check_messages + set_summary
-- AFTER EVERY build/test: call check_messages + set_summary with results
-- EVERY 2-3 MINUTES minimum: call check_messages even if doing nothing
-- When waiting for others: call check_messages + check_team_status every 10 seconds
-
-PROACTIVE BEHAVIOR — do these without being asked:
-- If a teammate signals done and your role involves review/QA: START IMMEDIATELY. Do not wait.
-- If you see a teammate stuck: message them with specific help via send_message.
-- If you finish a plan item: call update_plan to mark it done, then set_summary.
-- If your work changes: call set_summary so teammates see the update in real-time.
-
-YOUR TEAMMATES CAN ONLY SEE:
-- Your set_summary text (visible in check_team_status)
-- Messages you send via send_message
-- Your signal_done / submit_feedback / approve calls
-They CANNOT see your file writes, shell output, or internal reasoning.
-If you don't call these tools, you are INVISIBLE to the team.
-
---- 7. BUG FIXING ---
-
-When bugs are reported to you:
-- Investigate autonomously. Trace logs, read error output, find the root cause.
-- Do NOT ask "what should I do?" — you are the expert on your code.
-- Fix the root cause, not the symptom.
-- Verify the fix resolves the issue AND doesn't break other things.
-- Then signal_done with the fix summary.
-
---- 8. HANDOFF PROTOCOL (role-specific workflows) ---
-
-Software Engineers:
-  1. Receive specs/task → read carefully → identify ALL unknowns
-  2. Ask Designer/spec-writer via send_message → wait for answer → verify clarity → repeat until ZERO unknowns
-  3. Implement with TDD: write failing test → implement → verify → refactor
-  4. Run linters, type checkers, full test suite. Fix ALL issues.
-  5. signal_done with proof: test output, build log, manual verification results
-  6. Receive Code Reviewer feedback → fix ALL [BLOCKING] items → signal_done again
-  7. Receive QA bugs → fix → signal_done → QA re-tests
-  8. Loop steps 6-7 until BOTH Reviewer AND QA call approve() on you
-
-UI/UX Designers:
-  1. Analyze requirements → produce detailed spec with ALL component states
-  2. signal_done with the spec deliverable
-  3. Answer ALL engineer questions IMMEDIATELY via send_message — they are blocked on you
-  4. Review engineer implementation against your spec → provide visual feedback
-  5. Done when: engineer matches spec AND QA approves accessibility
-
-Code Reviewers:
-  1. Monitor check_team_status — when any engineer reaches "done_pending_review", START IMMEDIATELY
-  2. Read ALL changed files + trace cross-file dependencies
-  3. Check: security (OWASP Top 10), performance, architecture, code smells, test coverage
-  4. submit_feedback with prefixes: [BLOCKING] for must-fix, [SUGGESTION] for nice-to-have
-  5. After engineer fixes → RE-REVIEW every prior [BLOCKING] issue + inspect new changes
-  6. approve() ONLY when zero [BLOCKING] issues remain
-  7. Continue monitoring — QA may find issues requiring engineer re-work and another review round
-
-QA Engineers:
-  1. Monitor check_team_status — when any engineer reaches "done_pending_review", START IMMEDIATELY
-  2. Design a platform-appropriate test plan (see your ROLE-SPECIFIC PRACTICES for platform details)
-  3. Execute ALL tests: happy path + edge cases + error states + platform lifecycle
-  4. Use ALL available tools: browser automation for web, emulator for mobile, CLI for commands
-  5. submit_feedback(actionable=true) with [P0-P3] severity + file:line + repro steps for each bug
-  6. After engineer fixes → RE-TEST every bug + run regression on related features
-  7. approve() ONLY when ALL P0/P1 bugs fixed and app works end-to-end on target platform
-  8. If you need infrastructure: send_message(to_id="orchestrator", "BLOCKED: Need [what] for [why]")
-
-CRITICAL FOR ALL ROLES:
-- Do NOT call signal_done or approve() prematurely.
-- The session continues until EVERY team member's work is approved by ALL relevant parties.
-- If you are waiting: call check_team_status and check_messages every few seconds. Pick up new work.
-- If a teammate is unresponsive after 3+ messages: escalate to orchestrator.
-
---- 9. ESCALATION TO ORCHESTRATOR ---
-
-When you are BLOCKED by something outside your control:
-- Missing infrastructure (emulator, simulator, test database, etc.)
-- Need a dependency installed or configured
-- Need access/credentials to a service
-- A teammate is unresponsive after multiple attempts (3+ messages with no reply)
-- Unclear requirements that no teammate can answer
-
-Send a message to the orchestrator: send_message(to_id="orchestrator", message="BLOCKED: [specific description of what you need and why]")
-The orchestrator will either resolve it directly or communicate with the user.
-
---- 10. COMMUNICATION STANDARDS ---
-
-EVERY message and status update must be via MCP tools. Your team sees NOTHING else.
-
-- When starting work: set_summary("Starting: <what>")
-- After each step: set_summary("<what you did> → <result>")
-- When blocked: send_message to the right person + set_summary("BLOCKED: <what I need>")
-- When asked a question: send_message reply within 1 minute
-- When done: signal_done with proof (test output, build results, verification)
-- When receiving feedback: send_message("Acknowledged, fixing now") → fix → signal_done
-
-NEVER let 1 minute pass without a set_summary or check_messages call.
-
---- 11. STAYING ACTIVE ---
-
-The system DENIES disconnect attempts until you are released. While waiting:
-- Call check_messages every 10 seconds
-- Call check_team_status every 30 seconds
-- If a teammate needs review: start immediately (submit_feedback or approve)
-- If a teammate is blocked on you: respond via send_message immediately
-- If truly idle: set_summary("Idle — waiting for <what>. Ready to help with <skills>")
-- NEVER go silent. The orchestrator monitors your activity. Silent agents get nudged and may be restarted.
-
---- 12. COMPLETION CRITERIA (cross-role dependency matrix) ---
-
-The SESSION is NOT complete until ALL of these conditions are met:
-- Every Engineer: approved by BOTH Code Reviewer AND QA Engineer
-- Every Designer: specs confirmed implementable by Engineer, accessibility verified by QA
-- Every Reviewer: has reviewed and approved ALL Engineers
-- Every QA: has tested and approved ALL Engineers
-- Plan: 100% of items marked "done"
-
-YOUR individual work is not done until:
-- Your deliverable is complete and verified (see YOUR COMPLETION CRITERIA in role context)
-- You have called signal_done with specific proof of correctness
-- ALL relevant teammates have called approve() on you (or you have called approve() on all of them if you are a reviewer/QA)
-- You have addressed ALL feedback — zero unresolved items
-- Your plan items are marked "done"
-
-If ANY condition is unmet, continue the feedback loop. Do NOT go silent.
-When ALL conditions are met, set your summary to "All work approved, ready for release."
-
---- 13. SHARED KNOWLEDGE ---
-
-Your team has a shared knowledge store that persists across agent restarts.
-
-ON START (after check_team_status and get_plan):
-- Call query_knowledge() to read all existing entries. This tells you what decisions have been made, what patterns were discovered, and what constraints exist.
-
-DURING WORK:
-- When you make an architectural decision: store_knowledge(key, value, category="decision")
-- When you discover a codebase pattern: store_knowledge(key, value, category="discovery")
-- When you find a blocker or constraint: store_knowledge(key, value, category="blocker")
-- Keep entries concise (1-3 sentences). Your teammates will read every entry.
-
-IMPORTANT: Query knowledge BEFORE making decisions. A teammate may have already decided on an approach. Contradicting existing decisions without discussion wastes everyone's time.
+--- 8. WHAT "DONE" MEANS ---
+- Deliverable complete and verified, and signal_done called with proof.
+- Every feedback item addressed, and the relevant reviewers/QA have called approve() on you.
+- Your plan items marked done. The SESSION ends only when all of that holds for everyone.
 `;
+  }
+
+  /**
+   * Full lifecycle prompt = compact core + (for non-economy tiers) the handoff
+   * protocol matching this agent's role.
+   *
+   * Role and tier come from the MULTIAGENTS_ROLE / MULTIAGENTS_TIER env vars
+   * set by the orchestrator's launcher. This runs during MCP server
+   * construction, before the slot is fetched from the broker, so the slot's
+   * role is not yet available here — the env vars are the only source.
+   * Standalone agents (no launcher) get the core only, which is the safe
+   * default: nothing role-specific is guessed.
+   */
+  protected getLifecyclePromptSection(): string {
+    const core = this.getLifecycleCore();
+
+    // economy tier pays for the core only — the handoff protocol is the
+    // largest optional block and the least useful on a small model.
+    const tier = process.env.MULTIAGENTS_TIER;
+    if (tier === "economy") return core;
+
+    const handoff = getRoleHandoffProtocol(
+      process.env.MULTIAGENTS_ROLE ?? null,
+      process.env.MULTIAGENTS_ROLE_DESCRIPTION ?? null,
+    );
+    if (!handoff) return core;
+
+    return `${core}\n${handoff}\n`;
   }
 
   // --- Helpers ---

@@ -71,10 +71,10 @@ describe("mcpServerCommand", () => {
     expect(result.args).toContain("codex");
   });
 
-  test("returns bun + cli.ts path for gemini", () => {
-    const result = mcpServerCommand("gemini");
+  test("returns bun + cli.ts path for agy", () => {
+    const result = mcpServerCommand("agy");
     expect(result.command).toBe("bun");
-    expect(result.args).toContain("gemini");
+    expect(result.args).toContain("agy");
   });
 
   test("cli.ts path is absolute", () => {
@@ -138,6 +138,16 @@ describe("buildCliArgs — claude", () => {
     const args = buildCliArgs("claude", task);
     const mcpJson = JSON.parse(getFlagValue(args, "--mcp-config"));
     expect(mcpJson.mcpServers["multiagents-peer"].args).toContain("claude");
+  });
+
+  test("forwards optimizer tier and role description to the MCP adapter", () => {
+    const args = buildCliArgs("claude", task, {
+      MULTIAGENTS_TIER: "economy",
+      MULTIAGENTS_ROLE_DESCRIPTION: "Implement a bounded change.",
+    });
+    const mcpArgs = JSON.parse(getFlagValue(args, "--mcp-config")).mcpServers["multiagents-peer"].args;
+    expect(getFlagValue(mcpArgs, "--tier")).toBe("economy");
+    expect(getFlagValue(mcpArgs, "--role-description")).toBe("Implement a bounded change.");
   });
 
   test("ends with -p and the task", () => {
@@ -207,6 +217,16 @@ describe("buildCliArgs — codex", () => {
     expect(cFlags).toContain('model_reasoning_effort="high"');
   });
 
+  test("applies optimizer model and reasoning policy", () => {
+    const args = buildCliArgs("codex", task, undefined, {
+      model: "test-economy",
+      reasoning_effort: "low",
+      max_output_tokens: 2_000,
+    });
+    expect(getFlagValue(args, "--model")).toBe("test-economy");
+    expect(collectFlagValues(args, "-c")).toContain('model_reasoning_effort="low"');
+  });
+
   test("task is the last argument", () => {
     const args = buildCliArgs("codex", task);
     expect(args[args.length - 1]).toBe(task);
@@ -219,39 +239,33 @@ describe("buildCliArgs — codex", () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildCliArgs — Gemini
+// buildCliArgs — Antigravity
 // ---------------------------------------------------------------------------
-describe("buildCliArgs — gemini", () => {
+describe("buildCliArgs — agy", () => {
   const task = "Do something";
 
-  test("starts with -y @google/gemini-cli for npx invocation", () => {
-    const args = buildCliArgs("gemini", task);
-    expect(args[0]).toBe("-y");
-    expect(args[1]).toBe("@google/gemini-cli");
+  test("starts directly with AGY runtime flags", () => {
+    const args = buildCliArgs("agy", task);
+    expect(args[0]).toBe("--sandbox");
   });
 
   test("includes --sandbox", () => {
-    const args = buildCliArgs("gemini", task);
+    const args = buildCliArgs("agy", task);
     expect(args).toContain("--sandbox");
   });
 
-  test("includes --approval-mode yolo for autonomous operation", () => {
-    const args = buildCliArgs("gemini", task);
-    expect(getFlagValue(args, "--approval-mode")).toBe("yolo");
+  test("includes --dangerously-skip-permissions for autonomous operation", () => {
+    const args = buildCliArgs("agy", task);
+    expect(args).toContain("--dangerously-skip-permissions");
   });
 
   test("includes --output-format stream-json", () => {
-    const args = buildCliArgs("gemini", task);
+    const args = buildCliArgs("agy", task);
     expect(getFlagValue(args, "--output-format")).toBe("stream-json");
   });
 
-  test("restricts MCP to multiagents only via --allowed-mcp-server-names", () => {
-    const args = buildCliArgs("gemini", task);
-    expect(getFlagValue(args, "--allowed-mcp-server-names")).toBe("multiagents-peer");
-  });
-
   test("ends with -p and the task", () => {
-    const args = buildCliArgs("gemini", task);
+    const args = buildCliArgs("agy", task);
     const pIdx = args.lastIndexOf("-p");
     expect(pIdx).toBeGreaterThan(-1);
     expect(args[pIdx + 1]).toBe(task);
@@ -473,6 +487,13 @@ describe("detectAgent", () => {
     }
   });
 
+  test("detects agy if installed", async () => {
+    const result = await detectAgent("agy");
+    if (result.available) {
+      expect(result.path).toBeDefined();
+    }
+  });
+
   test("returns available: false for custom type", async () => {
     const result = await detectAgent("custom");
     expect(result.available).toBe(false);
@@ -494,28 +515,28 @@ describe("MCP config consistency across agent types", () => {
   test("all agent types reference the same cli.ts path", () => {
     const claudeMcp = mcpServerCommand("claude");
     const codexMcp = mcpServerCommand("codex");
-    const geminiMcp = mcpServerCommand("gemini");
+    const agyMcp = mcpServerCommand("agy");
 
     expect(claudeMcp.args[0]).toBe(codexMcp.args[0]);
-    expect(codexMcp.args[0]).toBe(geminiMcp.args[0]);
+    expect(codexMcp.args[0]).toBe(agyMcp.args[0]);
   });
 
   test("all agent types use bun as the MCP server command", () => {
     expect(mcpServerCommand("claude").command).toBe("bun");
     expect(mcpServerCommand("codex").command).toBe("bun");
-    expect(mcpServerCommand("gemini").command).toBe("bun");
+    expect(mcpServerCommand("agy").command).toBe("bun");
   });
 
   test("each agent type gets its own --agent-type flag value", () => {
     const claudeArgs = mcpServerCommand("claude").args;
     const codexArgs = mcpServerCommand("codex").args;
-    const geminiArgs = mcpServerCommand("gemini").args;
+    const agyArgs = mcpServerCommand("agy").args;
 
     const getAgentType = (args: string[]) => getFlagValue(args, "--agent-type");
 
     expect(getAgentType(claudeArgs)).toBe("claude");
     expect(getAgentType(codexArgs)).toBe("codex");
-    expect(getAgentType(geminiArgs)).toBe("gemini");
+    expect(getAgentType(agyArgs)).toBe("agy");
   });
 
   test("claude --mcp-config JSON and codex mcpServerCommand reference same binary", () => {
@@ -554,7 +575,7 @@ describe("buildTeamContext", () => {
       listSlots: async () => [
         { id: 1, display_name: "Self", agent_type: "claude", role: "engineer", status: "connected", paused: false },
         { id: 2, display_name: "Peer-A", agent_type: "codex", role: "reviewer", status: "connected", paused: false },
-        { id: 3, display_name: "Peer-B", agent_type: "gemini", role: "tester", status: "disconnected", paused: false },
+        { id: 3, display_name: "Peer-B", agent_type: "agy", role: "tester", status: "disconnected", paused: false },
       ],
     } as any;
 

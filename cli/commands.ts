@@ -12,7 +12,7 @@ const BROKER_URL = `http://${BROKER_HOSTNAME}:${BROKER_PORT}`;
 const COMMAND_HELP: Record<string, string> = {
   "setup": `multiagents setup
 
-  Interactive setup wizard. Detects installed agent CLIs (Claude Code, Codex, Gemini),
+  Interactive setup wizard. Detects installed agent CLIs (Claude Code, Codex, AGY),
   configures MCP servers, and starts the broker daemon.
 
   Run this once after installing multiagents.
@@ -97,10 +97,21 @@ const COMMAND_HELP: Record<string, string> = {
 
   Configure MCP servers for all detected agent CLIs.
   Writes to ~/.claude/.mcp.json (Claude), ~/.codex/config.toml (Codex),
-  and ~/.gemini/settings.json (Gemini).
+  and ~/.gemini/config/mcp_config.json (Antigravity).
 
   Example:
     multiagents install-mcp`,
+
+  "orchestrator": `multiagents orchestrator <status|set HOST>
+
+  Show or change which agent CLI hosts the multiagents orchestrator.
+  HOST must be one of: claude, codex, agy.
+
+  Restart your agent CLIs after switching.
+
+  Examples:
+    multiagents orchestrator status
+    multiagents orchestrator set agy`,
 };
 
 function printUsage(topic?: string): void {
@@ -123,13 +134,13 @@ Commands:
   broker start|stop|status        Manage broker daemon
   install-mcp                     Configure MCP servers
   mcp-server [--agent-type <t>]   Run agent MCP server (internal)
-  orchestrator                    Run orchestrator MCP server (internal)
+  orchestrator status|set <host>  Show or switch the orchestrator host
   help [command]                  Show help (optionally for a specific command)
 
 Getting Started:
   1. multiagents setup                    # Configure MCP + detect agents
-  2. Restart Claude Code                  # Load multiagents tools
-  3. Ask Claude to create a team          # Or use the orchestrator MCP
+  2. Restart the selected agent CLI       # Load multiagents tools
+  3. Ask it to create a team              # Via the orchestrator MCP
 
 Quick Examples:
   multiagents setup                       # First-time setup
@@ -300,14 +311,24 @@ export async function runCli(args: string[]): Promise<void> {
       if (slotIdx !== -1 && args[slotIdx + 1]) process.env.MULTIAGENTS_SLOT = args[slotIdx + 1];
       const roleIdx = args.indexOf("--role");
       if (roleIdx !== -1 && args[roleIdx + 1]) process.env.MULTIAGENTS_ROLE = args[roleIdx + 1];
+      const roleDescriptionIdx = args.indexOf("--role-description");
+      if (roleDescriptionIdx !== -1 && args[roleDescriptionIdx + 1]) process.env.MULTIAGENTS_ROLE_DESCRIPTION = args[roleDescriptionIdx + 1];
       const nameIdx = args.indexOf("--name");
       if (nameIdx !== -1 && args[nameIdx + 1]) process.env.MULTIAGENTS_NAME = args[nameIdx + 1];
+      const tierIdx = args.indexOf("--tier");
+      if (tierIdx !== -1 && args[tierIdx + 1]) process.env.MULTIAGENTS_TIER = args[tierIdx + 1];
       await import("../server.ts");
       break;
     }
 
     case "orchestrator": {
-      await import("../orchestrator/orchestrator-server.ts");
+      if (args[1] === "status" || args[1] === "get" || args[1] === "set") {
+        const { orchestratorHostCommand } = await import("./orchestrator-host.ts");
+        await orchestratorHostCommand(args.slice(1));
+      } else {
+        // Internal server entrypoint retained for direct/manual MCP configs.
+        await import("../orchestrator/orchestrator-server.ts");
+      }
       break;
     }
 

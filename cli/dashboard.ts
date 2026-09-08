@@ -48,6 +48,18 @@ const INVERSE = `${ESC}[7m`;
 
 type ResolvedSlotStatus = Slot["status"] | "starting";
 
+/** The model the token optimizer picked for this slot (see shared/model-routing.ts), read back
+ *  from the context_snapshot the launcher/escalation logic persists on every tier change. */
+function slotModel(slot: Slot): string | null {
+  if (!slot.context_snapshot) return null;
+  try {
+    const optimization = JSON.parse(slot.context_snapshot)?.optimization;
+    return optimization?.model ?? optimization?.tier ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function colorStatus(status: string): string {
   switch (status) {
     case "connected": case "active": case "ok": return `${GREEN}${status}${RESET}`;
@@ -694,7 +706,8 @@ function renderAgentsTab(state: DashboardState, sid: string | null, cols: number
       " ",
       "Name".padEnd(18),
       "Type".padEnd(8),
-      "Role".padEnd(18),
+      "Role".padEnd(14),
+      "Model".padEnd(14),
       "Conn".padEnd(14),
       "Task".padEnd(14),
     ];
@@ -707,11 +720,12 @@ function renderAgentsTab(state: DashboardState, sid: string | null, cols: number
 
       const name = truncate(slot.display_name ?? "—", 16);
       const type = slot.agent_type.padEnd(8);
-      const role = truncate(slot.role ?? "—", 16);
+      const role = truncate(slot.role ?? "—", 12);
       const connStatus = colorStatus(r.status);
       const taskState = colorTaskState(slot.task_state ?? "idle");
+      const model = truncate(slotModel(slot) ?? "—", 12);
 
-      let line = `${prefix}${name.padEnd(18)}${type}${role.padEnd(18)}${padRight(connStatus, 14)}${taskState}`;
+      let line = `${prefix}${name.padEnd(18)}${type}${role.padEnd(14)}${MAGENTA}${model.padEnd(14)}${RESET}${padRight(connStatus, 14)}${taskState}`;
 
       // Show summary for selected agent
       if (isSelected && r.peer?.summary) {

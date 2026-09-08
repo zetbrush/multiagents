@@ -34,52 +34,13 @@ export class CodexAdapter extends BaseAdapter {
       ? `\nYour INBOX FILE: ${this.inboxPath}`
       : "\nYour INBOX FILE: .multiagents/inbox/<your-name>.md (created after registration)";
 
-    const base = `You are a team member on the multiagents network. You MUST use the multiagents-peer MCP tools to communicate. Your team CANNOT see your work unless you tell them.
-
-═══ COMMUNICATION IS YOUR #1 PRIORITY ═══
-
-You have MCP tools from the "multiagents-peer" server. USE THEM — not shell commands, not HTTP calls, not CLI scripts. The MCP tools are:
-  set_summary, check_messages, send_message, check_team_status, get_plan,
-  update_plan, signal_done, submit_feedback, approve, list_peers,
-  acquire_file, release_file, view_file_locks, get_history
-
-BEFORE ANY OTHER WORK — call these MCP tools in this exact order:
-  1. set_summary → describe your task in one line
-  2. check_team_status → see your teammates and their roles
-  3. get_plan → see the plan and your assigned items
-  4. check_messages → read pending messages from teammates
-
-AFTER EVERY SHELL COMMAND OR FILE WRITE:
-  → Call check_messages (teammates may have sent critical updates — THIS IS MANDATORY)
-  → Call set_summary with what you just did
-  → Read your inbox file for real-time messages from teammates${inboxHint}
-
-DURING LONG-RUNNING OPERATIONS (builds, tests, installs that take >1 minute):
-  → Before starting: call set_summary with "Starting <operation>"
-  → After completion: call check_messages IMMEDIATELY — messages queue while you work
-  → The orchestrator will deliver queued messages as a "NEW MESSAGES FROM TEAMMATES" prompt
-  → When you receive that prompt: process it FULLY (reply to all, set_summary, check_messages again) before resuming
-
-WHEN YOU FINISH YOUR TASK:
-  → Call signal_done with what you built, tested, and results
-  → Then call check_messages every 10s waiting for review feedback
-
-WHEN A TEAMMATE MESSAGES YOU:
-  → Reply via send_message IMMEDIATELY — they are blocked waiting on you
-
-DO NOT:
-  ✗ Work for 1+ minute without calling check_messages
-  ✗ Finish without calling signal_done
-  ✗ Ignore teammate messages
-  ✗ Try to use CLI/HTTP to talk to the broker — use MCP tools only
-  ✗ Go silent — if you have nothing to do, call check_team_status and set_summary "Idle, ready to help"
-
-QUALITY: Production-grade code. Plan before coding. Verify before signaling done.`;
-
-    if (this.roleContext) {
-      return `${base}\n\n--- ROLE CONTEXT ---\n${this.roleContext}`;
-    }
-    return base;
+    return this.getBaseTeamPrompt({
+      transport: `INBOUND MESSAGES: you have no push channel — teammates reach you through your inbox file.
+  → Read it whenever you check in, and after any operation that ran longer than a minute${inboxHint}
+  → Messages queue while you work: after a long build/test/install, call check_messages IMMEDIATELY
+  → The orchestrator may inject a "NEW MESSAGES FROM TEAMMATES" prompt — process it FULLY (reply to all, set_summary) before resuming`,
+      extraDonts: ["Try to use CLI/HTTP to talk to the broker — use MCP tools only"],
+    });
   }
 
   /**
@@ -224,13 +185,7 @@ QUALITY: Production-grade code. Plan before coding. Verify before signaling done
     parts.push(
       "",
       "── ACTION REQUIRED ──",
-      "You now have full team context. Use multiagents-peer MCP tools to communicate:",
-      "  → set_summary after every major action (so teammates see your progress)",
-      "  → check_messages after every shell command (teammates may have updates)",
-      "  → send_message to reply to teammates (they are waiting on you)",
-      "  → signal_done when finished (with proof: test output, build results)",
-      "  → update_plan to mark items in_progress/done as you work",
-      "DO NOT go 1+ minute without calling check_messages.",
+      "Use multiagents-peer at meaningful milestones: reply to teammates, update changed status/plan items, and signal_done with verification evidence.",
       "════════════════════════════════════════════════════════════",
       "",
     );

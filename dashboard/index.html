@@ -166,6 +166,7 @@
     .badge-released { background: rgba(125,133,144,0.1); color: var(--text-muted); }
     .badge-connected { background: rgba(63,185,80,0.15); color: var(--green); }
     .badge-disconnected { background: rgba(248,81,73,0.15); color: var(--red); }
+    .badge-model { background: rgba(188,140,255,0.15); color: var(--purple); font-family: monospace; }
 
     /* --- Message feed --- */
     .msg-feed { max-height: calc(100vh - 160px); overflow-y: auto; }
@@ -584,9 +585,13 @@
       const peerMap = new Map(state.peers.map(p => [p.id, p]));
       const html = state.slots.map(slot => {
         const peer = slot.peer_id ? peerMap.get(slot.peer_id) : null;
-        const summary = peer?.summary ?? (slot.context_snapshot ? (() => {
-          try { return JSON.parse(slot.context_snapshot)?.last_summary; } catch { return null; }
-        })() : null);
+        let snapshot = null;
+        if (slot.context_snapshot) { try { snapshot = JSON.parse(slot.context_snapshot); } catch { /* ignore */ } }
+        const summary = peer?.summary ?? snapshot?.last_summary ?? null;
+        const optimization = snapshot?.optimization ?? null;
+        const modelBadge = optimization
+          ? `<span class="badge badge-model" title="Tier: ${esc(optimization.tier ?? "?")}${optimization.escalation_count ? ` · escalated ${optimization.escalation_count}x` : ""}">${esc(optimization.model ?? optimization.tier ?? "?")}</span>`
+          : "";
         const tokens = (slot.input_tokens || slot.output_tokens)
           ? `<div style="font-size:11px;color:var(--text-muted);margin-top:4px">${fmtTokens(slot.input_tokens ?? 0)} in / ${fmtTokens(slot.output_tokens ?? 0)} out</div>`
           : "";
@@ -599,6 +604,7 @@
           <div class="flex gap-2 items-center">
             ${taskBadge(slot.task_state ?? "idle")}
             <span style="font-size:11px;color:var(--text-muted)">${slot.agent_type}</span>
+            ${modelBadge}
           </div>
           ${tokens}
           ${summary ? `<div class="agent-summary">${esc(truncate(summary, 200))}</div>` : ""}

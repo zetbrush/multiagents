@@ -1,3 +1,4 @@
+import { AUTONOMOUS_INSTRUCTIONS } from "../shared/plan-execution.ts";
 // ============================================================================
 // multiagents — Agent Launcher
 // ============================================================================
@@ -7,8 +8,9 @@
 // ============================================================================
 
 import type { Subprocess } from "bun";
-import type { AgentType, AgentLaunchConfig, Slot } from "../shared/types.ts";
+import type { AgentType, AgentLaunchConfig, ResolvedModelPolicy, Slot, TokenOptimizationConfig } from "../shared/types.ts";
 import type { BrokerClient } from "../shared/broker-client.ts";
+import { resolveModelPolicy } from "../shared/model-routing.ts";
 import { log } from "../shared/utils.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 import * as path from "node:path";
@@ -20,10 +22,105 @@ const LOG_PREFIX = "launcher";
 const CLI_PATH = path.resolve(import.meta.dir, "..", "cli.ts");
 
 /**
+ * Sweep for `cli.ts mcp-server` processes belonging to this session and kill
+ * them, regardless of current parentage.
+ *
+ * killPidTreeVerified(pid) below only helps if the top-level agent process is
+ * still alive (or was just alive) when we walk `pgrep -P`. For agy — unlike
+ * claude/codex, which bake `--session <id>` into the mcp-server's own args —
+ * the agent CLI exits and its mcp-server grandchild gets reparented (often
+ * to PID 1) well before end_session/auto-end ever runs, especially since agy
+ * turns tend to finish fast. By then `pgrep -P <original top-level pid>`
+ * finds nothing: the grandchild's parent link is already gone.
+ *
+ * MULTIAGENTS_SESSION is set in spawnEnv on the top-level process and
+ * inherited by every descendant it spawns — that inheritance is a property
+ * of the process's own environment block, unaffected by reparenting. So
+ * instead of walking ancestry, scan every running mcp-server process's
+ * environment for this session's id.
+ *
+ * Linux-only (/proc/<pid>/environ), best-effort.
+ */
+/**
+ * Kill a process and its full descendant tree (including the root pid itself),
+ * verifying each target actually died and escalating to SIGKILL after a grace
+ * period for any that ignored SIGTERM.
+ *
+ * Replaces the old pattern of `killProcessTree(pid); proc.kill()` at every
+ * termination call site (remove_agent, end_session, auto-end): that pattern
+ * fires-and-forgets SIGTERM with no verification, so a process that's
+ * mid-syscall or otherwise slow to handle the signal is silently left running
+ * — which is how ghost `codex app-server`/`mcp-server` processes were
+ * observed surviving `end_session` even though the kill code "succeeded"
+ * with no error. This is the single call site every terminator should use.
+ *
+ * Linux-only (`pgrep -P`, `/proc` not required here); best-effort — failures
+ * are swallowed since this is cleanup, not correctness-critical.
+ */
+export async function killPidTreeVerified(rootPid: number): Promise<void> {
+  const toVisit = [rootPid];
+  const targets = new Set<number>([rootPid]);
+
+  while (toVisit.length > 0) {
+    const current = toVisit.pop()!;
+    try {
+      const result = Bun.spawnSync(["pgrep", "-P", String(current)]);
+      const output = new TextDecoder().decode(result.stdout).trim();
+      if (!output) continue;
+      for (const line of output.split("\n")) {
+        const childPid = parseInt(line, 10);
+        if (!isNaN(childPid) && !targets.has(childPid)) {
+          targets.add(childPid);
+          toVisit.push(childPid);
+        }
+      }
+    } catch { /* pgrep unavailable or process gone — best effort */ }
+  }
+
+  const isAlive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+
+  // Leaves-first-ish ordering doesn't matter for SIGTERM (unlike the old
+  // discovery-order kill) since we verify and escalate below regardless.
+  for (const pid of targets) {
+    try { process.kill(pid, "SIGTERM"); } catch { /* already dead */ }
+  }
+
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const survivors = [...targets].filter(isAlive);
+  if (survivors.length > 0) {
+    log(LOG_PREFIX, `SIGTERM ignored by pid(s) ${survivors.join(", ")} (rooted at ${rootPid}) — escalating to SIGKILL`);
+    for (const pid of survivors) {
+      try { process.kill(pid, "SIGKILL"); } catch { /* already dead */ }
+    }
+  }
+}
+
+export function killSessionMcpServers(sessionId: string): void {
+  try {
+    const result = Bun.spawnSync(["pgrep", "-f", "cli.ts mcp-server"]);
+    const output = new TextDecoder().decode(result.stdout).trim();
+    if (!output) return;
+    for (const line of output.split("\n")) {
+      const pid = parseInt(line, 10);
+      if (isNaN(pid)) continue;
+      try {
+        const environ = fs.readFileSync(`/proc/${pid}/environ`, "latin1");
+        if (environ.split("\0").includes(`MULTIAGENTS_SESSION=${sessionId}`)) {
+          process.kill(pid, "SIGTERM");
+        }
+      } catch { /* process exited mid-scan, or /proc unavailable — skip */ }
+    }
+  } catch { /* pgrep unavailable — best effort */ }
+}
+
+/**
  * Build a PATH that includes common CLI installation directories.
  * GUI apps (like Claude Desktop) don't load shell profiles, so their PATH
  * is minimal (just /usr/bin:/bin:/usr/sbin:/sbin). This ensures `which`
- * and spawned child processes can find claude, codex, gemini, bun, etc.
+ * and spawned child processes can find claude, codex, agy, bun, etc.
  */
 function enrichedPath(): string {
   const home = process.env.HOME ?? "";
@@ -71,13 +168,13 @@ interface LaunchResult {
 const AGENT_COMMANDS: Record<AgentType, string> = {
   claude: "claude",
   codex: "codex",
-  gemini: "npx",
+  agy: "agy",
   custom: "",
 };
 
 /**
  * Detect whether an agent CLI is installed and available on PATH.
- * Handles both direct binaries (claude, codex) and npx-based tools (gemini).
+ * Handles direct agent binaries (claude, codex, and agy).
  */
 export async function detectAgent(type: AgentType): Promise<AgentDetection> {
   const cmd = AGENT_COMMANDS[type];
@@ -86,21 +183,6 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
   }
 
   const spawnEnv = { ...process.env, PATH: ENRICHED_PATH };
-
-  // Gemini is invoked via npx — check if the package is available
-  if (type === "gemini") {
-    try {
-      const proc = Bun.spawnSync(["npx", "-y", "@google/gemini-cli", "--version"], {
-        timeout: 15_000,
-        env: spawnEnv,
-      });
-      const out = new TextDecoder().decode(proc.stdout).trim();
-      if (proc.exitCode === 0 && out) {
-        return { available: true, version: out.split("\n")[0], path: "npx" };
-      }
-    } catch { /* ok */ }
-    return { available: false };
-  }
 
   const which = Bun.spawnSync(["which", cmd], { env: spawnEnv });
   const binPath = new TextDecoder().decode(which.stdout).trim();
@@ -193,31 +275,33 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string): P
   const codexEntry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\n`;
   await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + codexEntry);
 
-  // --- Gemini: ~/.gemini/settings.json ---
-  const geminiSettingsPath = path.join(process.env.HOME ?? "", ".gemini", "settings.json");
+  // --- Antigravity CLI: ~/.gemini/config/mcp_config.json ---
+  const agyConfigDir = path.join(process.env.HOME ?? "", ".gemini", "config");
+  const agyMcpConfigPath = path.join(agyConfigDir, "mcp_config.json");
   try {
-    let geminiConfig: Record<string, unknown> = {};
+    if (!fs.existsSync(agyConfigDir)) fs.mkdirSync(agyConfigDir, { recursive: true });
+    let agyConfig: Record<string, unknown> = {};
     try {
-      const existing = await Bun.file(geminiSettingsPath).text();
-      geminiConfig = JSON.parse(existing);
-    } catch { /* ok */ }
+      const existing = await Bun.file(agyMcpConfigPath).text();
+      agyConfig = JSON.parse(existing);
+    } catch (error) {
+      // A missing file is expected. Preserve malformed user configuration
+      // instead of replacing it with a new object.
+      if (fs.existsSync(agyMcpConfigPath)) throw error;
+    }
 
-    const geminiMcpServers = (geminiConfig.mcpServers as Record<string, unknown>) ?? {};
+    const agyMcpServers = (agyConfig.mcpServers as Record<string, unknown>) ?? {};
     // Remove stale "multiagents" entries from older versions
-    if (geminiMcpServers["multiagents"] && !geminiMcpServers["multiagents-peer"]) {
-      delete geminiMcpServers["multiagents"];
-    }
-    if (!geminiMcpServers["multiagents-peer"]) {
-      const geminiMcp = mcpServerCommand("gemini");
-      geminiMcpServers["multiagents-peer"] = {
-        command: geminiMcp.command,
-        args: geminiMcp.args,
-      };
-      geminiConfig.mcpServers = geminiMcpServers;
-      await Bun.write(geminiSettingsPath, JSON.stringify(geminiConfig, null, 2));
-    }
+    delete agyMcpServers["multiagents"];
+    const agyMcp = mcpServerCommand("agy");
+    agyMcpServers["multiagents-peer"] = {
+      command: agyMcp.command,
+      args: agyMcp.args,
+    };
+    agyConfig.mcpServers = agyMcpServers;
+    await Bun.write(agyMcpConfigPath, JSON.stringify(agyConfig, null, 2));
   } catch {
-    // Gemini config is optional — skip if ~/.gemini doesn't exist
+    // Antigravity config is optional; launch can still continue without MCP.
   }
 
   // --- Session file: .multiagents/session.json ---
@@ -276,12 +360,19 @@ export async function launchAgent(
   projectDir: string,
   config: AgentLaunchConfig,
   brokerClient: BrokerClient,
+  optimization: TokenOptimizationConfig = {},
 ): Promise<LaunchResult> {
   // Ensure MCP configs and session file exist before spawning any agent
   await ensureMcpConfigs(projectDir, sessionId);
 
   // Enrich role_description with auto-detected platform context
-  const enrichedDescription = enrichRoleDescription(config, projectDir);
+  const session = await brokerClient.getSession(sessionId);
+  const autonomous = JSON.parse(session.config || "{}").execution_mode === "plan_execution";
+  if (autonomous) {
+    config = { ...config, model_policy: { ...config.model_policy, auto_escalate: false } };
+    if (!config.model_policy?.model) throw new Error("Plan execution requires an explicit model");
+  }
+  const enrichedDescription = enrichRoleDescription(config, projectDir) + (autonomous ? `\n\n${AUTONOMOUS_INSTRUCTIONS}` : "");
 
   // Create a slot in the broker for this agent
   const slot = await brokerClient.createSlot({
@@ -292,7 +383,22 @@ export async function launchAgent(
     role_description: enrichedDescription,
   });
 
+  if (autonomous) await brokerClient.assignExecutionPlan(sessionId, slot.id);
+
   log(LOG_PREFIX, `Created slot ${slot.id} for ${config.name} (${config.agent_type})`);
+
+  const modelPolicy = resolveModelPolicy(config, optimization);
+  const cliPolicy = optimization.enabled === false ? undefined : modelPolicy;
+  await brokerClient.updateSlot({
+    id: slot.id,
+    context_snapshot: JSON.stringify({
+      optimization: modelPolicy,
+      original_task: config.initial_task,
+      last_status: "starting",
+      updated_at: Date.now(),
+    }),
+  });
+  log(LOG_PREFIX, `Optimizer selected ${modelPolicy.tier}/${modelPolicy.model ?? "provider-default"} (${modelPolicy.reasoning_effort}) for ${config.name}`);
 
   // Assign file ownership if specified
   if (config.file_ownership && config.file_ownership.length > 0) {
@@ -309,57 +415,21 @@ export async function launchAgent(
   // because agents read the -p flag first and may start working before MCP tools load.
   // Without explicit enforcement here, agents execute their task using native tools only
   // and never call check_messages, set_summary, or signal_done.
-  // Codex/Gemini agents get file-based inbox instructions since they lack push notifications
-  const isNonPushAgent = config.agent_type === "codex" || config.agent_type === "gemini";
+  // Codex/AGY agents get file-based inbox instructions since they lack push notifications
+  const isNonPushAgent = config.agent_type === "codex" || config.agent_type === "agy";
 
   const taskPrompt = [
     `You are "${config.name}", role: ${config.role}.`,
     enrichedDescription,
+    `Task: ${config.initial_task}`,
+    "Output discipline: keep summaries concise and omit repeated context.",
     "",
-    `Your task: ${config.initial_task}`,
-    "",
-    "╔══════════════════════════════════════════════════════════════╗",
-    "║  MANDATORY: USE multiagents-peer MCP TOOLS — NOT OPTIONAL  ║",
-    "╚══════════════════════════════════════════════════════════════╝",
-    "",
-    "You have an MCP server called 'multiagents-peer' with tools for team communication.",
-    "These are NOT optional. You MUST call them. Your team is BLOCKED until you do.",
-    "",
-    "STEP 1 — DO THESE FIRST (before ANY other work, before reading files, before running commands):",
-    "  → Call set_summary with a 1-line description of your task",
-    "  → Call check_team_status to see your teammates",
-    "  → Call get_plan to see the team plan",
-    "  → Call check_messages to read messages from teammates",
-    "",
-    "STEP 2 — WHILE WORKING (after EVERY file write, EVERY shell command, EVERY build):",
-    "  → Call check_messages — teammates may have sent you critical info",
-    "  → Call set_summary with what you're currently doing",
-    "  → Call update_plan when you start or finish a plan item",
-    ...(isNonPushAgent ? [
-      `  → Read .multiagents/inbox/${config.name}.md — messages arrive here in real-time`,
-    ] : []),
-    "",
-    "STEP 3 — WHEN DONE:",
-    "  → Call signal_done with: what you built, what you tested, what the results were",
-    "  → Stay active — call check_messages every 10 seconds waiting for review feedback",
-    "  → If you get feedback: fix issues, then call signal_done again",
-    "",
-    "STEP 4 — WHEN TEAMMATES MESSAGE YOU:",
-    "  → Reply IMMEDIATELY via send_message. They are waiting on you.",
-    "  → If you need time, reply 'Working on it, will respond in ~N minutes'",
-    "",
-    "FAILURE MODES (your team will be stuck if you do these):",
-    "  ✗ Working for 1+ minute without calling check_messages",
-    "  ✗ Finishing work without calling signal_done",
-    "  ✗ Receiving a message and not replying via send_message",
-    "  ✗ Not calling set_summary — teammates can't see what you're doing",
-    "  ✗ Using shell commands to read broker state instead of MCP tools",
-    "",
-    "The multiagents-peer MCP tools are: set_summary, check_messages, send_message,",
-    "check_team_status, get_plan, update_plan, signal_done, submit_feedback, approve,",
-    "list_peers, acquire_file, release_file, view_file_locks, get_history,",
-    "store_knowledge, query_knowledge, remove_knowledge.",
-    "Use THESE tools. Do NOT try to call the broker via CLI or HTTP — use the MCP tools.",
+    "Coordinate through the multiagents-peer MCP server:",
+    "- At start: set_summary, then check_team_status, get_plan and check_messages.",
+    "- Check messages at meaningful milestones and reply when action is required.",
+    "- Update your summary/plan only when status changes; do not report every command.",
+    "- When complete, call signal_done once with changes and verification evidence.",
+    ...(isNonPushAgent ? [`- Inbox fallback: .multiagents/inbox/${config.name}.md.`] : []),
   ].join("\n");
 
   // Build env — enrich PATH for GUI-spawned contexts, unset CLAUDECODE for nesting
@@ -368,12 +438,15 @@ export async function launchAgent(
     PATH: ENRICHED_PATH,
     MULTIAGENTS_SESSION: sessionId,
     MULTIAGENTS_ROLE: config.role,
+    MULTIAGENTS_ROLE_DESCRIPTION: enrichedDescription,
     MULTIAGENTS_NAME: config.name,
     MULTIAGENTS_SLOT: String(slot.id),
+    MULTIAGENTS_TIER: cliPolicy?.tier,
+    MULTIAGENTS_CODEX_VERBOSITY: cliPolicy ? (cliPolicy.tier === "expert" ? "medium" : "low") : undefined,
   };
   delete spawnEnv.CLAUDECODE;
 
-  // Update session file with slot info so sandboxed agents (Codex, Gemini)
+  // Update session file with slot info so sandboxed agents (Codex, AGY)
   // can recover slot_id even if MULTIAGENTS_* env vars are stripped.
   // The adapter reads this as a fallback when env vars are absent.
   const sessionDir = path.join(projectDir, ".multiagents");
@@ -423,20 +496,8 @@ export async function launchAgent(
       `You are "${config.name}", role: ${config.role}.`,
       enrichedDescription,
       "",
-      "You have 'multiagents-peer' MCP tools: signal_done, set_summary, send_message, check_messages.",
-      "When done: call signal_done with proof. Use set_summary to show progress.",
+    "Use multiagents-peer at milestones; call signal_done with concise verification evidence when done.",
     ].join("\n");
-
-    // --- Two-phase startup for fast threadId acquisition ---
-    // Phase 1: Fast bootstrap turn (~5-9s) to get a threadId.
-    //   Codex creates the thread and returns immediately.
-    // Phase 2: Push the real task as a reply turn.
-    //   This runs in the background. The orchestrator can forward
-    //   teammate messages between turns because we have the threadId.
-    //
-    // Without this split, the entire task runs as turn 1 (can take
-    // minutes for complex tasks), blocking message forwarding.
-    const bootstrapPrompt = `You are "${config.name}" (${config.role}). Acknowledge by replying: "Ready."`;
 
     // Codex-specific task prompt: lightweight, action-focused.
     // Codex is slow per tool call (~10-30s each), so the heavy "MANDATORY MCP"
@@ -444,9 +505,6 @@ export async function launchAgent(
     // The developerInstructions already cover MCP tools — keep the task prompt
     // focused on the actual task with minimal MCP instructions.
     const codexTaskPrompt = [
-      `You are "${config.name}", role: ${config.role}.`,
-      enrichedDescription,
-      "",
       config.initial_task,
       "",
       "After completing your task:",
@@ -458,33 +516,23 @@ export async function launchAgent(
 
     const startPromise = (async () => {
       try {
-        // Phase 1: fast bootstrap (~5-9s)
-        const bootstrap = await driver.startSession({
-          prompt: bootstrapPrompt,
+        // Start the real task directly. The old acknowledgement-only bootstrap
+        // spent a full model turn without advancing the task.
+        const taskResult = await driver.startSession({
+          prompt: codexTaskPrompt,
           cwd: projectDir,
           sandbox: "workspace-write",
           developerInstructions,
+          model: cliPolicy?.model,
+          reasoningEffort: cliPolicy?.reasoning_effort,
         });
-        log(LOG_PREFIX, `${config.name} bootstrap complete: thread=${bootstrap.threadId} (${bootstrap.content.slice(0, 50)})`);
-
-        // Store threadId immediately — enables message forwarding
-        await brokerClient.updateSlot({
-          id: slot.id,
-          context_snapshot: JSON.stringify({
-            codex_thread_id: bootstrap.threadId,
-            last_summary: `Starting: ${config.initial_task.slice(0, 100)}`,
-            last_status: "working",
-            updated_at: Date.now(),
-          }),
-        });
-
-        // Phase 2: push real task as a reply turn (runs in background)
-        const taskResult = await driver.reply(bootstrap.threadId, codexTaskPrompt);
-        log(LOG_PREFIX, `${config.name} task turn complete: ${taskResult.content.slice(0, 100)}`);
+        log(LOG_PREFIX, `${config.name} task turn complete: thread=${taskResult.threadId}`);
 
         await brokerClient.updateSlot({
           id: slot.id,
           context_snapshot: JSON.stringify({
+            optimization: modelPolicy,
+            original_task: config.initial_task,
             codex_thread_id: taskResult.threadId,
             last_summary: taskResult.content.slice(0, 200),
             last_status: "working",
@@ -505,8 +553,8 @@ export async function launchAgent(
     };
   }
 
-  // --- Claude / Gemini / Custom: traditional process spawn ---
-  const args = buildCliArgs(config.agent_type, taskPrompt, spawnEnv);
+  // --- Claude / AGY / Custom: traditional process spawn ---
+  const args = buildCliArgs(config.agent_type, taskPrompt, spawnEnv, cliPolicy);
   const cmd = AGENT_COMMANDS[config.agent_type];
 
   if (!cmd) {
@@ -529,7 +577,14 @@ export async function launchAgent(
     if (!fs.existsSync(slotsDir)) fs.mkdirSync(slotsDir, { recursive: true });
     fs.writeFileSync(
       path.join(slotsDir, `${proc.pid}.json`),
-      JSON.stringify({ slot_id: slot.id, role: config.role, name: config.name, session_id: sessionId }),
+      JSON.stringify({
+        slot_id: slot.id,
+        role: config.role,
+        role_description: enrichedDescription,
+        name: config.name,
+        session_id: sessionId,
+        tier: cliPolicy?.tier,
+      }),
     );
   } catch { /* best effort */ }
 
@@ -569,34 +624,35 @@ export async function relaunchIntoSlot(
 
   // Build the task prompt with mandatory MCP enforcement
   const agentName = slot.display_name ?? `Agent #${slot.id}`;
-  const isNonPush = slot.agent_type === "codex" || slot.agent_type === "gemini";
+  const isNonPush = slot.agent_type === "codex" || slot.agent_type === "agy";
   const taskPrompt = [
     `You are "${agentName}", role: ${slot.role ?? "general"}.`,
     enrichedDescription,
     "",
     handoffTask,
     "",
-    "═══ MANDATORY: USE multiagents-peer MCP TOOLS ═══",
-    "BEFORE any work: call set_summary, check_team_status, get_plan, check_messages (in that order).",
-    "AFTER every file write/shell command: call check_messages + set_summary.",
-    "WHEN done: call signal_done with proof of what you did and tested.",
-    "WHEN messaged: reply via send_message IMMEDIATELY — teammates are blocked on you.",
+    "Use multiagents-peer at meaningful milestones: check status/messages on start,",
+    "update summary only when it changes, and call signal_done with verification when done.",
     ...(isNonPush ? [`Also read .multiagents/inbox/${agentName}.md for real-time messages.`] : []),
-    "NEVER work 1+ minute without calling check_messages. NEVER finish without signal_done.",
-    "Your team CANNOT see your work unless you use these MCP tools.",
   ].join("\n");
+
+  let storedPolicy: ResolvedModelPolicy | undefined;
+  try { storedPolicy = JSON.parse(slot.context_snapshot ?? "{}").optimization; } catch { /* use provider defaults */ }
 
   const spawnEnv: Record<string, string | undefined> = {
     ...process.env,
     PATH: ENRICHED_PATH,
     MULTIAGENTS_SESSION: sessionId,
     MULTIAGENTS_ROLE: slot.role ?? undefined,
+    MULTIAGENTS_ROLE_DESCRIPTION: enrichedDescription,
     MULTIAGENTS_NAME: slot.display_name ?? undefined,
     MULTIAGENTS_SLOT: String(slot.id),
+    MULTIAGENTS_TIER: storedPolicy?.tier,
+    MULTIAGENTS_CODEX_VERBOSITY: storedPolicy ? (storedPolicy.tier === "expert" ? "medium" : "low") : undefined,
   };
   delete spawnEnv.CLAUDECODE;
 
-  const args = buildCliArgs(slot.agent_type, taskPrompt, spawnEnv);
+  const args = buildCliArgs(slot.agent_type, taskPrompt, spawnEnv, storedPolicy);
   const cmd = AGENT_COMMANDS[slot.agent_type];
 
   if (!cmd) {
@@ -628,7 +684,12 @@ export async function relaunchIntoSlot(
  * --mcp-config (inline JSON); for Codex this uses -c to override the
  * mcp_servers config key (replacing any broken global entries).
  */
-export function buildCliArgs(agentType: AgentType, task: string, env?: Record<string, string | undefined>): string[] {
+export function buildCliArgs(
+  agentType: AgentType,
+  task: string,
+  env?: Record<string, string | undefined>,
+  policy?: Pick<ResolvedModelPolicy, "model" | "reasoning_effort" | "max_output_tokens">,
+): string[] {
   switch (agentType) {
     case "claude": {
       // Build inline MCP config JSON for --mcp-config.
@@ -645,7 +706,9 @@ export function buildCliArgs(agentType: AgentType, task: string, env?: Record<st
       if (env?.MULTIAGENTS_SESSION) mcpArgs.push("--session", env.MULTIAGENTS_SESSION);
       if (env?.MULTIAGENTS_SLOT) mcpArgs.push("--slot", env.MULTIAGENTS_SLOT);
       if (env?.MULTIAGENTS_ROLE) mcpArgs.push("--role", env.MULTIAGENTS_ROLE);
+      if (env?.MULTIAGENTS_ROLE_DESCRIPTION) mcpArgs.push("--role-description", env.MULTIAGENTS_ROLE_DESCRIPTION);
       if (env?.MULTIAGENTS_NAME) mcpArgs.push("--name", env.MULTIAGENTS_NAME);
+      if (env?.MULTIAGENTS_TIER) mcpArgs.push("--tier", env.MULTIAGENTS_TIER);
 
       const mcpConfigJson = JSON.stringify({
         mcpServers: {
@@ -655,43 +718,48 @@ export function buildCliArgs(agentType: AgentType, task: string, env?: Record<st
           },
         },
       });
-      return [
+      const args = [
         "--print",
         "--verbose",
         "--output-format", "stream-json",
         "--max-turns", "200",
         "--dangerously-skip-permissions",
         "--mcp-config", mcpConfigJson,
-        "-p", task,
       ];
+      if (policy?.model) args.push("--model", policy.model);
+      if (policy?.reasoning_effort) args.push("--effort", policy.reasoning_effort);
+      args.push("-p", task);
+      return args;
     }
     case "codex": {
       // IMPORTANT: Codex CLI's `-c` flag does NOT support injecting MCP servers.
       // MCP servers are loaded exclusively from ~/.codex/config.toml (global).
       // The `-c mcp_servers.*` overrides are silently ignored.
       // MCP injection is handled by ensureMcpConfigs() writing to the global config.
-      return [
+      const args = [
         "exec",
         "--sandbox", "workspace-write",
         "--full-auto",
         "--json",
-        "-c", 'model_reasoning_effort="high"',
-        task,
       ];
+      if (policy?.model) args.push("--model", policy.model);
+      args.push("-c", `model_reasoning_effort="${policy?.reasoning_effort ?? "high"}"`);
+      args.push(task);
+      return args;
     }
-    case "gemini": {
-      // Gemini CLI is invoked via npx. MCP is configured at user level
-      // (~/.gemini/settings.json) by ensureMcpConfigs. Use --approval-mode
-      // yolo for fully autonomous operation, --sandbox for safety, and
-      // --output-format stream-json for structured output parsing.
-      return [
-        "-y", "@google/gemini-cli",
+    case "agy": {
+      // Antigravity CLI is a native binary. MCP is configured globally in
+      // ~/.gemini/config/mcp_config.json by ensureMcpConfigs. Headless mode
+      // uses the same stream-json output contract as the previous integration.
+      const args = [
         "--sandbox",
-        "--approval-mode", "yolo",
+        "--dangerously-skip-permissions",
         "--output-format", "stream-json",
-        "--allowed-mcp-server-names", "multiagents-peer",
-        "-p", task,
       ];
+      if (policy?.model) args.push("--model", policy.model);
+      if (policy?.reasoning_effort) args.push("--effort", policy.reasoning_effort);
+      args.push("-p", task);
+      return args;
     }
     case "custom":
       return [task];

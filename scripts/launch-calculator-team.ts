@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Launch a 3-agent team to build a TypeScript calculator web app.
- * Gemini (UI/UX Designer) → Claude (Engineer) → Codex (Code Reviewer) → loop
+ * AGY (UI/UX Designer) → Claude (Engineer) → Codex (Code Reviewer) → loop
  */
 
 import { BrokerClient } from "../shared/broker-client.ts";
@@ -74,7 +74,7 @@ async function main() {
   // Agent configs
   const agents: AgentLaunchConfig[] = [
     {
-      agent_type: "gemini",
+      agent_type: "agy",
       name: "Luna",
       role: "UI/UX Designer",
       role_description: `You are a senior UI/UX designer specializing in web applications.

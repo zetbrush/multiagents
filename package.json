@@ -1,7 +1,7 @@
 {
   "name": "multiagents",
   "version": "0.5.0",
-  "description": "Multi-agent orchestration platform for Claude Code, Codex CLI, and Gemini CLI",
+  "description": "Multi-agent orchestration platform for Claude Code, Codex CLI, and Antigravity CLI",
   "module": "index.ts",
   "type": "module",
   "private": false,
@@ -67,7 +67,8 @@
     "multi-agent",
     "claude",
     "codex",
-    "gemini",
+    "antigravity",
+    "agy",
     "orchestration",
     "ai-agents"
   ],

@@ -12,6 +12,8 @@
 
 import { Database } from "bun:sqlite";
 import { normalize } from "node:path";
+import { PlanExecutionStore, type StepRequest } from "./shared/plan-execution-store.ts";
+import { validateExecutionPlan, type ExecutionStep } from "./shared/plan-execution.ts";
 import {
   DEFAULT_BROKER_PORT,
   DEFAULT_DB_PATH,
@@ -20,6 +22,10 @@ import {
   RECONNECT_RECAP_LIMIT,
   DEFAULT_GUARDRAILS,
   CLEANUP_INTERVAL,
+  KNOWLEDGE_LIST_DEFAULT_LIMIT,
+  KNOWLEDGE_LIST_MAX_LIMIT,
+  KNOWLEDGE_VALUE_PREVIEW_CHARS,
+  KNOWLEDGE_VALUE_MAX_CHARS,
 } from "./shared/constants.ts";
 import { generatePeerId } from "./shared/utils.ts";
 import type {
@@ -265,11 +271,15 @@ db.run(`
   )
 `);
 
+const executionStore = new PlanExecutionStore(db);
+
 // --- Context snapshot builder ---
 
 /** Build a rich context snapshot for a disconnecting peer/slot. */
 function buildContextSnapshot(peer: { summary?: string | null; cwd?: string | null }, slotId: number): string {
-  const slotRow = db.query("SELECT task_state FROM slots WHERE id = ?").get(slotId) as { task_state: string } | null;
+  const slotRow = db.query("SELECT task_state, context_snapshot FROM slots WHERE id = ?").get(slotId) as { task_state: string; context_snapshot: string | null } | null;
+  let previous = {};
+  try { previous = JSON.parse(slotRow?.context_snapshot ?? "{}"); } catch { /* legacy snapshot */ }
 
   // Get plan items assigned to this slot (if any plan exists)
   let planItems: { label: string; status: string }[] = [];
@@ -281,6 +291,7 @@ function buildContextSnapshot(peer: { summary?: string | null; cwd?: string | nu
   } catch { /* plan tables may not have data */ }
 
   return JSON.stringify({
+    ...previous,
     last_summary: peer.summary ?? null,
     last_status: "disconnected",
     last_cwd: peer.cwd ?? null,
@@ -413,7 +424,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
 
   // Explicit slot targeting — when orchestrator passes a specific slot_id
   // Resolve session_id: explicit > inferred from the slot's own record.
-  // This fallback covers sandboxed agents (Codex, Gemini) that may lose
+  // This fallback covers sandboxed agents (Codex, AGY) that may lose
   // MULTIAGENTS_SESSION env var but still have MULTIAGENTS_SLOT.
   let effectiveSessionId = body.session_id;
   if (body.slot_id && !effectiveSessionId) {
@@ -710,6 +721,12 @@ function handleKnowledgePut(body: KnowledgePutRequest): KnowledgePutResponse {
   if (!body.session_id) throw new Error("session_id required");
   if (!body.key || !body.key.trim()) throw new Error("key required");
   if (!body.value || !body.value.trim()) throw new Error("value required");
+  if (body.value.length > KNOWLEDGE_VALUE_MAX_CHARS) {
+    throw new Error(
+      `value too long: ${body.value.length} chars (max ${KNOWLEDGE_VALUE_MAX_CHARS}). ` +
+        `Store a summary instead, or split across multiple keys.`
+    );
+  }
 
   const now = Date.now();
   const category = body.category ?? "context";
@@ -742,12 +759,59 @@ function handleKnowledgeGet(body: KnowledgeGetRequest): KnowledgeEntry | { error
   return entry;
 }
 
+/**
+ * Normalize a `since` cutoff to ms-epoch. Accepts a number (ms), a numeric
+ * string, or an ISO timestamp. Returns null for anything unparseable so a
+ * malformed cutoff degrades to "no filter" rather than hiding every entry.
+ */
+function parseSince(since: number | string | undefined): number | null {
+  if (since === undefined || since === null || since === "") return null;
+  const numeric = Number(since);
+  if (Number.isFinite(numeric)) return numeric;
+  const parsed = Date.parse(String(since));
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+/**
+ * Shorten a value to a preview, tagging it so callers know to re-query with `full: true`.
+ * Returns the entry untouched when it already fits.
+ */
+function previewKnowledgeValue(entry: KnowledgeEntry): KnowledgeEntry {
+  if (entry.value.length <= KNOWLEDGE_VALUE_PREVIEW_CHARS) return entry;
+  return {
+    ...entry,
+    value: `${entry.value.slice(0, KNOWLEDGE_VALUE_PREVIEW_CHARS)}... [truncated, ${entry.value.length} chars total — use knowledge_get for the full value]`,
+    truncated: true,
+  };
+}
+
 function handleKnowledgeList(body: KnowledgeListRequest): KnowledgeEntry[] {
   if (!body.session_id) return [];
+
+  // Clamp rather than reject: an oversized limit is a caller mistake, not a failure.
+  const requested = Number(body.limit);
+  const limit = Number.isFinite(requested) && requested > 0
+    ? Math.min(Math.floor(requested), KNOWLEDGE_LIST_MAX_LIMIT)
+    : KNOWLEDGE_LIST_DEFAULT_LIMIT;
+
+  const where = ["session_id = ?"];
+  const params: (string | number)[] = [body.session_id];
   if (body.category) {
-    return db.query("SELECT * FROM knowledge WHERE session_id = ? AND category = ? ORDER BY updated_at DESC").all(body.session_id, body.category) as KnowledgeEntry[];
+    where.push("category = ?");
+    params.push(body.category);
   }
-  return db.query("SELECT * FROM knowledge WHERE session_id = ? ORDER BY updated_at DESC").all(body.session_id) as KnowledgeEntry[];
+  const since = parseSince(body.since);
+  if (since !== null) {
+    where.push("updated_at >= ?");
+    params.push(since);
+  }
+  params.push(limit);
+
+  const entries = db
+    .query(`SELECT * FROM knowledge WHERE ${where.join(" AND ")} ORDER BY updated_at DESC LIMIT ?`)
+    .all(...params) as KnowledgeEntry[];
+
+  return body.full === true ? entries : entries.map(previewKnowledgeValue);
 }
 
 function handleKnowledgeDelete(body: KnowledgeDeleteRequest): { ok: boolean } {
@@ -780,6 +844,7 @@ function handleDeleteSession(body: { id: string }): { ok: boolean; deleted: { sl
   const session = db.query("SELECT id FROM sessions WHERE id = ?").get(body.id) as { id: string } | null;
   if (!session) return { ok: false, deleted: { slots: 0, messages: 0, plans: 0, locks: 0 } };
 
+  executionStore.cancelSession(body.id);
   // Delete in dependency order: plan_items → plans → messages → file_locks → file_ownership → slots → session
   const plans = db.query("SELECT id FROM plans WHERE session_id = ?").all(body.id) as { id: number }[];
   for (const plan of plans) {
@@ -817,6 +882,8 @@ function handleDeleteSession(body: { id: string }): { ok: boolean; deleted: { sl
 }
 
 function handleUpdateSession(body: UpdateSessionRequest): Session | null {
+  if (body.status && body.status !== "active") executionStore.cancelSession(body.id);
+
   const fields: string[] = [];
   const values: any[] = [];
 
@@ -838,6 +905,8 @@ function handleUpdateSession(body: UpdateSessionRequest): Session | null {
 // --- Slots ---
 
 function handleCreateSlot(body: CreateSlotRequest): Slot {
+  if (executionStore.isExecution(body.session_id) && db.query("SELECT id FROM slots WHERE session_id = ?").get(body.session_id)) throw new Error("Execution sessions have one worker");
+
   const res = db.run(
     "INSERT INTO slots (session_id, agent_type, display_name, role, role_description) VALUES (?, ?, ?, ?, ?)",
     [body.session_id, body.agent_type, body.display_name ?? null, body.role ?? null, body.role_description ?? null]
@@ -854,6 +923,8 @@ function handleListSlots(body: { session_id: string }): Slot[] {
 }
 
 function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
+  const existingSlot = handleGetSlot({ id: body.id });
+  if (existingSlot && executionStore.isExecution(existingSlot.session_id) && body.task_state !== undefined && body.task_state !== existingSlot.task_state && ["approved", "released", "done_pending_review"].includes(body.task_state)) throw new Error("Use execution lifecycle tools for completion and approval");
   const fields: string[] = [];
   const values: any[] = [];
 
@@ -873,7 +944,19 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
       fields.push("last_connected = ?"); values.push(Date.now());
     }
   }
-  if (body.context_snapshot !== undefined) { fields.push("context_snapshot = ?"); values.push(body.context_snapshot); }
+  if (body.context_snapshot !== undefined) {
+    // Snapshots are incremental status updates. Preserve durable optimizer and
+    // handoff metadata instead of discarding it whenever an agent reports a
+    // new one-line summary.
+    let snapshot = body.context_snapshot;
+    try {
+      const row = db.query("SELECT context_snapshot FROM slots WHERE id = ?").get(body.id) as { context_snapshot: string | null } | null;
+      const previous = row?.context_snapshot ? JSON.parse(row.context_snapshot) : {};
+      const incoming = JSON.parse(body.context_snapshot);
+      snapshot = JSON.stringify({ ...previous, ...incoming });
+    } catch { /* keep the caller payload when either value is not JSON */ }
+    fields.push("context_snapshot = ?"); values.push(snapshot);
+  }
   if (body.display_name !== undefined) { fields.push("display_name = ?"); values.push(body.display_name); }
   if (body.role !== undefined) { fields.push("role = ?"); values.push(body.role); }
   if (body.role_description !== undefined) { fields.push("role_description = ?"); values.push(body.role_description); }
@@ -897,6 +980,8 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
 
 /** Delete a slot and its associated file locks, ownership, and orphaned peer. */
 function handleDeleteSlot(body: { id: number }): { ok: boolean; deleted: boolean } {
+  const slot = handleGetSlot(body);
+  if (slot && executionStore.isExecution(slot.session_id) && slot.task_state !== "released") throw new Error("Keep unfinished execution slots for resume; delete the session to cancel it");
   const existing = db.query("SELECT id, peer_id FROM slots WHERE id = ?").get(body.id) as { id: number; peer_id: string | null } | null;
   if (!existing) return { ok: true, deleted: false };
 
@@ -1133,10 +1218,14 @@ function handleUpdateGuardrail(body: UpdateGuardrailRequest) {
 interface CreatePlanRequest {
   session_id: string;
   title: string;
-  items: { label: string; assigned_to_slot?: number; parent_id?: number }[];
+  items: { label: string; assigned_to_slot?: number; parent_id?: number; execution?: ExecutionStep }[];
 }
 
 function handleCreatePlan(body: CreatePlanRequest) {
+  if (executionStore.isExecution(body.session_id)) {
+    validateExecutionPlan(body.items.map(i => i.execution!));
+    if (db.query("SELECT id FROM plans WHERE session_id = ?").get(body.session_id)) throw new Error("Execution plans cannot be replaced; create a new session");
+  } else if (body.items.some(i => i.execution)) throw new Error("Execution contracts require plan_execution mode");
   const now = Date.now();
   const existing = db.query("SELECT id FROM plans WHERE session_id = ?").get(body.session_id) as { id: number } | null;
   if (existing) {
@@ -1155,8 +1244,8 @@ function handleCreatePlan(body: CreatePlanRequest) {
     const item = body.items[i];
     if (!item) continue;
     db.run(
-      "INSERT INTO plan_items (plan_id, parent_id, label, status, assigned_to_slot, sort_order) VALUES (?, ?, ?, 'pending', ?, ?)",
-      [plan.id, item.parent_id ?? null, item.label, item.assigned_to_slot ?? null, i],
+      "INSERT INTO plan_items (plan_id, parent_id, label, status, assigned_to_slot, sort_order, execution) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+      [plan.id, item.parent_id ?? null, item.label, item.assigned_to_slot ?? null, i, item.execution ? JSON.stringify({ ...item.execution, status: "pending", attempts: 0 }) : null],
     );
   }
 
@@ -1175,28 +1264,21 @@ function handleGetPlan(body: { session_id: string }) {
   const done = items.filter((i: any) => i.status === "done").length;
   const completion = total > 0 ? Math.round((done / total) * 100) : 0;
 
-  return { plan, items, completion };
+  return { plan, items: items.map(i => ({ ...i, execution: i.execution ? JSON.parse(i.execution) : undefined })), completion };
 }
 
-function handleUpdatePlanItem(body: { item_id: number; status: string; session_id?: string }) {
-  const now = Date.now();
-  const completedAt = body.status === "done" ? now : null;
-  db.run(
-    "UPDATE plan_items SET status = ?, completed_at = ? WHERE id = ?",
-    [body.status, completedAt, body.item_id],
-  );
-
-  // Update the plan's updated_at timestamp
-  const item = db.query("SELECT plan_id FROM plan_items WHERE id = ?").get(body.item_id) as any;
-  if (item) {
-    db.run("UPDATE plans SET updated_at = ? WHERE id = ?", [now, item.plan_id]);
+function handleUpdatePlanItem(body: { item_id: number; status: string; session_id?: string; peer_id?: string; reason?: string }) {
+  if (!["pending", "in_progress", "done", "blocked"].includes(body.status)) throw new Error("Invalid plan status");
+  const row = db.query("SELECT pi.*, p.session_id FROM plan_items pi JOIN plans p ON p.id = pi.plan_id WHERE pi.id = ?").get(body.item_id) as any;
+  if (!row || (body.session_id && row.session_id !== body.session_id)) throw new Error("Plan item does not belong to this session");
+  if (row.execution) {
+    if (!body.session_id) throw new Error("Execution updates require session_id");
+    executionStore.update({ ...body, session_id: body.session_id });
+  } else {
+    db.run("UPDATE plan_items SET status = ?, completed_at = ? WHERE id = ?", [body.status, body.status === "done" ? Date.now() : null, body.item_id]);
+    db.run("UPDATE plans SET updated_at = ? WHERE id = ?", [Date.now(), row.plan_id]);
   }
-
-  // If session_id provided, return full plan state
-  if (body.session_id) {
-    return handleGetPlan({ session_id: body.session_id });
-  }
-  return { ok: true };
+  return handleGetPlan({ session_id: row.session_id });
 }
 
 // --- Message log ---
@@ -1321,7 +1403,7 @@ Bun.serve({
           const rows = db.query(
             "SELECT msg_type, sent_at FROM messages WHERE to_slot_id = ? AND delivered = 0 AND held = 0 ORDER BY id ASC"
           ).all(slot_id) as { msg_type: string; sent_at: string }[];
-          const oldest_at = rows.length > 0 ? new Date(rows[0].sent_at).getTime() : 0;
+          const oldest_at = rows[0] ? new Date(rows[0].sent_at).getTime() : 0;
           return Response.json({ count: rows.length, msg_types: rows.map(r => r.msg_type), oldest_at });
         }
         case "/unregister":
@@ -1386,6 +1468,19 @@ Bun.serve({
         // --- Plans ---
         case "/plan/create":
           return Response.json(handleCreatePlan(body as CreatePlanRequest));
+        case "/plan/assign": {
+          const { session_id, slot_id } = body as { session_id: string; slot_id: number };
+          const slot = handleGetSlot({ id: slot_id });
+          if (!executionStore.isExecution(session_id) || slot?.session_id !== session_id) throw new Error("Invalid execution assignment");
+          db.run("UPDATE plan_items SET assigned_to_slot = ? WHERE plan_id IN (SELECT id FROM plans WHERE session_id = ?) AND assigned_to_slot IS NULL", [slot_id, session_id]);
+          return Response.json({ ok: true });
+        }
+        case "/plan/verify":
+          await executionStore.verify(body as StepRequest & { summary: string });
+          return Response.json(handleGetPlan(body as { session_id: string }));
+        case "/plan/resolve":
+          executionStore.resolve(body as StepRequest & { from_id: string; decision: string });
+          return Response.json(handleGetPlan(body as { session_id: string }));
         case "/plan/get":
           return Response.json(handleGetPlan(body as { session_id: string }));
         case "/plan/update-item":
@@ -1411,13 +1506,15 @@ Bun.serve({
           const peer = db.query("SELECT * FROM peers WHERE id = ?").get(peer_id) as any;
           if (!peer || !peer.slot_id) return Response.json({ error: "Peer not found or no slot" }, { status: 404 });
 
+          if (peer.session_id !== session_id) throw new Error("Peer session mismatch");
+          if (executionStore.isExecution(session_id)) executionStore.assertComplete(session_id);
           db.run("UPDATE peers SET summary = ? WHERE id = ?", [summary, peer_id]);
 
           const allSlots = db.query("SELECT * FROM slots WHERE session_id = ? AND id != ?").all(session_id, peer.slot_id) as any[];
           const thisSlot = db.query("SELECT * FROM slots WHERE id = ?").get(peer.slot_id) as any;
 
           // Reviewers/QA auto-approve on signal_done — they don't need external review.
-          const isReviewerRole = thisSlot.role && /qa|review|test|lead/i.test(thisSlot.role);
+          const isReviewerRole = !executionStore.isExecution(session_id) && thisSlot.role && /qa|review|test|lead/i.test(thisSlot.role);
           const newTaskState = isReviewerRole ? "approved" : "done_pending_review";
           db.run("UPDATE slots SET task_state = ? WHERE id = ?", [newTaskState, peer.slot_id]);
 
@@ -1467,6 +1564,12 @@ Bun.serve({
           const targetSlot = db.query("SELECT * FROM slots WHERE id = ?").get(target_slot_id) as any;
           if (!targetSlot) return Response.json({ error: "Target slot not found" }, { status: 404 });
 
+          if (targetSlot.session_id !== session_id) throw new Error("Target session mismatch");
+          if (executionStore.isExecution(targetSlot.session_id)) {
+            if (targetSlot.session_id !== session_id || peer_id !== "orchestrator") throw new Error("Only coordinator can approve execution work");
+            executionStore.assertComplete(session_id);
+            if (targetSlot.task_state !== "done_pending_review") throw new Error("Work must be submitted for final review");
+          }
           const approverSlot = peer?.slot_id ? db.query("SELECT * FROM slots WHERE id = ?").get(peer.slot_id) as any : null;
           const approverName = approverSlot?.display_name || peer_id;
           const approverRole = approverSlot?.role ?? "unknown";
@@ -1509,7 +1612,7 @@ Bun.serve({
           const singleReviewerApproved = reviewRoles.size <= 1 && approverRoles.size >= 1;
 
           let newState: string;
-          if (allReviewRolesApproved || singleReviewerApproved) {
+          if (allReviewRolesApproved || singleReviewerApproved || (executionStore.isExecution(session_id) && peer_id === "orchestrator")) {
             db.run("UPDATE slots SET task_state = 'approved' WHERE id = ?", [target_slot_id]);
             newState = "approved";
           } else {
@@ -1530,6 +1633,8 @@ Bun.serve({
           const targetSlot = db.query("SELECT * FROM slots WHERE id = ?").get(target_slot_id) as any;
           if (!targetSlot) return Response.json({ error: "Target slot not found" }, { status: 404 });
 
+          if (targetSlot.session_id !== session_id) throw new Error("Target session mismatch");
+          if (executionStore.isExecution(targetSlot.session_id) && targetSlot.task_state !== "approved" && targetSlot.task_state !== "released") throw new Error("Execution work requires explicit final approval before release");
           db.run("UPDATE slots SET task_state = 'released' WHERE id = ?", [target_slot_id]);
 
           if (targetSlot.peer_id) {
@@ -1580,6 +1685,7 @@ console.error(`[multiagents broker] listening on 127.0.0.1:${PORT} (db: ${DB_PAT
 // --- Graceful shutdown: kill all registered peers and close DB ---
 function shutdownBroker() {
   console.error("[multiagents broker] shutting down...");
+  executionStore.cancelAll();
   // Kill all registered peer processes so they don't become orphans
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
   for (const peer of peers) {

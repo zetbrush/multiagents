@@ -1,3 +1,4 @@
+import { AUTONOMOUS_INSTRUCTIONS } from "../shared/plan-execution.ts";
 // ============================================================================
 // multiagents — Crash Recovery
 // ============================================================================
@@ -11,6 +12,8 @@ import type { CodexDriver } from "./codex-driver.ts";
 import { FLAP_THRESHOLD, FLAP_WINDOW_MS } from "../shared/constants.ts";
 import { log, safeJsonParse, formatDuration } from "../shared/utils.ts";
 import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
+import type { ResolvedModelPolicy, TokenOptimizationConfig } from "../shared/types.ts";
+import { escalateModelPolicy } from "../shared/model-routing.ts";
 
 const LOG_PREFIX = "recovery";
 
@@ -135,19 +138,43 @@ export async function respawnAgent(
 ): Promise<{ pid: number; process: import("bun").Subprocess; codexDriver?: CodexDriver }> {
   // Get the crashed slot's info
   const slot = await brokerClient.getSlot(slotId);
-  const snapshot = safeJsonParse<{ last_summary?: string; last_status?: string; codex_thread_id?: string }>(
+  const snapshot = safeJsonParse<{ last_summary?: string; last_status?: string; codex_thread_id?: string; optimization?: ResolvedModelPolicy; original_task?: string }>(
     slot.context_snapshot,
     {},
   );
+  let optimizationConfig: TokenOptimizationConfig = {};
+  let autonomous = false;
+  try {
+    const session = await brokerClient.getSession(sessionId);
+    autonomous = JSON.parse(session.config || "{}").execution_mode === "plan_execution";
+    optimizationConfig = safeJsonParse<{ optimization?: TokenOptimizationConfig }>(session.config, {}).optimization ?? {};
+  } catch { /* defaults are safe */ }
+  if (autonomous && slot.paused) throw new Error("Execution paused pending coordinator decision");
+  if (autonomous && snapshot.optimization) snapshot.optimization.auto_escalate = false;
+  const previousEscalationCount = snapshot.optimization?.escalation_count ?? 0;
+  const escalatedPolicy = snapshot.optimization && optimizationConfig.enabled !== false
+    ? escalateModelPolicy(snapshot.optimization, slot.agent_type, optimizationConfig)
+    : snapshot.optimization;
+  if (escalatedPolicy) {
+    snapshot.optimization = escalatedPolicy;
+    await brokerClient.updateSlot({
+      id: slotId,
+      context_snapshot: JSON.stringify({ optimization: escalatedPolicy, updated_at: Date.now() }),
+    });
+    if (escalatedPolicy.escalation_count > previousEscalationCount) {
+      log(LOG_PREFIX, `Escalated slot ${slotId} to ${escalatedPolicy.tier}/${escalatedPolicy.model ?? "provider-default"}`);
+    }
+  }
+  const recoveryPolicy = optimizationConfig.enabled === false ? undefined : escalatedPolicy;
 
   // Get recent messages for this slot to build recap
   const messages = await brokerClient.getMessageLog(sessionId, {
-    limit: 20,
+    limit: 8,
     with_slot: slotId,
   });
 
   const recapLines = messages.map(
-    (m) => `[${m.msg_type}] ${m.from_slot_id !== null ? `slot ${m.from_slot_id}` : m.from_id}: ${m.text.slice(0, 150)}`,
+    (m) => `[${m.msg_type}] ${m.from_slot_id !== null ? `slot ${m.from_slot_id}` : m.from_id}: ${m.text.slice(0, 120)}`,
   );
 
   // Build team context
@@ -159,6 +186,9 @@ export async function respawnAgent(
     "",
     `Role: ${slot.role ?? "unassigned"}`,
     slot.role_description ? `Role description: ${slot.role_description}` : "",
+    snapshot.original_task ? `Original task: ${snapshot.original_task}` : "",
+    autonomous ? AUTONOMOUS_INSTRUCTIONS : "",
+    autonomous ? `Durable plan: ${JSON.stringify(await brokerClient.getPlan(sessionId))}` : "",
     snapshot.last_summary ? `Last known status: ${snapshot.last_summary}` : "",
     "",
     teamContext,
@@ -190,8 +220,11 @@ export async function respawnAgent(
       MULTIAGENTS_SESSION: sessionId,
       MULTIAGENTS_SLOT: String(slotId),
       MULTIAGENTS_ROLE: slot.role ?? undefined,
+      MULTIAGENTS_ROLE_DESCRIPTION: slot.role_description ?? undefined,
       MULTIAGENTS_NAME: slot.display_name ?? undefined,
       MULTIAGENTS_DRIVER_MODE: "1",
+      MULTIAGENTS_TIER: recoveryPolicy?.tier,
+      MULTIAGENTS_CODEX_VERBOSITY: recoveryPolicy ? (recoveryPolicy.tier === "expert" ? "medium" : "low") : undefined,
     };
     delete spawnEnv.CLAUDECODE;
 
@@ -208,7 +241,10 @@ export async function respawnAgent(
     if (previousThreadId) {
       log(LOG_PREFIX, `Attempting to resume Codex thread ${previousThreadId} for slot ${slotId}`);
       try {
-        const result = await driver.reply(previousThreadId, handoffTask);
+        const result = await driver.reply(previousThreadId, handoffTask, recoveryPolicy ? {
+          model: recoveryPolicy.model,
+          reasoningEffort: recoveryPolicy.reasoning_effort,
+        } : {});
         await brokerClient.updateSlot({
           id: slotId,
           context_snapshot: JSON.stringify({
@@ -226,26 +262,24 @@ export async function respawnAgent(
       }
     }
 
-    // Fallback: create a new session (fresh thread, no prior context)
-    const bootstrap = await driver.startSession({
-      prompt: `You are "${slot.display_name ?? `Agent #${slotId}`}" (${slot.role ?? "agent"}). You are being restarted. Reply: "Ready."`,
+    // Fallback: create a fresh thread and execute the handoff directly.
+    const result = await driver.startSession({
+      prompt: handoffTask,
       cwd: projectDir,
       sandbox: "workspace-write",
       developerInstructions: slot.role_description ?? "",
+      model: recoveryPolicy?.model,
+      reasoningEffort: recoveryPolicy?.reasoning_effort,
     });
-
-    // Push handoff task as reply
-    driver.reply(bootstrap.threadId, handoffTask).then(async (result) => {
-      await brokerClient.updateSlot({
-        id: slotId,
-        context_snapshot: JSON.stringify({
-          codex_thread_id: result.threadId,
-          last_summary: result.content.slice(0, 200),
-          last_status: "working",
-          updated_at: Date.now(),
-        }),
-      });
-    }).catch((err) => log(LOG_PREFIX, `Codex respawn task failed: ${err}`));
+    await brokerClient.updateSlot({
+      id: slotId,
+      context_snapshot: JSON.stringify({
+        codex_thread_id: result.threadId,
+        last_summary: result.content.slice(0, 200),
+        last_status: "working",
+        updated_at: Date.now(),
+      }),
+    });
 
     log(LOG_PREFIX, `Respawned Codex into slot ${slotId} via CodexDriver (PID ${driver.pid})`);
     return { pid: driver.pid, process: driver.process, codexDriver: driver };

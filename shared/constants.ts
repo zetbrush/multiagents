@@ -15,7 +15,7 @@ export const BROKER_HOSTNAME = "127.0.0.1";
 export const POLL_INTERVALS: Record<AgentType, number> = {
   claude: 1000, // Claude uses channel push — polling is fallback only
   codex: 300, // Aggressive: piggyback delivery depends on fast buffering
-  gemini: 300, // Same as Codex — no push capability
+  agy: 300, // Same as Codex — no push capability
   custom: 500, // Reasonable default for unknown agents
 };
 
@@ -40,12 +40,19 @@ export const SESSION_DIR = ".multiagents";
 export const SESSION_FILE = ".multiagents/session.json";
 export const RECONNECT_RECAP_LIMIT = 20; // messages to replay on reconnect
 
+// --- Knowledge store ---
+
+export const KNOWLEDGE_LIST_DEFAULT_LIMIT = 20; // entries returned by /knowledge/list when no limit given
+export const KNOWLEDGE_LIST_MAX_LIMIT = 100; // hard ceiling — larger requests are clamped, not rejected
+export const KNOWLEDGE_VALUE_PREVIEW_CHARS = 500; // per-entry value length in list results unless full: true
+export const KNOWLEDGE_VALUE_MAX_CHARS = 4000; // max stored value length — longer puts are rejected
+
 // --- Agent ID prefixes ---
 
 export const AGENT_ID_PREFIXES: Record<AgentType, string> = {
   claude: "cl",
   codex: "cx",
-  gemini: "gm",
+  agy: "ag",
   custom: "cu",
 };
 

@@ -8,8 +8,8 @@
  * Codex CLI: `codex mcp add` → writes to ~/.codex/config.toml
  *   Docs: https://developers.openai.com/codex/mcp
  *
- * Gemini CLI: `gemini mcp add -s user --trust` → writes to ~/.gemini/settings.json
- *   Docs: https://geminicli.com/docs/tools/mcp-server/
+ * Antigravity CLI: writes to ~/.gemini/config/mcp_config.json
+ *   Docs: https://antigravity.google/docs/mcp
  *
  * Each agent has its own config format and location. This script handles all three.
  *
@@ -20,12 +20,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { readOrchestratorHost, writeOrchestratorHost, type OrchestratorHost } from "../shared/orchestrator-host.ts";
 
 const HOME = os.homedir();
 const CLAUDE_PERMISSION_ENTRIES = ["mcp__multiagents", "mcp__multiagents-orch"] as const;
 const CLAUDE_STALE_PERMISSION_ENTRIES = ["mcp__multiagents__*", "mcp__multiagents-orch__*"] as const;
 const CODEX_ARGS_TOML = '["--agent-type", "codex"]';
-const GEMINI_ARGS = ["--agent-type", "gemini"] as const;
+const AGY_ARGS = ["--agent-type", "agy"] as const;
 
 // --- Self-resolving paths ---
 // Compute script paths relative to THIS file's location in the installed package.
@@ -80,11 +81,10 @@ function findAgentCli(name: string): string | null {
       "/usr/local/bin/codex",
       "/opt/homebrew/bin/codex",
     ],
-    gemini: [
-      path.join(HOME, ".local", "bin", "gemini"),
-      path.join(HOME, ".npm-global", "bin", "gemini"),
-      "/usr/local/bin/gemini",
-      "/opt/homebrew/bin/gemini",
+    agy: [
+      path.join(HOME, ".local", "bin", "agy"),
+      "/usr/local/bin/agy",
+      "/opt/homebrew/bin/agy",
     ],
   };
 
@@ -144,12 +144,13 @@ function upsertTomlLine(lines: string[], key: string, value: string): boolean {
   return true;
 }
 
-function upsertCodexMultiagentsSection(content: string, serverCmd: string, serverArgs: string[]): { content: string; changed: boolean } {
+function upsertCodexMcpSection(content: string, serverName: string, serverCmd: string, serverArgs: string[]): { content: string; changed: boolean } {
   const argsToml = `[${serverArgs.map(a => JSON.stringify(a)).join(", ")}]`;
-  const sectionRegex = /(^|\n)\[mcp_servers\.multiagents\]\n([\s\S]*?)(?=\n\[|$)/;
+  const escapedName = escapeRegExp(serverName);
+  const sectionRegex = new RegExp(`(^|\\n)\\[mcp_servers\\.${escapedName}\\]\\n([\\s\\S]*?)(?=\\n\\[|$)`);
   const match = content.match(sectionRegex);
   const desiredSection = [
-    "[mcp_servers.multiagents]",
+    `[mcp_servers.${serverName}]`,
     `command = ${JSON.stringify(serverCmd)}`,
     `args = ${argsToml}`,
     'default_approval_mode = "approve"',
@@ -172,11 +173,18 @@ function upsertCodexMultiagentsSection(content: string, serverCmd: string, serve
   changed = upsertTomlLine(bodyLines, "args", argsToml) || changed;
   changed = upsertTomlLine(bodyLines, "default_approval_mode", '"approve"') || changed;
 
-  const replacement = `${match[1]}[mcp_servers.multiagents]\n${bodyLines.join("\n")}\n`;
+  const replacement = `${match[1]}[mcp_servers.${serverName}]\n${bodyLines.join("\n")}\n`;
   return {
     content: content.replace(sectionRegex, replacement),
     changed,
   };
+}
+
+function removeCodexMcpSection(content: string, serverName: string): { content: string; changed: boolean } {
+  const escapedName = escapeRegExp(serverName);
+  const sectionRegex = new RegExp(`(^|\\n)\\[mcp_servers\\.${escapedName}\\]\\n[\\s\\S]*?(?=\\n\\[|$)`);
+  const updated = content.replace(sectionRegex, "$1");
+  return { content: updated, changed: updated !== content };
 }
 
 // --- Claude Code ---
@@ -193,7 +201,7 @@ function upsertCodexMultiagentsSection(content: string, serverCmd: string, serve
  *
  * Never throws — returns a warning line on any I/O error.
  */
-function addClaudePermissions(): AgentConfigResult {
+function addClaudePermissions(includeOrchestrator: boolean): AgentConfigResult {
   const settingsDir = path.join(HOME, ".claude");
   const settingsPath = path.join(settingsDir, "settings.json");
   const readResult = readJsonObject(settingsPath);
@@ -213,9 +221,16 @@ function addClaudePermissions(): AgentConfigResult {
     allow = allow.filter((entry) => !CLAUDE_STALE_PERMISSION_ENTRIES.includes(entry as typeof CLAUDE_STALE_PERMISSION_ENTRIES[number]));
   }
 
-  const missing = CLAUDE_PERMISSION_ENTRIES.filter((entry) => !allow.includes(entry));
+  const desired = includeOrchestrator
+    ? [...CLAUDE_PERMISSION_ENTRIES]
+    : [CLAUDE_PERMISSION_ENTRIES[0]];
+  const hadUnwantedOrchestrator = !includeOrchestrator && allow.includes(CLAUDE_PERMISSION_ENTRIES[1]);
+  if (hadUnwantedOrchestrator) {
+    allow = allow.filter((entry) => entry !== CLAUDE_PERMISSION_ENTRIES[1]);
+  }
+  const missing = desired.filter((entry) => !allow.includes(entry));
 
-  if (missing.length === 0 && !hadStale) {
+  if (missing.length === 0 && !hadStale && !hadUnwantedOrchestrator) {
     return {
       logs: ["  \x1b[90m✔\x1b[0m Claude Code: MCP permissions already configured"],
       ok: true,
@@ -245,7 +260,7 @@ function addClaudePermissions(): AgentConfigResult {
   return { logs: lines, ok: true };
 }
 
-function writeClaudeConfig(serverCmd: string, serverArgs: string[], orchCmd: string, orchArgs: string[]): AgentConfigResult {
+function writeClaudeConfig(serverCmd: string, serverArgs: string[], orchCmd: string, orchArgs: string[], includeOrchestrator: boolean): AgentConfigResult {
   const configPath = path.join(HOME, ".claude.json");
   const readResult = readJsonObject(configPath);
 
@@ -259,7 +274,6 @@ function writeClaudeConfig(serverCmd: string, serverArgs: string[], orchCmd: str
   const config = readResult.value;
   const mcpServers = asRecord(config.mcpServers) ?? {};
   const existingServer = asRecord(mcpServers["multiagents"]) ?? {};
-  const existingOrch = asRecord(mcpServers["multiagents-orch"]) ?? {};
 
   mcpServers["multiagents"] = {
     ...existingServer,
@@ -268,13 +282,18 @@ function writeClaudeConfig(serverCmd: string, serverArgs: string[], orchCmd: str
     args: [...serverArgs],
     env: asRecord(existingServer.env) ?? {},
   };
-  mcpServers["multiagents-orch"] = {
-    ...existingOrch,
-    type: "stdio",
-    command: orchCmd,
-    args: [...orchArgs],
-    env: asRecord(existingOrch.env) ?? {},
-  };
+  if (includeOrchestrator) {
+    const existingOrch = asRecord(mcpServers["multiagents-orch"]) ?? {};
+    mcpServers["multiagents-orch"] = {
+      ...existingOrch,
+      type: "stdio",
+      command: orchCmd,
+      args: [...orchArgs],
+      env: asRecord(existingOrch.env) ?? {},
+    };
+  } else {
+    delete mcpServers["multiagents-orch"];
+  }
   config.mcpServers = mcpServers;
 
   try {
@@ -291,7 +310,7 @@ function writeClaudeConfig(serverCmd: string, serverArgs: string[], orchCmd: str
   }
 }
 
-function configureClaude(serverCmd: string, serverArgs: string[], orchCmd: string, orchArgs: string[]): AgentConfigResult {
+function configureClaude(serverCmd: string, serverArgs: string[], orchCmd: string, orchArgs: string[], includeOrchestrator: boolean): AgentConfigResult {
   const logs: string[] = [];
   const claudePath = findAgentCli("claude");
   let serverOk = false;
@@ -303,26 +322,28 @@ function configureClaude(serverCmd: string, serverArgs: string[], orchCmd: strin
 
     // `claude mcp add <name> -s user -- <command> [args...]`
     const r1 = Bun.spawnSync([claudePath, "mcp", "add", "multiagents", "-s", "user", "--", serverCmd, ...serverArgs]);
-    const r2 = Bun.spawnSync([claudePath, "mcp", "add", "multiagents-orch", "-s", "user", "--", orchCmd, ...orchArgs]);
+    const r2 = includeOrchestrator
+      ? Bun.spawnSync([claudePath, "mcp", "add", "multiagents-orch", "-s", "user", "--", orchCmd, ...orchArgs])
+      : null;
 
-    if (r1.exitCode === 0 && r2.exitCode === 0) {
+    if (r1.exitCode === 0 && (!r2 || r2.exitCode === 0)) {
       logs.push("  \x1b[32m✔\x1b[0m Claude Code: MCP servers added (via claude mcp add -s user)");
       serverOk = true;
     } else {
       logs.push("  \x1b[33m!\x1b[0m Claude Code: CLI method failed, falling back to file config");
-      const fileResult = writeClaudeConfig(serverCmd, serverArgs, orchCmd, orchArgs);
+      const fileResult = writeClaudeConfig(serverCmd, serverArgs, orchCmd, orchArgs, includeOrchestrator);
       logs.push(...fileResult.logs);
       serverOk = fileResult.ok;
     }
   } else {
     // No claude CLI — write directly to ~/.claude.json
-    const fileResult = writeClaudeConfig(serverCmd, serverArgs, orchCmd, orchArgs);
+    const fileResult = writeClaudeConfig(serverCmd, serverArgs, orchCmd, orchArgs, includeOrchestrator);
     logs.push(...fileResult.logs);
     serverOk = fileResult.ok;
   }
 
   // Always add tool-level permissions to ~/.claude/settings.json (never throws)
-  const permissionsResult = addClaudePermissions();
+  const permissionsResult = addClaudePermissions(includeOrchestrator);
   logs.push(...permissionsResult.logs);
   return { logs, ok: serverOk && permissionsResult.ok };
 }
@@ -332,7 +353,7 @@ function configureClaude(serverCmd: string, serverArgs: string[], orchCmd: strin
 // Writes to: ~/.codex/config.toml → [mcp_servers.<name>]
 // Docs: https://developers.openai.com/codex/mcp
 
-function configureCodex(serverCmd: string, serverArgs: string[]): AgentConfigResult {
+function configureCodex(serverCmd: string, serverArgs: string[], orchCmd: string, orchArgs: string[], includeOrchestrator: boolean): AgentConfigResult {
   const logs: string[] = [];
   let ok = false;
   // For Codex TOML: command is "bun", args include the script + "--agent-type codex"
@@ -351,7 +372,11 @@ function configureCodex(serverCmd: string, serverArgs: string[]): AgentConfigRes
     const codexPath = findAgentCli("codex");
     if (codexPath) {
       Bun.spawnSync([codexPath, "mcp", "remove", "multiagents"], { stderr: "ignore", stdout: "ignore" });
+      Bun.spawnSync([codexPath, "mcp", "remove", "multiagents-orch"], { stderr: "ignore", stdout: "ignore" });
       const r1 = Bun.spawnSync([codexPath, "mcp", "add", "multiagents", "--", serverCmd, ...codexFullArgs]);
+      if (includeOrchestrator) {
+        Bun.spawnSync([codexPath, "mcp", "add", "multiagents-orch", "--", orchCmd, ...orchArgs]);
+      }
       if (r1.exitCode === 0) {
         logs.push("  \x1b[32m✔\x1b[0m Codex CLI: MCP server added (via codex mcp add)");
       } else {
@@ -369,10 +394,14 @@ function configureCodex(serverCmd: string, serverArgs: string[]): AgentConfigRes
     }
 
     const hadSection = existing.includes("[mcp_servers.multiagents]");
-    const updated = upsertCodexMultiagentsSection(existing, serverCmd, codexFullArgs);
+    const peerUpdated = upsertCodexMcpSection(existing, "multiagents", serverCmd, codexFullArgs);
+    const orchUpdated = includeOrchestrator
+      ? upsertCodexMcpSection(peerUpdated.content, "multiagents-orch", orchCmd, orchArgs)
+      : removeCodexMcpSection(peerUpdated.content, "multiagents-orch");
+    const changed = peerUpdated.changed || orchUpdated.changed;
 
-    if (updated.changed) {
-      fs.writeFileSync(configPath, updated.content);
+    if (changed) {
+      fs.writeFileSync(configPath, orchUpdated.content);
       logs.push(
         hadSection
           ? "  \x1b[32m✔\x1b[0m Codex CLI: updated ~/.codex/config.toml for multiagents approval + command"
@@ -389,20 +418,20 @@ function configureCodex(serverCmd: string, serverArgs: string[]): AgentConfigRes
   return { logs, ok };
 }
 
-// --- Gemini CLI ---
-// Prefer: `gemini mcp add -s user --trust`
-// Fallback: direct write to ~/.gemini/settings.json → mcpServers
-// Docs: https://geminicli.com/docs/tools/mcp-server/
+// --- Antigravity CLI ---
+// AGY stores MCP servers separately from preferences in
+// ~/.gemini/config/mcp_config.json.
+// Docs: https://antigravity.google/docs/cli/gcli-migration/
 
-function writeGeminiConfig(serverCmd: string, serverArgs: string[]): AgentConfigResult {
-  const geminiDir = path.join(HOME, ".gemini");
-  const configPath = path.join(geminiDir, "settings.json");
-  const geminiFullArgs = [...serverArgs, ...GEMINI_ARGS];
+function configureAgy(serverCmd: string, serverArgs: string[], orchCmd: string, orchArgs: string[], includeOrchestrator: boolean): AgentConfigResult {
+  const agyConfigDir = path.join(HOME, ".gemini", "config");
+  const configPath = path.join(agyConfigDir, "mcp_config.json");
+  const agyFullArgs = [...serverArgs, ...AGY_ARGS];
   const readResult = readJsonObject(configPath);
 
   if (!readResult.value) {
     return {
-      logs: [`  \x1b[33m!\x1b[0m Gemini CLI: ${readResult.error}, skipping ~/.gemini/settings.json update`],
+      logs: [`  \x1b[33m!\x1b[0m Antigravity CLI: ${readResult.error}, skipping ~/.gemini/config/mcp_config.json update`],
       ok: false,
     };
   }
@@ -411,87 +440,48 @@ function writeGeminiConfig(serverCmd: string, serverArgs: string[]): AgentConfig
   const mcpServers = asRecord(settings.mcpServers) ?? {};
   const existingEntry = asRecord(mcpServers["multiagents"]) ?? {};
   const existingArgs = Array.isArray(existingEntry.args) ? existingEntry.args : [];
+  const existingOrch = asRecord(mcpServers["multiagents-orch"]);
+  const orchArgsMatch = Array.isArray(existingOrch?.args)
+    && JSON.stringify(existingOrch.args) === JSON.stringify(orchArgs);
   const isAlreadyConfigured = existingEntry.command === serverCmd
-    && JSON.stringify(existingArgs) === JSON.stringify(geminiFullArgs)
-    && existingEntry.timeout === 30000
-    && existingEntry.trust === true;
+    && JSON.stringify(existingArgs) === JSON.stringify(agyFullArgs)
+    && (includeOrchestrator
+      ? existingOrch?.command === orchCmd && orchArgsMatch
+      : !existingOrch);
 
   if (isAlreadyConfigured) {
     return {
-      logs: ["  \x1b[90m✔\x1b[0m Gemini CLI: MCP server already configured"],
+      logs: ["  \x1b[90m✔\x1b[0m Antigravity CLI: MCP server already configured"],
       ok: true,
     };
   }
 
   mcpServers["multiagents"] = {
-    ...existingEntry,
     command: serverCmd,
-    args: geminiFullArgs,
-    timeout: 30000,
-    trust: true,
+    args: agyFullArgs,
   };
+  if (includeOrchestrator) {
+    mcpServers["multiagents-orch"] = { command: orchCmd, args: [...orchArgs] };
+  } else {
+    delete mcpServers["multiagents-orch"];
+  }
   settings.mcpServers = mcpServers;
 
   try {
-    if (!fs.existsSync(geminiDir)) {
-      fs.mkdirSync(geminiDir, { recursive: true });
+    if (!fs.existsSync(agyConfigDir)) {
+      fs.mkdirSync(agyConfigDir, { recursive: true });
     }
     fs.writeFileSync(configPath, JSON.stringify(settings, null, 2) + "\n");
     return {
-      logs: ["  \x1b[32m✔\x1b[0m Gemini CLI: MCP server written to ~/.gemini/settings.json (trust: true)"],
+      logs: ["  \x1b[32m✔\x1b[0m Antigravity CLI: MCP server written to ~/.gemini/config/mcp_config.json"],
       ok: true,
     };
   } catch (e) {
     return {
-      logs: [`  \x1b[33m!\x1b[0m Gemini CLI: could not write ~/.gemini/settings.json — ${errMsg(e)}`],
+      logs: [`  \x1b[33m!\x1b[0m Antigravity CLI: could not write ~/.gemini/config/mcp_config.json — ${errMsg(e)}`],
       ok: false,
     };
   }
-}
-
-function configureGemini(serverCmd: string, serverArgs: string[]): AgentConfigResult {
-  const logs: string[] = [];
-  let ok = false;
-  const geminiFullArgs = [...serverArgs, ...GEMINI_ARGS];
-
-  try {
-    const geminiDir = path.join(HOME, ".gemini");
-    if (!fs.existsSync(geminiDir)) {
-      fs.mkdirSync(geminiDir, { recursive: true });
-    }
-
-    const geminiPath = findAgentCli("gemini");
-    if (geminiPath) {
-      Bun.spawnSync([geminiPath, "mcp", "remove", "-s", "user", "multiagents"], { stderr: "ignore", stdout: "ignore" });
-      const addResult = Bun.spawnSync([
-        geminiPath,
-        "mcp",
-        "add",
-        "-s",
-        "user",
-        "--trust",
-        "--timeout",
-        "30000",
-        "multiagents",
-        serverCmd,
-        ...geminiFullArgs,
-      ]);
-      if (addResult.exitCode === 0) {
-        logs.push("  \x1b[32m✔\x1b[0m Gemini CLI: MCP server added (via gemini mcp add -s user --trust)");
-        ok = true;
-      } else {
-        logs.push("  \x1b[33m!\x1b[0m Gemini CLI: CLI method failed, falling back to file config");
-      }
-    }
-  } catch (e) {
-    logs.push(`  \x1b[33m!\x1b[0m Gemini CLI: configuration failed — ${errMsg(e)}`);
-  }
-
-  const fileResult = writeGeminiConfig(serverCmd, serverArgs);
-  logs.push(...fileResult.logs);
-  ok = ok || fileResult.ok;
-
-  return { logs, ok };
 }
 
 // --- Public API ---
@@ -512,20 +502,49 @@ function configureMcp(): ConfigResult {
   const logs: string[] = [];
   const configured: string[] = [];
 
-  // Claude Code (always — it's the primary orchestrator)
+  const claudeDetected = Boolean(findAgentCli("claude"));
+  const codexDetected = Boolean(findAgentCli("codex") || fs.existsSync(path.join(HOME, ".codex")));
+  const agyDetected = Boolean(
+    findAgentCli("agy")
+      || fs.existsSync(path.join(HOME, ".gemini", "antigravity-cli"))
+      || fs.existsSync(path.join(HOME, ".gemini", "config", "mcp_config.json")),
+  );
+  const savedHost = readOrchestratorHost();
+  const hostIsAvailable = (host: OrchestratorHost): boolean =>
+    host === "claude" ? claudeDetected : host === "codex" ? codexDetected : agyDetected;
+  const orchestratorHost: OrchestratorHost = savedHost && hostIsAvailable(savedHost)
+    ? savedHost
+    : claudeDetected ? "claude" : codexDetected ? "codex" : agyDetected ? "agy" : "claude";
+  if (savedHost && savedHost !== orchestratorHost) {
+    logs.push(`  \x1b[33m!\x1b[0m Saved orchestrator ${savedHost} is unavailable; switching to ${orchestratorHost}`);
+  }
   try {
-    const result = configureClaude(serverBin, serverArgs, orchBin, orchArgs);
-    logs.push(...result.logs);
-    if (result.ok) configured.push("claude");
+    writeOrchestratorHost(orchestratorHost);
   } catch (e) {
-    logs.push(`  \x1b[33m!\x1b[0m Claude Code: unexpected error — ${errMsg(e)}`);
+    logs.push(`  \x1b[33m!\x1b[0m Could not persist orchestrator host — ${errMsg(e)}`);
+  }
+  logs.push(`  \x1b[36m◆\x1b[0m Orchestrator host: ${orchestratorHost}`);
+
+  // Claude Code (if CLI binary or configuration exists)
+  const claudeConfigured = claudeDetected
+    || fs.existsSync(path.join(HOME, ".claude"))
+    || fs.existsSync(path.join(HOME, ".claude.json"));
+  if (claudeConfigured) {
+    try {
+      const result = configureClaude(serverBin, serverArgs, orchBin, orchArgs, orchestratorHost === "claude");
+      logs.push(...result.logs);
+      if (result.ok) configured.push("claude");
+    } catch (e) {
+      logs.push(`  \x1b[33m!\x1b[0m Claude Code: unexpected error — ${errMsg(e)}`);
+    }
+  } else {
+    logs.push("  \x1b[90m-\x1b[0m Claude Code: not detected, skipping");
   }
 
   // Codex CLI (if CLI binary exists OR ~/.codex/ config dir exists)
-  const codexDetected = findAgentCli("codex") || fs.existsSync(path.join(HOME, ".codex"));
   if (codexDetected) {
     try {
-      const result = configureCodex(serverBin, serverArgs);
+      const result = configureCodex(serverBin, serverArgs, orchBin, orchArgs, orchestratorHost === "codex");
       logs.push(...result.logs);
       if (result.ok) configured.push("codex");
     } catch (e) {
@@ -535,18 +554,17 @@ function configureMcp(): ConfigResult {
     logs.push("  \x1b[90m-\x1b[0m Codex CLI: not detected, skipping");
   }
 
-  // Gemini CLI (if CLI binary exists OR ~/.gemini/ config dir exists)
-  const geminiDetected = findAgentCli("gemini") || fs.existsSync(path.join(HOME, ".gemini"));
-  if (geminiDetected) {
+  // Antigravity CLI (if CLI binary exists OR its config dir exists)
+  if (agyDetected) {
     try {
-      const result = configureGemini(serverBin, serverArgs);
+      const result = configureAgy(serverBin, serverArgs, orchBin, orchArgs, orchestratorHost === "agy");
       logs.push(...result.logs);
-      if (result.ok) configured.push("gemini");
+      if (result.ok) configured.push("agy");
     } catch (e) {
-      logs.push(`  \x1b[33m!\x1b[0m Gemini CLI: unexpected error — ${errMsg(e)}`);
+      logs.push(`  \x1b[33m!\x1b[0m Antigravity CLI: unexpected error — ${errMsg(e)}`);
     }
   } else {
-    logs.push("  \x1b[90m-\x1b[0m Gemini CLI: not detected, skipping");
+    logs.push("  \x1b[90m-\x1b[0m Antigravity CLI: not detected, skipping");
   }
 
   return { logs, configured };
@@ -567,12 +585,11 @@ export async function installMcp(): Promise<void> {
 \x1b[1mNext step:\x1b[0m Restart your agent CLIs to load the new tools.
 
 \x1b[1mVerify:\x1b[0m
-${configured.includes("claude") ? "  Claude:  \x1b[90mclaude mcp list | grep multiagents\x1b[0m\n" : ""}${configured.includes("codex") ? "  Codex:   \x1b[90mcodex mcp list\x1b[0m\n" : ""}${configured.includes("gemini") ? "  Gemini:  \x1b[90mgemini mcp list\x1b[0m\n" : ""}
+${configured.includes("claude") ? "  Claude:  \x1b[90mclaude mcp list | grep multiagents\x1b[0m\n" : ""}${configured.includes("codex") ? "  Codex:   \x1b[90mcodex mcp list\x1b[0m\n" : ""}${configured.includes("agy") ? "  AGY:     \x1b[90mOpen /mcp and check multiagents\x1b[0m\n" : ""}
 \x1b[1mManual setup:\x1b[0m
   Claude:  \x1b[90mclaude mcp add multiagents -s user -- multiagents-server\x1b[0m
   Codex:   \x1b[90mcodex mcp add multiagents -- multiagents-server --agent-type codex\x1b[0m
-  Gemini:  \x1b[90mgemini mcp add -s user --trust multiagents multiagents-server --agent-type gemini\x1b[0m
-           \x1b[90m(or add trust:true under ~/.gemini/settings.json if the CLI is unavailable)\x1b[0m
+  AGY:     \x1b[90mAdd multiagents under ~/.gemini/config/mcp_config.json\x1b[0m
 `);
 }
 

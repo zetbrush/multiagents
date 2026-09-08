@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
+import { validateExecutionPlan, type ExecutionStep } from "../shared/plan-execution.ts";
 // ============================================================================
 // multiagents — Orchestrator MCP Server
 // ============================================================================
-// MCP server for Claude Desktop that provides tools to manage a team of
+// MCP server for Claude, Codex, or AGY that provides tools to manage a team of
 // headless AI agents. Exposes create_team, status, broadcast, control, etc.
 // ============================================================================
 
@@ -16,7 +17,8 @@ import type { Subprocess } from "bun";
 
 import * as fs from "node:fs";
 import { BrokerClient } from "../shared/broker-client.ts";
-import type { AgentLaunchConfig } from "../shared/types.ts";
+import type { AgentLaunchConfig, ResolvedModelPolicy, TokenOptimizationConfig } from "../shared/types.ts";
+import { DEFAULT_OPTIMIZATION, decayModelPolicy, escalateModelPolicy, recommendedTeamSize, rightSizeTeam } from "../shared/model-routing.ts";
 import { log, getGitRoot, slugify, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
   DEFAULT_BROKER_PORT,
@@ -26,16 +28,17 @@ import {
   FLAP_WINDOW_MS,
 } from "../shared/constants.ts";
 
-import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
+import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH, killPidTreeVerified, killSessionMcpServers } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
 import { monitorProcess, monitorCodexDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
 import { controlSession, broadcastToTeam, resolveTarget } from "./session-control.ts";
+import { buildOptimizationReport, formatOptimizationReport, getOptimizationConfig } from "./token-optimizer.ts";
 
 const LOG_PREFIX = "orchestrator";
-const BROKER_URL = `http://${BROKER_HOSTNAME}:${DEFAULT_BROKER_PORT}`;
+const BROKER_URL = `http://${BROKER_HOSTNAME}:${process.env.MULTIAGENTS_PORT ?? DEFAULT_BROKER_PORT}`;
 
 // Track active processes per session
 const activeProcesses: Map<string, Map<number, Subprocess>> = new Map();
@@ -52,6 +55,10 @@ interface CodexSlotState {
   lastNudge: number;
 }
 const activeCodexDrivers: Map<string, Map<number, CodexSlotState>> = new Map();
+/** Slots intentionally stopped by token budgets; they must not auto-respawn. */
+const budgetStoppedSlots = new Set<number>();
+/** Slots already escalated in place by the proactive budget check (one per budget). */
+const proactivelyEscalatedSlots = new Set<number>();
 
 // --- Dashboard auto-launch ---
 
@@ -139,12 +146,36 @@ async function ensureBroker(brokerClient: BrokerClient): Promise<void> {
 function handleEvent(event: AgentEvent): void {
   log(LOG_PREFIX, `[${event.severity}] ${event.message}`);
 
-  // Auto-respawn on crash (unless flapping)
+  if (budgetStoppedSlots.has(event.slotId) && (event.type === "agent_crashed" || event.type === "agent_completed")) {
+    pendingEvents.push({
+      type: "guardrail_triggered",
+      severity: "warning",
+      slotId: event.slotId,
+      sessionId: event.sessionId,
+      message: `Slot ${event.slotId} remains stopped because its token budget was exhausted.`,
+    });
+    return;
+  }
+
+  // Auto-respawn on crash (unless flapping, or the slot was intentionally removed/released —
+  // e.g. via remove_agent — in which case the exit is expected and must NOT respawn a bare
+  // "unassigned" ghost agent).
   if (event.type === "agent_crashed" && event.data && !event.data.is_flapping) {
     const sessionMeta = activeSessions.get(event.sessionId);
     if (sessionMeta) {
       const brokerClient = new BrokerClient(BROKER_URL);
-      handleAgentCrash(event.slotId, event.data.exit_code as number, event.sessionId, brokerClient)
+      (async () => {
+        try {
+          const slot = await brokerClient.getSlot(event.slotId);
+          if (slot?.task_state === "released" || slot?.paused) {
+            log(LOG_PREFIX, `Slot ${event.slotId} exited after being released — not respawning.`);
+            return;
+          }
+        } catch {
+          // If we can't confirm the slot's state, fall through to existing crash handling
+          // rather than silently dropping a real crash.
+        }
+        return handleAgentCrash(event.slotId, event.data!.exit_code as number, event.sessionId, brokerClient)
         .then(async (crashEvent) => {
           pendingEvents.push(crashEvent);
           if (!crashEvent.data?.is_flapping) {
@@ -196,6 +227,7 @@ function handleEvent(event: AgentEvent): void {
           }
         })
         .catch((err) => log(LOG_PREFIX, `Crash handler error: ${err}`));
+      })().catch((err) => log(LOG_PREFIX, `Crash handler error: ${err}`));
     }
   } else if (event.type === "agent_completed" && event.data) {
     // Codex agents exit with code 0 when they finish their turn, but they may
@@ -222,6 +254,113 @@ function handleEvent(event: AgentEvent): void {
 const completionRestartHistory: Map<number, number[]> = new Map();
 const COMPLETION_RESTART_LIMIT = 3; // max code-0 restarts in FLAP_WINDOW_MS
 
+// --- Model policy persistence -----------------------------------------------
+// The resolved policy lives inside slot.context_snapshot, which several call
+// sites rewrite wholesale. Always read-modify-write so a turn update can't drop
+// the routing state (or the Codex thread id) another writer put there.
+
+interface SlotPolicyContext {
+  policy: ResolvedModelPolicy;
+  snapshot: Record<string, any>;
+  config: TokenOptimizationConfig;
+}
+
+async function loadSlotPolicy(
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+): Promise<SlotPolicyContext | null> {
+  const slot = await brokerClient.getSlot(slotId);
+  const snapshot = safeJsonParse<Record<string, any>>(slot.context_snapshot, {});
+  const policy = snapshot.optimization as ResolvedModelPolicy | undefined;
+  if (!policy?.tier) return null;
+  const session = await brokerClient.getSession(sessionId);
+  const config = getOptimizationConfig(session);
+  if (config.enabled === false) return null;
+  return { policy, snapshot, config };
+}
+
+async function persistSlotPolicy(
+  slotId: number,
+  snapshot: Record<string, any>,
+  policy: ResolvedModelPolicy,
+  brokerClient: BrokerClient,
+): Promise<void> {
+  await brokerClient.updateSlot({
+    id: slotId,
+    context_snapshot: JSON.stringify({ ...snapshot, optimization: policy, updated_at: Date.now() }),
+  });
+}
+
+/**
+ * Record a turn that finished without needing an escalation. After enough clean
+ * turns decayModelPolicy steps the agent back down a tier, so a single hard task
+ * no longer pins it on `expert` for the rest of the session.
+ */
+async function recordAgentTurnSuccess(
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+): Promise<void> {
+  try {
+    const loaded = await loadSlotPolicy(slotId, sessionId, brokerClient);
+    if (!loaded) return;
+    const { policy, snapshot, config } = loaded;
+    const next = decayModelPolicy(policy, (await brokerClient.getSlot(slotId)).agent_type, config);
+    await persistSlotPolicy(slotId, snapshot, next, brokerClient);
+    if (next.tier !== policy.tier) {
+      log(LOG_PREFIX, `Decayed slot ${slotId} from ${policy.tier} to ${next.tier} after ${config.decay_after_stable_turns ?? DEFAULT_OPTIMIZATION.decay_after_stable_turns} stable turns`);
+      pendingEvents.push({
+        type: "guardrail_triggered",
+        severity: "info",
+        slotId,
+        sessionId,
+        message: `Slot ${slotId} stepped down to ${next.tier}/${next.model ?? "provider-default"} after stable turns.`,
+      });
+      // A decayed agent may climb again if the cheaper tier stalls on the budget.
+      proactivelyEscalatedSlots.delete(slotId);
+    }
+  } catch (err) {
+    log(LOG_PREFIX, `Tier decay update failed for slot ${slotId}: ${err}`);
+  }
+}
+
+/**
+ * Escalate an agent in place while it is still running, before the hard budget
+ * stop kills it. Recovery-path escalation only happens after a kill+respawn, so
+ * an agent burning through its budget on a too-weak model used to have to die
+ * first. Returns the new policy when the tier actually moved.
+ */
+async function proactivelyEscalateSlot(
+  slotId: number,
+  sessionId: string,
+  budgetPercent: number,
+  threshold: number,
+  brokerClient: BrokerClient,
+): Promise<ResolvedModelPolicy | null> {
+  if (proactivelyEscalatedSlots.has(slotId) || budgetStoppedSlots.has(slotId)) return null;
+  const loaded = await loadSlotPolicy(slotId, sessionId, brokerClient);
+  if (!loaded) return null;
+  const { policy, snapshot, config } = loaded;
+  if (!policy.auto_escalate || policy.tier === "expert") return null;
+
+  const slot = await brokerClient.getSlot(slotId);
+  const next = escalateModelPolicy(policy, slot.agent_type, config);
+  if (next.tier === policy.tier) return null;
+
+  proactivelyEscalatedSlots.add(slotId);
+  await persistSlotPolicy(slotId, snapshot, next, brokerClient);
+  log(LOG_PREFIX, `Proactively escalated slot ${slotId} to ${next.tier}/${next.model ?? "provider-default"} at ${budgetPercent}% of budget (threshold ${threshold}%)`);
+  pendingEvents.push({
+    type: "guardrail_triggered",
+    severity: "warning",
+    slotId,
+    sessionId,
+    message: `${slot.display_name ?? `Slot ${slotId}`} reached ${budgetPercent}% of its token budget — escalated to ${next.tier}/${next.model ?? "provider-default"} in place.`,
+  });
+  return next;
+}
+
 /** Check if a completed agent actually finished its task; if not, respawn it. */
 async function autoRestartIfIncomplete(
   slotId: number,
@@ -229,6 +368,7 @@ async function autoRestartIfIncomplete(
   brokerClient: BrokerClient,
 ): Promise<boolean> {
   try {
+    if ((await brokerClient.getSlot(slotId)).paused) return false;
     const taskInfo = await brokerClient.getTaskState(slotId);
     const state = taskInfo.task_state;
     const name = taskInfo.display_name ?? `Slot ${slotId}`;
@@ -262,6 +402,16 @@ async function autoRestartIfIncomplete(
         log(LOG_PREFIX, `No session metadata for ${sessionId}, cannot restart`);
         return false;
       }
+
+      // The exiting process reported code 0, but its own children (notably the
+      // `cli.ts mcp-server` grandchild each agent CLI spawns) can outlive it as
+      // orphans. Kill the previous generation's tree before overwriting the
+      // tracked handle below, or that orphan is never reachable again — it was
+      // the source of ghost processes surviving end_session entirely.
+      const priorDriver = activeCodexDrivers.get(sessionId)?.get(slotId);
+      if (priorDriver) { void killPidTreeVerified(priorDriver.driver.pid); }
+      const priorProc = activeProcesses.get(sessionId)?.get(slotId);
+      if (priorProc) { void killPidTreeVerified(priorProc.pid); }
 
       const { respawnAgent } = await import("./recovery.ts");
       const result = await respawnAgent(sessionId, slotId, brokerClient, sessionMeta.projectDir);
@@ -299,6 +449,7 @@ async function autoRestartIfIncomplete(
     }
 
     // Agent completed normally (done_pending_review, approved, released)
+    await recordAgentTurnSuccess(slotId, sessionId, brokerClient);
     log(LOG_PREFIX, `${name} completed with task_state="${state}" — no restart needed`);
     return false;
   } catch (err) {
@@ -339,18 +490,31 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
         type: "object" as const,
         properties: {
           project_dir: { type: "string", description: "Absolute path where agents will work. Will be created if it does not exist." },
+          execution_mode: { type: "string", enum: ["team", "plan_execution"], description: "plan_execution runs one explicitly selected model through a verified sequential plan, with coordinator decisions and final approval." },
           session_name: { type: "string", description: "Short name for this session. Used to generate session_id." },
           agents: {
             type: "array",
             items: {
               type: "object",
               properties: {
-                agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
+                agent_type: { type: "string", enum: ["claude", "codex", "agy"] },
                 name: { type: "string", description: "Display name for the agent, e.g., 'Alice' or 'Backend Engineer'" },
                 role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity: 'Android Software Engineer', 'Web QA Engineer'." },
                 role_description: { type: "string", description: "Detailed role brief including platform (web/android/ios/cli/api), framework/stack, specific expertise, constraints, and acceptance criteria. The richer this is, the better the agent performs." },
                 initial_task: { type: "string", description: "Specific task with acceptance criteria. Include what 'done' looks like, files to modify, APIs to use, and verification steps." },
                 file_ownership: { type: "array", items: { type: "string" }, description: "Glob patterns for files this agent owns exclusively, e.g., 'src/auth/**'" },
+                model_policy: {
+                  type: "object",
+                  description: "Optional optimizer overrides. Omit for automatic local classification.",
+                  properties: {
+                    tier: { type: "string", enum: ["economy", "balanced", "expert"] },
+                    model: { type: "string" },
+                    reasoning_effort: { type: "string", enum: ["low", "medium", "high"] },
+                    token_budget: { type: "number" },
+                    max_output_tokens: { type: "number" },
+                    auto_escalate: { type: "boolean" },
+                  },
+                },
               },
               required: ["agent_type", "name", "role", "role_description", "initial_task"],
             },
@@ -361,15 +525,49 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
             items: {
               type: "object",
               properties: {
+                key: { type: "string" },
+                files: { type: "array", items: { type: "string" } },
+                depends_on: { type: "array", items: { type: "string" } },
+                acceptance: { type: "array", items: { type: "string" } },
+                decision_required: { type: "string" },
+                checks: { type: "array", items: { type: "object", properties: { argv: { type: "array", items: { type: "string" } }, cwd: { type: "string" }, timeout_ms: { type: "number" } }, required: ["argv", "cwd"] } },
                 label: { type: "string", description: "What needs to be done" },
                 agent_name: { type: "string", description: "Name of the agent assigned to this item" },
               },
               required: ["label"],
             },
           },
+          optimization: {
+            type: "object",
+            description: "Token optimizer settings; enabled by default.",
+            properties: {
+              enabled: { type: "boolean" },
+              session_token_budget: { type: "number" },
+              default_agent_token_budget: { type: "number" },
+              auto_escalate: { type: "boolean" },
+              right_size: { type: "string", enum: ["off", "recommend", "enforce"] },
+              tiers: { type: "object", description: "Provider/tier model overrides." },
+              pricing: { type: "object", description: "Optional USD per million input/output tokens keyed by model." },
+            },
+          },
         },
         required: ["project_dir", "session_name", "agents"],
       },
+    },
+    {
+      name: "get_execution_plan",
+      description: "Get the durable execution plan, step IDs, blockers, decisions and verification evidence for coordinator review. Detailed logs remain on disk.",
+      inputSchema: { type: "object" as const, properties: { session_id: { type: "string" } }, required: ["session_id"] },
+    },
+    {
+      name: "resolve_plan_blocker",
+      description: "Coordinator decision for a blocked step or pre-execution gate. Describe the decision; optionally reopen a completed step after final review (later steps are invalidated).",
+      inputSchema: { type: "object" as const, properties: { session_id: { type: "string" }, item_id: { type: "number" }, decision: { type: "string" }, reopen: { type: "boolean" } }, required: ["session_id", "item_id", "decision"] },
+    },
+    {
+      name: "approve_execution",
+      description: "Explicit final coordinator approval after reviewing the diff and verification evidence of an autonomous plan.",
+      inputSchema: { type: "object" as const, properties: { session_id: { type: "string" }, message: { type: "string" } }, required: ["session_id", "message"] },
     },
     {
       name: "get_team_status",
@@ -380,6 +578,30 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
           session_id: { type: "string" },
         },
         required: ["session_id"],
+      },
+    },
+    {
+      name: "get_optimization_report",
+      description: "Show model-routing decisions, token budgets, escalation counts and optional estimated cost for a session.",
+      inputSchema: {
+        type: "object" as const,
+        properties: { session_id: { type: "string" } },
+        required: ["session_id"],
+      },
+    },
+    {
+      name: "adjust_token_budget",
+      description: "Set or extend a session or agent token budget. A stopped agent can then be resumed explicitly.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          session_id: { type: "string" },
+          scope: { type: "string", enum: ["session", "agent"] },
+          target: { type: "string", description: "Agent name/role/slot ID when scope=agent." },
+          operation: { type: "string", enum: ["set", "extend"] },
+          tokens: { type: "number", description: "Positive token amount." },
+        },
+        required: ["session_id", "scope", "operation", "tokens"],
       },
     },
     {
@@ -415,12 +637,23 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
         type: "object" as const,
         properties: {
           session_id: { type: "string" },
-          agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
+          agent_type: { type: "string", enum: ["claude", "codex", "agy"] },
           name: { type: "string", description: "Display name for the agent" },
           role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity." },
           role_description: { type: "string", description: "Detailed role brief including platform, framework, expertise, constraints. The richer this is, the better the agent performs." },
           initial_task: { type: "string", description: "Specific task with acceptance criteria. Include what 'done' looks like." },
           file_ownership: { type: "array", items: { type: "string" }, description: "Glob patterns for files this agent owns exclusively" },
+          model_policy: {
+            type: "object",
+            properties: {
+              tier: { type: "string", enum: ["economy", "balanced", "expert"] },
+              model: { type: "string" },
+              reasoning_effort: { type: "string", enum: ["low", "medium", "high"] },
+              token_budget: { type: "number" },
+              max_output_tokens: { type: "number" },
+              auto_escalate: { type: "boolean" },
+            },
+          },
         },
         required: ["session_id", "agent_type", "name", "role", "role_description", "initial_task"],
       },
@@ -580,19 +813,60 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     switch (name) {
+      case "get_execution_plan": {
+        const { session_id } = args as { session_id: string };
+        const plan = await brokerClient.getPlan(session_id);
+        return { content: [{ type: "text", text: JSON.stringify(plan) }] };
+      }
+      case "resolve_plan_blocker": {
+        const req = args as { session_id: string; item_id: number; decision: string; reopen?: boolean };
+        const plan = await brokerClient.resolvePlanBlocker(req);
+        const item = plan.items.find(i => i.id === req.item_id);
+        if (item?.assigned_to_slot) await brokerClient.sendMessage({ from_id: "orchestrator", to_slot_id: item.assigned_to_slot, session_id: req.session_id, text: `Coordinator decision: ${req.decision}\nCall get_plan and continue from the first unfinished step.`, msg_type: "system" });
+        return { content: [{ type: "text", text: JSON.stringify(plan) }] };
+      }
+      case "approve_execution": {
+        const req = args as { session_id: string; message: string };
+        const session = await brokerClient.getSession(req.session_id);
+        if (JSON.parse(session.config || "{}").execution_mode !== "plan_execution") throw new Error("Not an execution session");
+        if (!req.message?.trim()) throw new Error("Provide final review findings");
+        const slots = await brokerClient.listSlots(req.session_id);
+        if (slots.length !== 1) throw new Error("Expected one execution worker");
+        const result = await brokerClient.approve({ peer_id: "orchestrator", session_id: req.session_id, target_slot_id: slots[0]!.id, message: req.message });
+        return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      }
       // ---- create_team ----
       case "create_team": {
-        const { project_dir, session_name, agents, plan: planItems } = args as {
+        const { project_dir, session_name, agents, plan: planItems, optimization, execution_mode = "team" } = args as {
           project_dir: string;
           session_name: string;
           agents: AgentLaunchConfig[];
-          plan?: { label: string; agent_name?: string }[];
+          execution_mode?: "team" | "plan_execution";
+          plan?: (Partial<ExecutionStep> & { label: string; agent_name?: string })[];
+          optimization?: TokenOptimizationConfig;
         };
+        const autonomous = execution_mode === "plan_execution";
+        if (!["team", "plan_execution"].includes(execution_mode)) throw new Error("Invalid execution mode");
+        if (autonomous) {
+          if (agents.length !== 1 || !agents[0]?.model_policy?.model?.trim()) throw new Error("Plan execution requires one worker with an explicit model");
+          validateExecutionPlan(planItems as ExecutionStep[]);
+          agents[0].model_policy = { ...agents[0].model_policy, auto_escalate: false };
+        }
+        const optimizationConfig: TokenOptimizationConfig = {
+          ...DEFAULT_OPTIMIZATION,
+          ...(optimization ?? {}),
+        };
+        if (autonomous) Object.assign(optimizationConfig, { enabled: true, auto_escalate: false, right_size: "off", decay_after_stable_turns: 0 });
+        if (optimizationConfig.enabled === false) optimizationConfig.right_size = "off";
+        const recommendedCount = recommendedTeamSize(agents);
+        const agentsToLaunch = optimizationConfig.right_size === "enforce" && agents.length > recommendedCount
+          ? rightSizeTeam(agents, recommendedCount)
+          : agents;
 
         // Detect available agents — check ALL before failing, report what IS available
         const unavailable: { name: string; type: string }[] = [];
         const availableTypes = new Set<string>();
-        for (const agentCfg of agents) {
+        for (const agentCfg of agentsToLaunch) {
           const detection = await detectAgent(agentCfg.agent_type);
           if (!detection.available) {
             unavailable.push({ name: agentCfg.name, type: agentCfg.agent_type });
@@ -602,14 +876,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         if (unavailable.length > 0) {
           // Check what IS available on this machine
-          const allTypes: Array<"claude" | "codex" | "gemini"> = ["claude", "codex", "gemini"];
+          const allTypes: Array<"claude" | "codex" | "agy"> = ["claude", "codex", "agy"];
           for (const t of allTypes) {
             const d = await detectAgent(t);
             if (d.available) availableTypes.add(t);
           }
           const availableList = availableTypes.size > 0
             ? `Available agent CLIs on this machine: ${[...availableTypes].join(", ")}.`
-            : "No agent CLIs found. Install claude, codex, or gemini CLI first.";
+            : "No agent CLIs found. Install claude, codex, or agy first.";
           const failedList = unavailable.map(u => `${u.name} (${u.type})`).join(", ");
           return {
             content: [{
@@ -654,7 +928,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           name: session_name,
           project_dir,
           git_root: gitRoot,
+          config: { optimization: optimizationConfig, execution_mode },
         });
+
+        if (autonomous) await brokerClient.createPlan({ session_id: sessionId, title: session_name, items: planItems!.map(item => ({ label: item.label, execution: item as ExecutionStep })) });
 
         const sessionProcs = new Map<number, Subprocess>();
         activeProcesses.set(sessionId, sessionProcs);
@@ -663,17 +940,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // Launch each agent with staggered delays to prevent race conditions.
         // Codex agents share a global skills directory (~/.codex/system-skills/)
         // that gets corrupted when multiple instances initialize simultaneously.
-        // Gemini via npx can also race on package caching.
+        // Antigravity can also race during concurrent native CLI startup.
         const launchedAgents: { name: string; slot_id: number; pid: number }[] = [];
         const launchedTypes = new Set<string>();
-        for (const agentCfg of agents) {
+        for (const agentCfg of agentsToLaunch) {
           // Stagger if we've already launched an agent of this type
           if (launchedTypes.has(agentCfg.agent_type)) {
             await new Promise((r) => setTimeout(r, 3000));
           }
           launchedTypes.add(agentCfg.agent_type);
 
-          const result = await launchAgent(sessionId, project_dir, agentCfg, brokerClient);
+          const result = await launchAgent(sessionId, project_dir, agentCfg, brokerClient, optimizationConfig);
           sessionProcs.set(result.slotId, result.process);
 
           // Track CodexDriver instances for message forwarding
@@ -698,7 +975,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               });
             });
           } else {
-            // Start process monitoring for non-Codex agents (Claude, Gemini)
+            // Start process monitoring for non-Codex agents (Claude, AGY)
             monitorProcess(result.process, result.slotId, sessionId, brokerClient, handleEvent);
           }
 
@@ -714,8 +991,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         // Create plan if provided, then broadcast to each agent with their assigned items
-        let planSummary = "";
-        if (planItems && planItems.length > 0) {
+        let planSummary = autonomous ? `\nAutonomous plan: ${planItems!.length} verified steps. Use resolve_plan_blocker for decisions and approve_execution for final review.` : "";
+        if (!autonomous && planItems && planItems.length > 0) {
           const slotByName = new Map(launchedAgents.map((a) => [a.name, a.slot_id]));
           const lastAgentSlot = launchedAgents[launchedAgents.length - 1]?.slot_id;
 
@@ -764,10 +1041,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         const status = await getTeamStatus(sessionId, brokerClient);
         const display = formatTeamStatusForDisplay(status);
+        const rightSizeSummary = agents.length > recommendedCount && optimizationConfig.right_size !== "off"
+          ? optimizationConfig.right_size === "enforce"
+            ? `Optimizer right-sized the requested team from ${agents.length} to ${agentsToLaunch.length} agent(s).`
+            : `Optimizer recommendation: this workload needs about ${recommendedCount} agent(s), ${agents.length} were explicitly requested and kept.`
+          : `Optimizer team-size recommendation: ${recommendedCount} agent(s).`;
 
         // Auto-launch dashboards (TUI in terminal + web in browser)
-        launchDashboard(sessionId, project_dir);
-        launchWebDashboard(sessionId, project_dir);
+        if (!autonomous) {
+          launchDashboard(sessionId, project_dir);
+          launchWebDashboard(sessionId, project_dir);
+        }
 
         return {
           content: [{
@@ -777,11 +1061,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "",
               display,
               "",
+              rightSizeSummary,
+              "",
               "IMPORTANT: Agents take 15-60 seconds to start up (loading MCP servers, connecting to broker).",
               "They will show as 'starting' until they register. This is NORMAL — do NOT call cleanup_dead_slots",
               "or assume agents have crashed. Wait at least 60 seconds before checking status.",
               "",
-              `Dashboard launched — run \`multiagents dashboard ${sessionId}\` to reopen.`,
+              autonomous ? `Monitor with multiagents dashboard ${sessionId}.` : `Dashboard launched — run \`multiagents dashboard ${sessionId}\` to reopen.`,
             ].join("\n"),
           }],
         };
@@ -830,7 +1116,70 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           completionText = `\n\nCompletion: ${connectedAgents.length - needsWork.length}/${connectedAgents.length} agents approved. Still working: ${needsWork.map((a) => `${a.name} (${a.task_state})`).join(", ")}`;
         }
 
-        return { content: [{ type: "text", text: display + eventText + blockedText + completionText }] };
+        const session = await brokerClient.getSession(session_id);
+        let executionText = "";
+        if (JSON.parse(session.config || "{}").execution_mode === "plan_execution") {
+          const plan = await brokerClient.getPlan(session_id);
+          const current = plan.items.find(i => i.status !== "done");
+          executionText = current
+            ? `\nExecution step #${current.id}: ${current.label} (${current.status})${current.execution?.blocker ? " — " + current.execution.blocker : ""}${current.execution?.decision_required && !current.execution.decision ? " — Decision required: " + current.execution.decision_required : ""}`
+            : "\nAll steps verified. Review with get_execution_plan before approve_execution.";
+        }
+        return { content: [{ type: "text", text: display + eventText + blockedText + completionText + executionText }] };
+      }
+
+      // ---- get_optimization_report ----
+      case "get_optimization_report": {
+        const { session_id } = args as { session_id: string };
+        const session = await brokerClient.getSession(session_id);
+        const slots = await brokerClient.listSlots(session_id);
+        const report = buildOptimizationReport(session, slots);
+        return {
+          content: [{ type: "text", text: formatOptimizationReport(report) }],
+          structuredContent: report,
+        };
+      }
+
+      // ---- adjust_token_budget ----
+      case "adjust_token_budget": {
+        const { session_id, scope, target, operation, tokens } = args as {
+          session_id: string;
+          scope: "session" | "agent";
+          target?: string;
+          operation: "set" | "extend";
+          tokens: number;
+        };
+        if (!Number.isFinite(tokens) || tokens <= 0) {
+          return { content: [{ type: "text", text: "tokens must be a positive number." }], isError: true };
+        }
+        if (scope === "session") {
+          const session = await brokerClient.getSession(session_id);
+          const config = safeJsonParse<Record<string, any>>(session.config, {});
+          const optimization = config.optimization ?? {};
+          const current = optimization.session_token_budget ?? DEFAULT_OPTIMIZATION.session_token_budget;
+          optimization.session_token_budget = operation === "extend" ? current + tokens : tokens;
+          config.optimization = optimization;
+          await brokerClient.updateSession({ id: session_id, config });
+          const slots = await brokerClient.listSlots(session_id);
+          for (const slot of slots) {
+            budgetStoppedSlots.delete(slot.id);
+            await brokerClient.updateSlot({ id: slot.id, context_snapshot: JSON.stringify({ budget_exhausted: false, updated_at: Date.now() }) });
+          }
+          return { content: [{ type: "text", text: `Session token budget ${operation === "extend" ? "extended to" : "set to"} ${optimization.session_token_budget}.` }] };
+        }
+        if (!target) return { content: [{ type: "text", text: "target is required for an agent budget." }], isError: true };
+        const slot = await resolveTarget(session_id, target, brokerClient);
+        if (!slot) return { content: [{ type: "text", text: `Agent "${target}" not found.` }], isError: true };
+        const snapshot = safeJsonParse<Record<string, any>>(slot.context_snapshot, {});
+        const policy = snapshot.optimization ?? {};
+        const current = policy.token_budget ?? DEFAULT_OPTIMIZATION.default_agent_token_budget;
+        policy.token_budget = operation === "extend" ? current + tokens : tokens;
+        await brokerClient.updateSlot({
+          id: slot.id,
+          context_snapshot: JSON.stringify({ optimization: policy, budget_exhausted: false, updated_at: Date.now() }),
+        });
+        budgetStoppedSlots.delete(slot.id);
+        return { content: [{ type: "text", text: `${slot.display_name ?? target} token budget ${operation === "extend" ? "extended to" : "set to"} ${policy.token_budget}. Resume the agent if it was stopped.` }] };
       }
 
       // ---- broadcast_to_team ----
@@ -869,14 +1218,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // ---- add_agent ----
       case "add_agent": {
-        const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership } = args as {
+        const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership, model_policy } = args as {
           session_id: string;
-          agent_type: "claude" | "codex" | "gemini";
+          agent_type: "claude" | "codex" | "agy";
           name: string;
           role: string;
           role_description: string;
           initial_task: string;
           file_ownership?: string[];
+          model_policy?: AgentLaunchConfig["model_policy"];
         };
 
         const detection = await detectAgent(agent_type);
@@ -885,6 +1235,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const session = await brokerClient.getSession(session_id);
+        if (JSON.parse(session.config || "{}").execution_mode === "plan_execution") throw new Error("Execution mode supports one worker; create another session for a different plan");
         const config: AgentLaunchConfig = {
           agent_type,
           name: agentName,
@@ -892,9 +1243,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           role_description,
           initial_task,
           file_ownership,
+          model_policy,
         };
 
-        const result = await launchAgent(session_id, session.project_dir, config, brokerClient);
+        const optimizationConfig = getOptimizationConfig(session);
+        const result = await launchAgent(session_id, session.project_dir, config, brokerClient, optimizationConfig);
 
         const sessionProcs = activeProcesses.get(session_id) ?? new Map();
         sessionProcs.set(result.slotId, result.process);
@@ -935,18 +1288,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: `Could not find agent matching "${target}".` }] };
         }
 
+        // Mark as released BEFORE killing so the exit handler (agent_crashed) and the
+        // stale-message watchdog both see "released" and skip auto-respawn. Without this
+        // ordering, killing the process races the crash handler and the slot respawns as
+        // a bare "unassigned" ghost agent (see recovery.ts / handleEvent's agent_crashed path).
+        await brokerClient.updateSlot({ id: slot.id, status: "disconnected", task_state: "released" });
+
         // Kill the process if we have it
         const sessionProcs = activeProcesses.get(session_id);
         if (sessionProcs) {
           const proc = sessionProcs.get(slot.id);
           if (proc) {
-            proc.kill();
+            await killPidTreeVerified(proc.pid);
             sessionProcs.delete(slot.id);
           }
         }
 
-        // Update slot to disconnected
-        await brokerClient.updateSlot({ id: slot.id, status: "disconnected" });
+        // Codex agents run under a CodexDriver, not a plain Subprocess — kill that too and
+        // stop tracking it, otherwise its own onExit handler fires agent_crashed independently.
+        const sessionDrivers = activeCodexDrivers.get(session_id);
+        const driverState = sessionDrivers?.get(slot.id);
+        if (driverState) {
+          await killPidTreeVerified(driverState.driver.pid);
+          driverState.driver.kill().catch(() => { /* already dead */ });
+          sessionDrivers?.delete(slot.id);
+        }
+
+        clearSlotTracking(slot.id);
 
         // Notify remaining team
         const slots = await brokerClient.listSlots(session_id);
@@ -1147,7 +1515,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionProcs) {
           for (const [slotId, proc] of sessionProcs) {
             log(LOG_PREFIX, `Stopping agent in slot ${slotId}`);
-            try { proc.kill(); } catch { /* already dead */ }
+            try { await killPidTreeVerified(proc.pid); } catch { /* already dead */ }
           }
           sessionProcs.clear();
           activeProcesses.delete(session_id);
@@ -1158,11 +1526,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (sessionDrivers) {
           for (const [slotId, state] of sessionDrivers) {
             log(LOG_PREFIX, `Stopping Codex driver in slot ${slotId}`);
-            try { state.driver.kill(); } catch { /* already dead */ }
+            try { await killPidTreeVerified(state.driver.pid); state.driver.kill(); } catch { /* already dead */ }
           }
           sessionDrivers.clear();
           activeCodexDrivers.delete(session_id);
         }
+
+        // Catch mcp-server grandchildren whose top-level agent process already
+        // exited on its own before the kills above ran (common with agy —
+        // see killSessionMcpServers's docstring) and so were never reachable
+        // via killProcessTree's ancestry walk.
+        killSessionMcpServers(session_id);
 
         // Clean driver-mode sentinel file
         try {
@@ -1317,6 +1691,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const disconnected = slots.filter((s: any) =>
           s.status === "disconnected" &&
           s.task_state !== "released" &&
+          !(JSON.parse(session.config || "{}").execution_mode === "plan_execution" && (s.paused || s.task_state === "approved" || s.task_state === "done_pending_review")) &&
           !skipSet.has((s.display_name ?? "").toLowerCase()) &&
           !skipSet.has((s.role ?? "").toLowerCase())
         );
@@ -1350,9 +1725,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             // Get message recap for this slot
             let recapLines: string[] = [];
             try {
-              const messages = await brokerClient.getMessageLog(session_id, { limit: 30, with_slot: slot.id });
+              const messages = await brokerClient.getMessageLog(session_id, { limit: 10, with_slot: slot.id });
               recapLines = messages.map((m: any) =>
-                `[${m.msg_type}] ${m.from_id}: ${(m.text ?? "").slice(0, 200)}`
+                `[${m.msg_type}] ${m.from_id}: ${(m.text ?? "").slice(0, 120)}`
               );
             } catch { /* ok */ }
 
@@ -1364,7 +1739,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 const myItems = plan.items.filter((i: any) => i.assigned_to_slot === slot.id);
                 planItemLines = myItems.map((i: any) => {
                   const marker = i.status === "done" ? "[x]" : i.status === "in_progress" ? "[~]" : "[ ]";
-                  return `  ${marker} ${i.label}`;
+                  return `  ${marker} #${i.id} ${i.label}${i.execution ? " " + JSON.stringify(i.execution) : ""}`;
                 });
               }
             } catch { /* ok */ }
@@ -1377,6 +1752,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               "",
               `Your role: ${slot.role ?? "unassigned"}`,
               slot.role_description ? `Role description: ${slot.role_description}` : "",
+              snapshot.original_task ? `Original task: ${snapshot.original_task}` : "",
               snapshot.last_summary ? `Your last status: ${snapshot.last_summary}` : "",
               snapshot.task_state ? `Your task state when you left: ${snapshot.task_state}` : "",
               "",
@@ -1490,6 +1866,36 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     for (const sessionId of activeProcesses.keys()) {
       try {
         await enforceGuardrails(sessionId, brokerClient, handleEvent);
+        const session = await brokerClient.getSession(sessionId);
+        const slots = await brokerClient.listSlots(sessionId);
+        const report = buildOptimizationReport(session, slots);
+        if (!report.enabled) continue;
+
+        const stopSlot = async (slotId: number, message: string) => {
+          if (budgetStoppedSlots.has(slotId)) return;
+          budgetStoppedSlots.add(slotId);
+          try { activeProcesses.get(sessionId)?.get(slotId)?.kill(); } catch { /* already stopped */ }
+          try { activeCodexDrivers.get(sessionId)?.get(slotId)?.driver.kill(); } catch { /* already stopped */ }
+          await brokerClient.updateSlot({
+            id: slotId,
+            paused: true,
+            paused_at: Date.now(),
+            status: "disconnected",
+            context_snapshot: JSON.stringify({ budget_exhausted: true, last_status: "token_budget_exhausted", updated_at: Date.now() }),
+          });
+          pendingEvents.push({ type: "guardrail_triggered", severity: "warning", slotId, sessionId, message });
+        };
+
+        if (report.session_token_budget > 0 && report.total_tokens !== null && report.total_tokens >= report.session_token_budget) {
+          for (const agent of report.agents) await stopSlot(agent.slot_id, `Session token budget exhausted (${report.total_tokens}/${report.session_token_budget}).`);
+          await brokerClient.updateSession({ id: sessionId, status: "paused", pause_reason: "Token budget exhausted", paused_at: Date.now() });
+        } else {
+          for (const agent of report.agents) {
+            if (agent.token_budget > 0 && agent.total_tokens !== null && agent.total_tokens >= agent.token_budget) {
+              await stopSlot(agent.slot_id, `${agent.name} token budget exhausted (${agent.total_tokens}/${agent.token_budget}).`);
+            }
+          }
+        }
       } catch (err) {
         log(LOG_PREFIX, `Guardrail check error for ${sessionId}: ${err}`);
       }
@@ -1531,7 +1937,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
   // --- Codex message forwarding prompt ---
   function buildForwardingPrompt(formatted: string): string {
-    return `[Teammate message] ${formatted}\nAcknowledge briefly, then continue your current task.`;
+    return `[Teammate message] ${formatted}\nIncorporate it and continue. Reply only if a decision or answer is required.`;
   }
 
   // --- Codex message forwarding loop ---
@@ -1546,14 +1952,13 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     for (const [sessionId, drivers] of activeCodexDrivers) {
       for (const [slotId, state] of drivers) {
         if (!state.driver.alive) continue;
+        try { if ((await brokerClient.getSlot(slotId)).paused) continue; } catch { continue; }
         const threadId = state.threadId ?? state.driver.threadId;
         if (!threadId) continue; // First turn hasn't completed yet
 
-        // --- Interrupt + signal_done turn: if Codex turn is active but idle for >60s ---
-        // The Codex LLM can get stuck in a single long inference call after completing work.
-        // turn/steer only works between loop iterations — it can't interrupt mid-generation.
-        // Instead: interrupt the stuck turn, then start a new focused turn for signal_done.
-        const INTERRUPT_IDLE_MS = 60_000;
+        // After five minutes without activity, diagnose progress. Never infer
+        // completion from silence or instruct an unfinished agent to signal done.
+        const INTERRUPT_IDLE_MS = 300_000;
         const now = Date.now();
         if (
           state.driver.activeTurnId &&
@@ -1561,7 +1966,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           now - state.lastNudge > INTERRUPT_IDLE_MS
         ) {
           state.lastNudge = now;
-          log(LOG_PREFIX, `Codex slot ${slotId} stuck for ${Math.round((now - state.driver.lastNotificationActivity) / 1000)}s — interrupting turn and requesting signal_done`);
+          log(LOG_PREFIX, `Codex slot ${slotId} stuck for ${Math.round((now - state.driver.lastNotificationActivity) / 1000)}s — interrupting turn and requesting a progress diagnosis`);
           try {
             await state.driver.interrupt(threadId);
           } catch {
@@ -1569,18 +1974,18 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           }
           // Wait a moment for the turn to fully complete after interrupt
           await new Promise(r => setTimeout(r, 2000));
-          // Start a new focused turn asking only for signal_done
+          // Ask the worker to inspect actual progress before deciding what to do.
           if (!state.driver.activeTurnId && !state.busy) {
             state.busy = true;
-            state.driver.reply(threadId, "Your previous task is complete. Call signal_done NOW with a summary of what you accomplished. This is the ONLY thing you need to do.")
+            state.driver.reply(threadId, "No recent activity was observed. Inspect your actual progress and the plan. If work remains, continue it. If blocked, report the blocker. Only call signal_done if implementation and verification are complete; silence is not evidence of completion.")
               .then(async (result) => {
                 state.threadId = result.threadId;
                 state.busy = false;
-                log(LOG_PREFIX, `Codex slot ${slotId} signal_done turn completed`);
+                log(LOG_PREFIX, `Codex slot ${slotId} progress diagnosis completed`);
               })
               .catch((err) => {
                 state.busy = false;
-                log(LOG_PREFIX, `Codex slot ${slotId} signal_done turn failed: ${err}`);
+                log(LOG_PREFIX, `Codex slot ${slotId} progress diagnosis failed: ${err}`);
               });
           }
         }
@@ -1655,6 +2060,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
           // Skip agents in truly terminal task states — no point nudging them
           const taskState = (slot as any).task_state;
           if (taskState === "approved" || taskState === "released") continue;
+          if (taskState === "done_pending_review" && JSON.parse((await brokerClient.getSession(sessionId)).config || "{}").execution_mode === "plan_execution") continue;
           // Note: done_pending_review agents are NOT skipped — they may need
           // to respond to feedback or review requests from teammates.
 
@@ -1792,31 +2198,8 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
         const slots = await brokerClient.listSlots(sessionId);
         if (slots.length === 0) continue;
 
-        // --- Auto-approve orphaned done_pending_review agents ---
-        // When all reviewer/QA agents are approved/released/disconnected but some
-        // non-reviewer agents are still at done_pending_review, there's nobody left
-        // to approve them. Auto-approve to unblock session completion.
-        const reviewerSlots = slots.filter((s) => s.role && /qa|review|test|lead/i.test(s.role));
-        const allReviewersDone = reviewerSlots.length > 0 && reviewerSlots.every(
-          (s) => (s as any).task_state === "approved" || (s as any).task_state === "released" || s.status === "disconnected"
-        );
-        if (allReviewersDone) {
-          const orphaned = slots.filter(
-            (s) => (s as any).task_state === "done_pending_review" && !(s.role && /qa|review|test|lead/i.test(s.role))
-          );
-          for (const slot of orphaned) {
-            log(LOG_PREFIX, `Auto-approving orphaned ${slot.display_name ?? `slot ${slot.id}`} (all reviewers done, no one left to approve)`);
-            await brokerClient.updateSlot({ id: slot.id, task_state: "approved" } as any);
-            pendingEvents.push({
-              type: "auto_approved",
-              severity: "info",
-              slotId: slot.id,
-              sessionId,
-              message: `${slot.display_name ?? `slot ${slot.id}`} auto-approved: all reviewers finished, no pending review possible.`,
-            });
-          }
-        }
-
+        // Reviewer absence is not evidence of correctness. Keep work pending
+        // until a reviewer or the coordinator explicitly approves it.
         const allDone = slots.every(
           (s) => (s as any).task_state === "approved" || (s as any).task_state === "released" || s.status === "disconnected"
         );
@@ -1842,7 +2225,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             const sessionProcs = activeProcesses.get(sessionId);
             if (sessionProcs) {
               for (const [slotId, proc] of sessionProcs) {
-                try { proc.kill(); } catch { /* already dead */ }
+                try { await killPidTreeVerified(proc.pid); } catch { /* already dead */ }
               }
               sessionProcs.clear();
               activeProcesses.delete(sessionId);
@@ -1850,11 +2233,13 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             const sessionDrivers = activeCodexDrivers.get(sessionId);
             if (sessionDrivers) {
               for (const [, state] of sessionDrivers) {
-                try { state.driver.kill(); } catch { /* already dead */ }
+                try { await killPidTreeVerified(state.driver.pid); state.driver.kill(); } catch { /* already dead */ }
               }
               sessionDrivers.clear();
               activeCodexDrivers.delete(sessionId);
             }
+
+            killSessionMcpServers(sessionId);
 
             // Mark all connected slots as disconnected
             for (const slot of slots) {
@@ -1892,7 +2277,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
   // --- Smart non-driver agent respawn ---
   //
-  // Problem: Gemini (and disconnected Claude) agents have no push/steer mechanism.
+  // Problem: AGY (and disconnected Claude) agents have no push/steer mechanism.
   // After signal_done or when idle, the LLM stops calling MCP tools and messages
   // pile up undelivered. Teammates are blocked waiting.
   //
@@ -1904,7 +2289,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
   //   - Claude with channel push (connected) → skip, push handles delivery
   //   - Codex with driver → skip, forwarding loop handles delivery
   //
-  // This means: teammate sends review_request → 15s for Gemini to self-poll →
+  // This means: teammate sends review_request → 15s for AGY to self-poll →
   // if not picked up, orchestrator kills idle process and spawns a fresh one
   // that gets recap + pending messages on startup.
   //
@@ -1917,7 +2302,9 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
         const slots = await brokerClient.listSlots(sessionId);
         for (const slot of slots) {
           const taskState = (slot as any).task_state;
-          if (taskState === "released") continue;
+          if (taskState === "released" || slot.paused) continue;
+
+          if (slot.status === "connected" && JSON.parse((await brokerClient.getSession(sessionId)).config || "{}").execution_mode === "plan_execution") continue;
 
           // Skip Codex — driver-managed via forwarding loop
           const drivers = activeCodexDrivers.get(sessionId);
@@ -1961,8 +2348,16 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
             const sessionProcs = activeProcesses.get(sessionId);
             const proc = sessionProcs?.get(slot.id);
             if (proc) {
-              try { proc.kill(); } catch { /* ok */ }
+              await killPidTreeVerified(proc.pid);
               sessionProcs?.delete(slot.id);
+            }
+            // Codex agents run under a CodexDriver, not a plain Subprocess — same
+            // orphaned-grandchild risk applies here, kill it before respawning too.
+            const staleDriver = activeCodexDrivers.get(sessionId)?.get(slot.id);
+            if (staleDriver) {
+              await killPidTreeVerified(staleDriver.driver.pid);
+              staleDriver.driver.kill().catch(() => { /* already dead */ });
+              activeCodexDrivers.get(sessionId)?.delete(slot.id);
             }
             // Brief wait for broker to register disconnect
             await new Promise((r) => setTimeout(r, 1000));
