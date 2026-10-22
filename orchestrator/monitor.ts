@@ -8,7 +8,7 @@
 import type { Subprocess } from "bun";
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { CodexDriver, CodexNotification } from "./codex-driver.ts";
-import type { ClaudeDriver, ClaudeEvent } from "./claude-driver.ts";
+import type { ClaudeSession, ClaudeEvent } from "./claude-driver.ts";
 import { log } from "../shared/utils.ts";
 
 const LOG_PREFIX = "monitor";
@@ -16,6 +16,8 @@ type ProcessReadableStream = Exclude<Subprocess["stdout"], number | null | undef
 
 // Last cumulative totals per slot, for sources that report running thread totals
 const lastTokenTotals = new Map<number, { input: number; output: number; cacheRead: number }>();
+/** Last running cost a Claude session reported, per slot (its result events carry the session total). */
+const lastCost = new Map<number, number>();
 // Input-side usage already metered from a Claude turn's API calls (keyed by message id), settled by its result event
 const claudeTurnInput = new Map<number, { input: number; cacheRead: number; calls: Set<string> }>();
 
@@ -98,10 +100,12 @@ export function monitorProcess(
   sessionId: string,
   brokerClient: BrokerClient,
   onEvent: (event: AgentEvent) => void,
+  /** Every JSON line the process prints (the activity timeline reads Gemini's stream-json here) */
+  onJson?: (parsed: any) => void,
 ): void {
   // Read stdout for JSON progress lines
   if (isReadableStream(proc.stdout)) {
-    readStream(proc.stdout, slotId, sessionId, brokerClient, onEvent);
+    readStream(proc.stdout, slotId, sessionId, brokerClient, onEvent, onJson);
   }
 
   // Read stderr for error output
@@ -122,6 +126,7 @@ async function readStream(
   sessionId: string,
   brokerClient: BrokerClient,
   onEvent: (event: AgentEvent) => void,
+  onJson?: (parsed: any) => void,
 ): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -139,7 +144,7 @@ async function readStream(
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        await processLine(trimmed, slotId, sessionId, brokerClient, onEvent);
+        await processLine(trimmed, slotId, sessionId, brokerClient, onEvent, onJson);
       }
     }
   } catch (err) {
@@ -154,6 +159,7 @@ const transitionedToWorking = new Set<number>();
 /** Clear all tracking state for a slot (call on release/session end). */
 export function clearSlotTracking(slotId: number): void {
   lastTokenTotals.delete(slotId);
+  lastCost.delete(slotId);
   claudeTurnInput.delete(slotId);
   transitionedToWorking.delete(slotId);
 }
@@ -161,6 +167,7 @@ export function clearSlotTracking(slotId: number): void {
 /** Clear all tracking state (call on full session cleanup). */
 export function clearAllTracking(): void {
   lastTokenTotals.clear();
+  lastCost.clear();
   claudeTurnInput.clear();
   transitionedToWorking.clear();
 }
@@ -184,6 +191,7 @@ async function processLine(
   sessionId: string,
   brokerClient: BrokerClient,
   onEvent: (event: AgentEvent) => void,
+  onJson?: (parsed: any) => void,
 ): Promise<void> {
   let parsed: any;
   try {
@@ -191,6 +199,7 @@ async function processLine(
   } catch {
     return; // Not JSON — plain text output, ignore
   }
+  try { onJson?.(parsed); } catch { /* the timeline must not break monitoring */ }
   await processEvent(parsed, slotId, sessionId, brokerClient, onEvent);
 }
 
@@ -213,6 +222,24 @@ export async function processEvent(
         message: `Agent produced result`,
         data: { result: parsed.result, subtype: parsed.subtype },
       });
+
+      // Claude reports the session's running cost; meter the increase (a new process starts over)
+      if (typeof parsed.total_cost_usd === "number") {
+        const last = lastCost.get(slotId) ?? 0;
+        const delta = parsed.total_cost_usd >= last ? parsed.total_cost_usd - last : parsed.total_cost_usd;
+        lastCost.set(slotId, parsed.total_cost_usd);
+        if (delta > 0) await brokerClient.updateSlot({ id: slotId, cost_usd: delta }).catch(() => {});
+      }
+
+      // Gemini stream-json: one run's totals in `stats`
+      if (parsed.stats && !parsed.usage) {
+        const st = parsed.stats;
+        await updateTokenUsage(slotId, {
+          input: st.input_tokens ?? st.prompt_tokens ?? 0,
+          output: st.output_tokens ?? st.candidates_tokens ?? 0,
+          cacheRead: st.cached ?? st.cached_tokens ?? 0,
+        }, brokerClient, "per_turn");
+      }
 
       // The turn's usage minus what its assistant events already metered; output is only known here.
       const usage = parsed.usage ?? parsed.result?.usage;
@@ -330,7 +357,7 @@ export async function processEvent(
  * as a plain Claude process (summaries, token usage, working transition).
  */
 export function monitorClaudeDriver(
-  driver: ClaudeDriver,
+  driver: ClaudeSession,
   slotId: number,
   sessionId: string,
   brokerClient: BrokerClient,
@@ -390,14 +417,28 @@ async function handleExit(
   brokerClient: BrokerClient,
   onEvent: (event: AgentEvent) => void,
 ): Promise<void> {
-  // Update slot status to disconnected
+  let taskState: string | undefined;
   try {
-    await brokerClient.updateSlot({
-      id: slotId,
-      status: "disconnected",
-    });
-  } catch (err) {
-    log(LOG_PREFIX, `Failed to update slot ${slotId} on exit: ${err}`);
+    const slot = await brokerClient.getSlot(slotId);
+    taskState = slot?.task_state;
+  } catch { /* ok */ }
+
+  // An agent whose work completed normally (code 0) in "approved" state remains connected
+  // in standby awaiting human review or release — it must not drop offline while the session is active.
+  const isStandbyApproved = exitCode === 0 && taskState === "approved";
+
+  if (!isStandbyApproved) {
+    // Update slot status to disconnected
+    try {
+      await brokerClient.updateSlot({
+        id: slotId,
+        status: "disconnected",
+      });
+    } catch (err) {
+      log(LOG_PREFIX, `Failed to update slot ${slotId} on exit: ${err}`);
+    }
+  } else {
+    log(LOG_PREFIX, `Slot ${slotId} completed (exit 0) with task_state="approved" — keeping slot online (standby for review/release)`);
   }
 
   if (exitCode === 0) {

@@ -12,6 +12,8 @@ import {
   watchdogInbox,
   RELEASE_IDLE_MS,
   RELEASE_MAX_WAIT_MS,
+  deadSlotVerdict,
+  type DeadSlotInput,
 } from "../orchestrator/supervision.ts";
 import type { DriverSlot } from "../orchestrator/delivery.ts";
 
@@ -138,5 +140,38 @@ describe("watchdogInbox", () => {
   test("a paused agent is never judged", () => {
     expect(watchdogInbox({ status: "connected", paused: true }, peek)).toBeNull();
     expect(watchdogInbox({ status: "connected", paused: 1 as unknown as boolean }, peek)).toBeNull();
+  });
+});
+
+describe("deadSlotVerdict", () => {
+  const now = 10 * 60 * 60_000;
+  const gone = (over: Partial<DeadSlotInput["slot"]> = {}): DeadSlotInput["slot"] => ({
+    status: "disconnected", task_state: "idle", last_connected: now - 3_600_000, last_disconnected: now - 10 * 60_000, paused: false, ...over,
+  });
+  const verdict = (slot: DeadSlotInput["slot"], over: Partial<DeadSlotInput> = {}) =>
+    deadSlotVerdict({ slot, driven: false, tookPart: false, sessionOnHold: false, now, ...over });
+
+  test("an agent that finished its work and exited stays (the reported Gemini case)", () => {
+    expect(verdict(gone({ task_state: "approved" }))).toBe("keep");
+    expect(verdict(gone({ task_state: "done_pending_review" }))).toBe("keep");
+    expect(verdict(gone({ task_state: "released" }))).toBe("keep");
+    expect(verdict(gone({ task_state: "working" }))).toBe("keep");
+  });
+
+  test("an idle agent that took part in the conversation stays", () => {
+    expect(verdict(gone(), { tookPart: true })).toBe("keep");
+  });
+
+  test("nothing is deleted while the session is paused or waits on a person", () => {
+    expect(verdict(gone(), { sessionOnHold: true })).toBe("keep");
+    expect(verdict(gone({ paused: 1 }))).toBe("keep");
+  });
+
+  test("only an orphan goes: connected once, never worked, gone for 5 minutes", () => {
+    expect(verdict(gone())).toBe("delete");
+    expect(verdict(gone({ last_disconnected: now - 60_000 }))).toBe("keep");
+    expect(verdict(gone({ last_connected: null, last_disconnected: null }))).toBe("keep");
+    expect(verdict(gone({ status: "connected" }))).toBe("keep");
+    expect(verdict(gone(), { driven: true })).toBe("keep");
   });
 });

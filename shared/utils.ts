@@ -110,11 +110,23 @@ export function getTty(): string | null {
 }
 
 /** Convert a string to a URL-friendly slug */
+/** Lowercase, dash-separated; letters and digits of any script survive ("食物过敏论文" stays readable). */
 export function slugify(text: string): string {
   return text
+    .normalize("NFKC")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** A session id for a name: its slug (or "session" when nothing survives), suffixed until unused. */
+export function uniqueSessionId(name: string, existingIds: Iterable<string>): string {
+  const base = slugify(name) || "session";
+  const taken = new Set(existingIds);
+  if (!taken.has(base)) return base;
+  let i = 2;
+  while (taken.has(`${base}-${i}`)) i++;
+  return `${base}-${i}`;
 }
 
 // Re-export AGENT_ID_PREFIXES for convenience

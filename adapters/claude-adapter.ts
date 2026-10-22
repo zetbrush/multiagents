@@ -10,11 +10,12 @@
 
 import { BaseAdapter } from "./base-adapter.ts";
 import { ALL_TOOLS } from "./protocol-text.ts";
-import type { BufferedMessage } from "../shared/types.ts";
+import type { AgentType, BufferedMessage } from "../shared/types.ts";
 
 export class ClaudeAdapter extends BaseAdapter {
-  constructor() {
-    super("claude");
+  /** API agents use this adapter too (driver mode), registering as "api" */
+  constructor(agentType: AgentType = "claude") {
+    super(agentType);
   }
 
   getCapabilities(): Record<string, unknown> {

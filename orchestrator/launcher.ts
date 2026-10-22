@@ -10,15 +10,18 @@
 // ============================================================================
 
 import type { Subprocess } from "bun";
-import type { AgentType, AgentLaunchConfig, Slot } from "../shared/types.ts";
+import type { AgentType, AgentLaunchConfig, ApprovalMode, Slot } from "../shared/types.ts";
 import type { BrokerClient } from "../shared/broker-client.ts";
 import { log } from "../shared/utils.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 import { resolveBrokerPort } from "../shared/broker-url.ts";
 import { FULL_PROTOCOL, SHORT_PROTOCOL } from "../adapters/protocol-text.ts";
 import { getStructuredRolePractices } from "../adapters/role-practices.ts";
-import { ClaudeDriver } from "./claude-driver.ts";
+import { ClaudeDriver, type ClaudeSession } from "./claude-driver.ts";
+import { ApiDriver } from "./api-driver.ts";
+import { getProvider, loadProviders } from "../shared/providers.ts";
 import { CodexDriver } from "./codex-driver.ts";
+import { CODEX_APPROVAL_POLICY, CLAUDE_PERMISSION_MODE, parseApprovalMode } from "./activity.ts";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
@@ -74,16 +77,26 @@ export interface LaunchResult {
   process: Subprocess;
   /** Present for Codex agents (driven over `codex app-server`). */
   codexDriver?: CodexDriver;
-  /** Present for Claude agents (driven over stream-json stdin). */
-  claudeDriver?: ClaudeDriver;
+  /** Present for Claude agents (driven over stream-json stdin) and API agents (same events). */
+  claudeDriver?: ClaudeSession;
+  /** Model, effort and approval mode the agent was launched with */
+  settings?: { model?: string; effort?: string; approvalMode?: ApprovalMode };
 }
 
 /** CLI binary name for each agent type. */
 const AGENT_COMMANDS: Record<AgentType, string> = {
   claude: "claude",
   codex: "codex",
-  gemini: "npx",
+  gemini: process.env.MULTIAGENTS_ANTIGRAVITY_PATH || process.env.MULTIAGENTS_GEMINI_PATH || "agy",
+  api: "",
   custom: "",
+};
+
+/** Env vars that replace an agent's CLI binary (the drivers launch these instead). */
+const COMMAND_OVERRIDES: Partial<Record<AgentType, string>> = {
+  claude: "MULTIAGENTS_CLAUDE_COMMAND",
+  codex: "MULTIAGENTS_CODEX_COMMAND",
+  gemini: "MULTIAGENTS_ANTIGRAVITY_PATH",
 };
 
 /**
@@ -91,6 +104,11 @@ const AGENT_COMMANDS: Record<AgentType, string> = {
  * Handles both direct binaries (claude, codex) and npx-based tools (gemini).
  */
 export async function detectAgent(type: AgentType): Promise<AgentDetection> {
+  // API agents run in-process: available once a provider is configured
+  if (type === "api") {
+    const providers = loadProviders();
+    return providers.length ? { available: true, version: providers.map((p) => p.name).join(", "), path: "api" } : { available: false };
+  }
   const cmd = AGENT_COMMANDS[type];
   if (!cmd) {
     return { available: false };
@@ -98,8 +116,20 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
 
   const spawnEnv = { ...process.env, PATH: ENRICHED_PATH };
 
-  // Gemini is invoked via npx — check if the package is available
+  // Gemini worker is upgraded to Antigravity CLI (agy)
   if (type === "gemini") {
+    const agyCmd = (process.env.MULTIAGENTS_ANTIGRAVITY_PATH || AGENT_COMMANDS.gemini || "agy").trim();
+    const which = Bun.spawnSync(["which", agyCmd.split(/\s+/)[0]!], { env: spawnEnv });
+    const binPath = new TextDecoder().decode(which.stdout).trim();
+    if (which.exitCode === 0 && binPath) {
+      let version: string | undefined;
+      try {
+        const proc = Bun.spawnSync([binPath, "--version"], { env: spawnEnv });
+        const out = new TextDecoder().decode(proc.stdout).trim();
+        if (proc.exitCode === 0 && out) version = out.split("\n")[0];
+      } catch { /* ok */ }
+      return { available: true, version: version || "antigravity", path: binPath };
+    }
     try {
       const proc = Bun.spawnSync(["npx", "-y", "@google/gemini-cli", "--version"], {
         timeout: 15_000,
@@ -113,12 +143,16 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
     return { available: false };
   }
 
-  const which = Bun.spawnSync(["which", cmd], { env: spawnEnv });
+  // An override is what gets launched, so it is what has to exist
+  const overrideVar = COMMAND_OVERRIDES[type];
+  const override = overrideVar ? process.env[overrideVar]?.trim() : undefined;
+  const which = Bun.spawnSync(["which", override ? override.split(/\s+/)[0]! : cmd], { env: spawnEnv });
   const binPath = new TextDecoder().decode(which.stdout).trim();
 
   if (which.exitCode !== 0 || !binPath) {
     return { available: false };
   }
+  if (override) return { available: true, version: `${overrideVar}=${override}`, path: binPath };
 
   // Try to get version
   let version: string | undefined;
@@ -215,32 +249,70 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string, ag
     await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + codexEntry);
   }
 
-  // --- Gemini: ~/.gemini/settings.json ---
-  const geminiSettingsPath = path.join(process.env.HOME ?? "", ".gemini", "settings.json");
-  if (writeGemini) try {
-    let geminiConfig: Record<string, unknown> = {};
+  // --- Antigravity & Gemini MCP configs ---
+  if (writeGemini) {
+    const geminiMcp = mcpServerCommand("gemini");
+    const mcpEntry = {
+      command: geminiMcp.command,
+      args: geminiMcp.args,
+      ...(portOverride ? { env: { MULTIAGENTS_PORT: portOverride } } : {}),
+    };
+
+    // 1. Global Antigravity config: ~/.gemini/config/mcp_config.json
     try {
-      const existing = await Bun.file(geminiSettingsPath).text();
-      geminiConfig = JSON.parse(existing);
+      const homeDir = process.env.HOME ?? "";
+      const mcpConfigDir = path.join(homeDir, ".gemini", "config");
+      if (!fs.existsSync(mcpConfigDir)) fs.mkdirSync(mcpConfigDir, { recursive: true });
+      const mcpConfigPath = path.join(mcpConfigDir, "mcp_config.json");
+      let mcpConfig: Record<string, unknown> = {};
+      try {
+        const existing = await Bun.file(mcpConfigPath).text();
+        mcpConfig = JSON.parse(existing);
+      } catch { /* ok */ }
+
+      const mcpServers = (mcpConfig.mcpServers as Record<string, unknown>) ?? {};
+      delete mcpServers["multiagents"];
+      mcpServers["multiagents-peer"] = mcpEntry;
+      mcpConfig.mcpServers = mcpServers;
+      await Bun.write(mcpConfigPath, JSON.stringify(mcpConfig, null, 2));
     } catch { /* ok */ }
 
-    const geminiMcpServers = (geminiConfig.mcpServers as Record<string, unknown>) ?? {};
-    // Remove stale "multiagents" entries from older versions
-    if (geminiMcpServers["multiagents"] && !geminiMcpServers["multiagents-peer"]) {
-      delete geminiMcpServers["multiagents"];
-    }
-    if (!geminiMcpServers["multiagents-peer"]) {
-      const geminiMcp = mcpServerCommand("gemini");
-      geminiMcpServers["multiagents-peer"] = {
-        command: geminiMcp.command,
-        args: geminiMcp.args,
-        ...(portOverride ? { env: { MULTIAGENTS_PORT: portOverride } } : {}),
-      };
-      geminiConfig.mcpServers = geminiMcpServers;
-      await Bun.write(geminiSettingsPath, JSON.stringify(geminiConfig, null, 2));
-    }
-  } catch {
-    // Gemini config is optional — skip if ~/.gemini doesn't exist
+    // 2. Project-level Antigravity config: <projectDir>/.agents/mcp_config.json
+    try {
+      const agentsDir = path.join(projectDir, ".agents");
+      if (!fs.existsSync(agentsDir)) fs.mkdirSync(agentsDir, { recursive: true });
+      const projMcpConfigPath = path.join(agentsDir, "mcp_config.json");
+      let projMcpConfig: Record<string, unknown> = {};
+      try {
+        const existing = await Bun.file(projMcpConfigPath).text();
+        projMcpConfig = JSON.parse(existing);
+      } catch { /* ok */ }
+
+      const projMcpServers = (projMcpConfig.mcpServers as Record<string, unknown>) ?? {};
+      projMcpServers["multiagents-peer"] = mcpEntry;
+      projMcpConfig.mcpServers = projMcpServers;
+      await Bun.write(projMcpConfigPath, JSON.stringify(projMcpConfig, null, 2));
+    } catch { /* ok */ }
+
+    // 3. Backward-compatible ~/.gemini/settings.json
+    try {
+      const geminiSettingsPath = path.join(process.env.HOME ?? "", ".gemini", "settings.json");
+      let geminiConfig: Record<string, unknown> = {};
+      try {
+        const existing = await Bun.file(geminiSettingsPath).text();
+        geminiConfig = JSON.parse(existing);
+      } catch { /* ok */ }
+
+      const geminiMcpServers = (geminiConfig.mcpServers as Record<string, unknown>) ?? {};
+      if (geminiMcpServers["multiagents"] && !geminiMcpServers["multiagents-peer"]) {
+        delete geminiMcpServers["multiagents"];
+      }
+      if (!geminiMcpServers["multiagents-peer"]) {
+        geminiMcpServers["multiagents-peer"] = mcpEntry;
+        geminiConfig.mcpServers = geminiMcpServers;
+        await Bun.write(geminiSettingsPath, JSON.stringify(geminiConfig, null, 2));
+      }
+    } catch { /* ok */ }
   }
 
   // --- Session file: .multiagents/session.json ---
@@ -295,6 +367,36 @@ interface AgentIdentity {
   name: string;
   role: string;
   roleDescription: string;
+  /** Per-agent settings, kept in the slot snapshot so respawns reuse them */
+  model?: string;
+  effort?: string;
+  approvalMode?: ApprovalMode;
+  /** API agents: the provider to call */
+  providerId?: string;
+}
+
+/** Model, effort and approval mode stored in a slot's snapshot. */
+export function slotSettings(slot: Pick<Slot, "context_snapshot">): { model?: string; effort?: string; approvalMode: ApprovalMode; tokenLimit?: number; providerId?: string } {
+  let snap: Record<string, unknown> = {};
+  try { snap = JSON.parse(slot.context_snapshot ?? "{}") ?? {}; } catch { /* no snapshot */ }
+  const text = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const limit = Number(snap.token_limit);
+  return {
+    model: text(snap.model),
+    effort: text(snap.effort),
+    approvalMode: parseApprovalMode(snap.approval_mode),
+    tokenLimit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+    providerId: text(snap.provider_id),
+  };
+}
+
+function launchSettings(identity: AgentIdentity): NonNullable<LaunchResult["settings"]> {
+  return { model: identity.model, effort: identity.effort, approvalMode: identity.approvalMode ?? "bypass" };
+}
+
+/** The mode a Claude session is launched in; "auto" is switched to once it runs. */
+function claudeLaunchMode(mode: ApprovalMode): "bypassPermissions" | "acceptEdits" | "default" {
+  return mode === "bypass" ? "bypassPermissions" : mode === "accept_edits" ? "acceptEdits" : "default";
 }
 
 /** Env for a spawned agent: enriched PATH, session/slot identity, no nested-Claude marker. */
@@ -307,6 +409,18 @@ function agentEnv(identity: AgentIdentity): Record<string, string | undefined> {
     MULTIAGENTS_NAME: identity.name,
     MULTIAGENTS_SLOT: String(identity.slotId),
   };
+  // In non-CI environments, inject proxy if needed and preserve localhost loopback
+  if (!process.env.CI && !env.http_proxy && !env.HTTP_PROXY) {
+    const proxyUrl = process.env.MULTIAGENTS_PROXY || "http://127.0.0.1:3067";
+    env.http_proxy = proxyUrl;
+    env.https_proxy = proxyUrl;
+    env.HTTP_PROXY = proxyUrl;
+    env.HTTPS_PROXY = proxyUrl;
+    env.all_proxy = "socks5://127.0.0.1:3067";
+    env.ALL_PROXY = "socks5://127.0.0.1:3067";
+    env.no_proxy = "localhost,127.0.0.1,::1";
+    env.NO_PROXY = "localhost,127.0.0.1,::1";
+  }
   // A Claude Code parent marks its environment; a child session must not look nested.
   delete env.CLAUDECODE;
   delete env.CLAUDE_CODE_ENTRYPOINT;
@@ -421,8 +535,8 @@ function buildHandoffPrompt(identity: AgentIdentity, handoffTask: string, delive
  * `alwaysLoad` keeps the team tools out of tool-search deferral, and
  * `--driver-mode` tells the adapter the orchestrator delivers messages.
  */
-export function claudeMcpConfig(identity: AgentIdentity, opts: { driverMode: boolean }): Record<string, unknown> {
-  const claudeMcp = mcpServerCommand("claude");
+export function claudeMcpConfig(identity: AgentIdentity, opts: { driverMode: boolean; agentType?: AgentType }): Record<string, unknown> {
+  const claudeMcp = mcpServerCommand(opts.agentType ?? "claude");
   const args = [
     ...claudeMcp.args,
     "--session", identity.sessionId,
@@ -477,7 +591,9 @@ async function spawnClaudeAgent(
     mcpConfig: claudeMcpConfig(identity, { driverMode: true }),
     appendSystemPrompt: claudeSystemPromptAppend(identity.role, identity.roleDescription),
     maxTurns: CLAUDE_MAX_TURNS,
-    model: process.env.MULTIAGENTS_CLAUDE_MODEL || undefined,
+    model: identity.model || process.env.MULTIAGENTS_CLAUDE_MODEL || undefined,
+    effort: identity.effort,
+    permissionMode: claudeLaunchMode(identity.approvalMode ?? "bypass"),
   };
 
   // The session reports init only after its first message, so the prompt goes
@@ -506,7 +622,48 @@ async function spawnClaudeAgent(
 
   log(LOG_PREFIX, `Claude ${identity.name} (pid ${driver.pid}, session ${driver.sessionId}) started`);
 
-  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, claudeDriver: driver };
+  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, claudeDriver: driver, settings: launchSettings(identity) };
+}
+
+/** System prompt of an API agent: who it is, how its tools work, the team protocol. */
+export function apiSystemPrompt(identity: AgentIdentity, providerName: string): string {
+  return [
+    `You are "${identity.name}", role: ${identity.role}, a member of a multi-agent team. You run on ${providerName}.`,
+    identity.roleDescription,
+    "",
+    `Your working directory is ${identity.projectDir}; file tools (Read, Write, Edit, LS, Glob, Grep) and Bash work inside it. WebFetch reads web pages.`,
+    "Team tools (send_message, check_messages, set_summary, signal_done, check_team_status, get_plan, update_plan, submit_feedback, approve, store_knowledge, query_knowledge…) are how you talk to teammates and the person — they only see what you send with them.",
+    "Teammate messages arrive as user messages starting with [Teammate messages]. To answer the person, use send_message with to_id \"human\".",
+    "Work in small steps: call a tool, read its result, decide the next step. Keep replies short; put details in files or messages.",
+    "",
+    claudeSystemPromptAppend(identity.role, identity.roleDescription),
+  ].join("\n");
+}
+
+/** Start an API agent (OpenAI-compatible provider) in-process; its first turn runs in the background. */
+async function spawnApiAgent(identity: AgentIdentity, firstPrompt: string, brokerClient: BrokerClient): Promise<LaunchResult> {
+  const provider = getProvider(identity.providerId);
+  if (!provider) throw new Error(`API provider "${identity.providerId ?? ""}" is not configured — add it under API providers first`);
+  const model = identity.model || provider.default_model;
+  if (!model) throw new Error(`Pick a model for ${provider.name} (no default model is set)`);
+  const server = claudeMcpConfig(identity, { driverMode: true, agentType: "api" }).mcpServers as Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
+  const driver = await ApiDriver.spawn({
+    cwd: identity.projectDir,
+    env: agentEnv(identity),
+    provider,
+    model,
+    effort: identity.effort,
+    mcpServer: server["multiagents-peer"]!,
+    systemPrompt: apiSystemPrompt(identity, provider.name),
+    firstPrompt,
+    permissionMode: CLAUDE_PERMISSION_MODE[identity.approvalMode ?? "bypass"],
+  });
+  await brokerClient.updateSlot({
+    id: identity.slotId,
+    context_patch: { provider_name: provider.name, last_summary: `Starting: ${firstPrompt.slice(0, 100)}`, last_status: "working", updated_at: Date.now() },
+  });
+  log(LOG_PREFIX, `API agent ${identity.name} on ${provider.name} (${model}) started`);
+  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, claudeDriver: driver, settings: launchSettings(identity) };
 }
 
 /**
@@ -535,6 +692,7 @@ async function spawnCodexAgent(
   env.MULTIAGENTS_DRIVER_MODE = "1";
 
   const driver = await CodexDriver.spawn(identity.projectDir, env);
+  driver.settings = { approvalPolicy: CODEX_APPROVAL_POLICY[identity.approvalMode ?? "bypass"], model: identity.model, effort: identity.effort };
   log(LOG_PREFIX, `CodexDriver spawned for ${identity.name} in slot ${identity.slotId}`);
 
   await brokerClient.updateSlot({ id: identity.slotId, status: "connected" });
@@ -548,6 +706,7 @@ async function spawnCodexAgent(
         cwd: identity.projectDir,
         sandbox: "workspace-write",
         developerInstructions: codexDeveloperInstructions(identity),
+        model: identity.model,
       });
       log(LOG_PREFIX, `${identity.name} bootstrap complete: thread=${bootstrap.threadId} (${bootstrap.content.slice(0, 50)})`);
 
@@ -578,7 +737,7 @@ async function spawnCodexAgent(
     }
   })();
 
-  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, codexDriver: driver };
+  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, codexDriver: driver, settings: launchSettings(identity) };
 }
 
 /** Spawn a one-shot Gemini (or custom) process; messages reach it through tool results. */
@@ -587,7 +746,7 @@ function spawnProcessAgent(agentType: AgentType, identity: AgentIdentity, taskPr
   if (!cmd) {
     throw new Error(`No CLI command configured for agent type: ${agentType}`);
   }
-  const proc = Bun.spawn([cmd, ...buildCliArgs(agentType, taskPrompt)], {
+  const proc = Bun.spawn([cmd, ...buildCliArgs(agentType, taskPrompt, { model: identity.model })], {
     cwd: identity.projectDir,
     stdin: "pipe",
     stdout: "pipe",
@@ -636,6 +795,15 @@ export async function launchAgent(
 
   log(LOG_PREFIX, `Created slot ${slot.id} for ${config.name} (${config.agent_type})`);
 
+  const approvalMode = parseApprovalMode(config.approval_mode);
+  await brokerClient.updateSlot({
+    id: slot.id,
+    context_patch: {
+      model: config.model ?? null, effort: config.effort ?? null, approval_mode: approvalMode,
+      ...(config.agent_type === "api" ? { provider_id: config.provider ?? null, provider_name: getProvider(config.provider)?.name ?? null } : {}),
+    },
+  });
+
   if (config.file_ownership && config.file_ownership.length > 0) {
     await brokerClient.assignOwnership({
       session_id: sessionId,
@@ -663,9 +831,15 @@ export async function launchAgent(
     name: config.name,
     role: config.role,
     roleDescription: enrichedDescription,
+    model: config.model || undefined,
+    effort: config.effort || undefined,
+    approvalMode,
+    providerId: config.provider || undefined,
   };
 
   switch (config.agent_type) {
+    case "api":
+      return spawnApiAgent(identity, buildTaskPrompt(identity, config.initial_task, "driver"), brokerClient);
     case "claude": {
       const result = await spawnClaudeAgent(identity, buildTaskPrompt(identity, config.initial_task, "driver"), brokerClient);
       log(LOG_PREFIX, `Launched ${config.name} (PID ${result.pid}) in slot ${slot.id}`);
@@ -720,6 +894,7 @@ export async function relaunchIntoSlot(
       role_description: slot.role_description ?? "",
       initial_task: handoffTask,
     }, projectDir),
+    ...slotSettings(slot),
   };
 
   switch (slot.agent_type) {
@@ -734,6 +909,8 @@ export async function relaunchIntoSlot(
     }
     case "codex":
       return spawnCodexAgent(identity, buildHandoffPrompt(identity, handoffTask, "driver"), brokerClient);
+    case "api":
+      return spawnApiAgent(identity, buildHandoffPrompt(identity, handoffTask, "driver"), brokerClient);
     default: {
       const result = spawnProcessAgent(slot.agent_type, identity, buildHandoffPrompt(identity, handoffTask, "inbox"));
       log(LOG_PREFIX, `Relaunched ${identity.name} (PID ${result.pid}) into existing slot ${slot.id}`);
@@ -746,21 +923,22 @@ export async function relaunchIntoSlot(
  * Build CLI arguments for the process-based agent types. Claude and Codex are
  * driven over their session protocols instead (see ClaudeDriver/CodexDriver).
  */
-export function buildCliArgs(agentType: AgentType, task: string): string[] {
+export function buildCliArgs(agentType: AgentType, task: string, opts: { model?: string } = {}): string[] {
   switch (agentType) {
     case "gemini": {
-      // Gemini CLI is invoked via npx. MCP is configured at user level
-      // (~/.gemini/settings.json) by ensureMcpConfigs. Use --approval-mode
-      // yolo for fully autonomous operation, --sandbox for safety, and
-      // --output-format stream-json for structured output parsing.
-      return [
-        "-y", "@google/gemini-cli",
-        "--sandbox",
-        "--approval-mode", "yolo",
+      // Upgraded to Antigravity CLI (`agy`).
+      // Uses --dangerously-skip-permissions for fully autonomous operation
+      // and --output-format stream-json for structured output parsing.
+      const args = [
+        "--dangerously-skip-permissions",
         "--output-format", "stream-json",
-        "--allowed-mcp-server-names", "multiagents-peer",
-        "-p", task,
       ];
+      const model = opts.model ?? process.env.MULTIAGENTS_ANTIGRAVITY_MODEL ?? process.env.MULTIAGENTS_GEMINI_MODEL;
+      if (model) {
+        args.push("--model", model);
+      }
+      args.push("-p", task);
+      return args;
     }
     case "custom":
       return [task];

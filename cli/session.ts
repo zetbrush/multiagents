@@ -2,10 +2,11 @@
 // multiagents — Session Management Commands
 // ============================================================================
 
-import { SESSION_DIR, SESSION_FILE } from "../shared/constants.ts";
+import { SESSION_FILE } from "../shared/constants.ts";
 import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import { BrokerClient } from "../shared/broker-client.ts";
-import { getGitRoot, formatTime, timeSince, slugify } from "../shared/utils.ts";
+import { formatTime, timeSince } from "../shared/utils.ts";
+import { createSessionRecord } from "../shared/session-ops.ts";
 import type { SessionFile } from "../shared/types.ts";
 import * as readline from "node:readline";
 import * as path from "node:path";
@@ -71,26 +72,7 @@ async function create(client: BrokerClient, name?: string): Promise<void> {
     process.exit(1);
   }
 
-  const projectDir = process.cwd();
-  const gitRoot = await getGitRoot(projectDir);
-  const sessionId = slugify(name);
-
-  const session = await client.createSession({
-    id: sessionId,
-    name,
-    project_dir: projectDir,
-    git_root: gitRoot,
-  });
-
-  // Write local session file
-  const sessionDir = path.join(projectDir, SESSION_DIR);
-  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
-  const sessionFile: SessionFile = {
-    session_id: session.id,
-    created_at: new Date().toISOString(),
-    broker_port: BROKER_PORT,
-  };
-  await Bun.write(path.join(projectDir, SESSION_FILE), JSON.stringify(sessionFile, null, 2));
+  const session = await createSessionRecord(client, name, process.cwd(), BROKER_PORT);
 
   console.log(`Session created: ${session.name} (${session.id})`);
   console.log(`Wrote ${SESSION_FILE}`);

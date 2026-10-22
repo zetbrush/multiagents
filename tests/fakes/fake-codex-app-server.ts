@@ -136,6 +136,17 @@ function handle(msg: any): void {
     }
     case "thread/list":
       return reply(id, { data: [], nextCursor: null });
+    case "account/read":
+      return reply(id, { account: { type: "chatgpt", email: "fake@example.com", planType: "plus" }, requiresOpenaiAuth: true });
+    case "account/rateLimits/read":
+      // Like older app-servers, whose request takes no params at all
+      if (params !== null && params !== undefined && Object.keys(params).length) return replyError(id, -32600, "Invalid request: invalid type: map, expected unit");
+      if (process.env.FAKE_CODEX_LOGGED_OUT === "1") return replyError(id, -32600, "codex account authentication required to read rate limits");
+      return reply(id, { rateLimits: {
+        limitId: "codex", planType: "plus",
+        primary: { usedPercent: 63, windowDurationMins: 300, resetsAt: 1893474000 },
+        secondary: { usedPercent: 21, windowDurationMins: 10080, resetsAt: 1893906000 },
+      } });
     case "turn/start": {
       if (activeTurn) return replyError(id, -32600, "a turn is already active");
       const turnId = `turn_${++turnCounter}`;

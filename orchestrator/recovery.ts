@@ -8,10 +8,11 @@
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentEvent } from "./monitor.ts";
 import type { CodexDriver } from "./codex-driver.ts";
-import type { ClaudeDriver } from "./claude-driver.ts";
+import type { ClaudeSession } from "./claude-driver.ts";
 import { FLAP_THRESHOLD, FLAP_WINDOW_MS } from "../shared/constants.ts";
 import { log, safeJsonParse, formatDuration } from "../shared/utils.ts";
-import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH, codexDeveloperInstructions } from "./launcher.ts";
+import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH, codexDeveloperInstructions, slotSettings } from "./launcher.ts";
+import { CODEX_APPROVAL_POLICY } from "./activity.ts";
 
 const LOG_PREFIX = "recovery";
 
@@ -126,7 +127,8 @@ export interface RespawnResult {
   pid: number;
   process: import("bun").Subprocess;
   codexDriver?: CodexDriver;
-  claudeDriver?: ClaudeDriver;
+  claudeDriver?: ClaudeSession;
+  settings?: { model?: string; effort?: string; approvalMode?: string };
 }
 
 /**
@@ -213,6 +215,8 @@ export async function respawnAgent(
     delete spawnEnv.CLAUDECODE;
 
     const driver = await CD.spawn(projectDir, spawnEnv);
+    const settings = slotSettings(slot);
+    driver.settings = { approvalPolicy: CODEX_APPROVAL_POLICY[settings.approvalMode], model: settings.model, effort: settings.effort };
     await brokerClient.updateSlot({ id: slotId, status: "connected" });
 
     const developerInstructions = codexDeveloperInstructions(identity);
@@ -257,7 +261,7 @@ export async function respawnAgent(
     }).catch((err) => log(LOG_PREFIX, `Codex respawn task failed: ${err}`));
 
     log(LOG_PREFIX, `Respawned Codex into slot ${slotId} via CodexDriver (PID ${driver.pid})`);
-    return { pid: driver.pid, process: driver.process, codexDriver: driver };
+    return { pid: driver.pid, process: driver.process, codexDriver: driver, settings };
   }
 
   // Claude (driver, resumes its session when the snapshot has one) and Gemini (process)
@@ -265,5 +269,5 @@ export async function respawnAgent(
 
   log(LOG_PREFIX, `Respawned into existing slot ${slotId} (PID ${result.pid})`);
 
-  return { pid: result.pid, process: result.process, codexDriver: result.codexDriver, claudeDriver: result.claudeDriver };
+  return { pid: result.pid, process: result.process, codexDriver: result.codexDriver, claudeDriver: result.claudeDriver, settings: result.settings };
 }

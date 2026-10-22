@@ -98,7 +98,6 @@ describe("Web Dashboard — HTTP server", () => {
     expect(res.headers.get("content-type")).toContain("text/html");
     const html = await res.text();
     expect(html).toContain("multiagents");
-    expect(html).toContain("connectWs");
   });
 
   test("serves index.html on /index.html", async () => {
@@ -245,31 +244,46 @@ describe("Web Dashboard — WebSocket", () => {
   });
 });
 
-describe("Web Dashboard — HTML content", () => {
-  test("contains all 6 tab panels", async () => {
-    const res = await fetch(DASHBOARD_URL);
-    const html = await res.text();
-    expect(html).toContain('data-tab="agents"');
-    expect(html).toContain('data-tab="messages"');
-    expect(html).toContain('data-tab="plan"');
-    expect(html).toContain('data-tab="knowledge"');
-    expect(html).toContain('data-tab="files"');
-    expect(html).toContain('data-tab="stats"');
+describe("Web Dashboard — UI assets", () => {
+  test("the page has the chat, the explorer and the preview", async () => {
+    const html = await (await fetch(DASHBOARD_URL)).text();
+    for (const tab of ["chat", "agents", "plan", "knowledge", "files", "stats"]) expect(html).toContain(`data-tab="${tab}"`);
+    expect(html).toContain('id="explorer-tree"');
+    expect(html).toContain('id="preview-body"');
+    expect(html).toContain('src="/app.js"');
+    expect(html).toContain('href="/styles.css"');
+    // Translations load first: app.js calls tr() while it boots
+    expect(html.indexOf('src="/i18n.js"')).toBeGreaterThan(-1);
+    expect(html.indexOf('src="/i18n.js"')).toBeLessThan(html.indexOf('src="/app.js"'));
   });
 
-  test("contains WebSocket connection logic", async () => {
-    const res = await fetch(DASHBOARD_URL);
-    const html = await res.text();
-    expect(html).toContain("new WebSocket");
-    expect(html).toContain("connectWs");
-    expect(html).toContain("ws.onmessage");
+  test("serves the translations", async () => {
+    const res = await fetch(`${DASHBOARD_URL}/i18n.js`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("javascript");
+    expect(await res.text()).toContain("function tr(");
   });
 
-  test("contains CSS for dark theme", async () => {
-    const res = await fetch(DASHBOARD_URL);
-    const html = await res.text();
-    expect(html).toContain("--bg:");
-    expect(html).toContain("--surface:");
-    expect(html).toContain("#0f1117");
+  test("serves the script with the WebSocket logic", async () => {
+    const res = await fetch(`${DASHBOARD_URL}/app.js`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("javascript");
+    const js = await res.text();
+    expect(js).toContain("new WebSocket");
+    expect(js).toContain("connectWs");
+    expect(js).toContain("ws.onmessage");
+  });
+
+  test("serves the stylesheet with light and dark themes", async () => {
+    const res = await fetch(`${DASHBOARD_URL}/styles.css`);
+    expect(res.headers.get("content-type")).toContain("text/css");
+    const css = await res.text();
+    expect(css).toContain('html[data-theme="light"]');
+    expect(css).toContain('html[data-theme="dark"]');
+  });
+
+  test("serves nothing else from the dashboard directory", async () => {
+    expect((await fetch(`${DASHBOARD_URL}/server.ts`)).status).toBe(404);
+    expect((await fetch(`${DASHBOARD_URL}/control.ts`)).status).toBe(404);
   });
 });

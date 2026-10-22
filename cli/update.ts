@@ -19,6 +19,8 @@ export interface BrokerHealth {
   peers: number;
   pid?: number;
   version?: string;
+  /** Capabilities of the running build (absent on brokers older than the list) */
+  features?: string[];
 }
 
 export interface UpdateDeps {
@@ -198,6 +200,7 @@ export function parseBrokerHealth(body: unknown): BrokerHealth | null {
   const health: BrokerHealth = { peers: b.peers };
   if (typeof b.pid === "number") health.pid = b.pid;
   if (typeof b.version === "string") health.version = b.version;
+  if (Array.isArray(b.features)) health.features = b.features.filter((f): f is string => typeof f === "string");
   return health;
 }
 

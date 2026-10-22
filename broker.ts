@@ -19,8 +19,9 @@ import {
   RECONNECT_RECAP_LIMIT,
   DEFAULT_GUARDRAILS,
   CLEANUP_INTERVAL,
+  BROKER_FEATURES,
 } from "./shared/constants.ts";
-import { generatePeerId } from "./shared/utils.ts";
+import { generatePeerId, safeJsonParse } from "./shared/utils.ts";
 import { resolveBrokerPort } from "./shared/broker-url.ts";
 import type {
   RegisterRequest,
@@ -62,6 +63,12 @@ import type {
   KnowledgeListRequest,
   KnowledgeGetRequest,
   KnowledgeDeleteRequest,
+  ActivityAddRequest,
+  ActivityEntry,
+  LiveActivity,
+  ApprovalRequest,
+  AddPlanItemRequest,
+  EditPlanItemRequest,
 } from "./shared/types.ts";
 
 // --- Configuration ---
@@ -229,6 +236,37 @@ db.run(`
 `);
 
 db.run(`
+  CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    slot_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT,
+    data TEXT,
+    ts INTEGER NOT NULL
+  )
+`);
+db.run("CREATE INDEX IF NOT EXISTS idx_activity_session ON activity (session_id, id)");
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    slot_id INTEGER NOT NULL,
+    tool TEXT NOT NULL,
+    title TEXT NOT NULL,
+    input TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    always INTEGER NOT NULL DEFAULT 0,
+    note TEXT,
+    decided_by TEXT,
+    created_at INTEGER NOT NULL,
+    decided_at INTEGER
+  )
+`);
+
+db.run(`
   CREATE TABLE IF NOT EXISTS knowledge (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -269,6 +307,7 @@ for (const stmt of [
   "ALTER TABLE slots ADD COLUMN input_tokens INTEGER DEFAULT 0",
   "ALTER TABLE slots ADD COLUMN output_tokens INTEGER DEFAULT 0",
   "ALTER TABLE slots ADD COLUMN cache_read_tokens INTEGER DEFAULT 0",
+  "ALTER TABLE slots ADD COLUMN cost_usd REAL DEFAULT 0",
 ]) {
   addColumn(stmt);
 }
@@ -277,6 +316,25 @@ for (const stmt of [
 // message of an older database counts as acked or it would be replayed.
 if (addColumn("ALTER TABLE messages ADD COLUMN acked_at TEXT")) {
   db.run("UPDATE messages SET acked_at = COALESCE(delivered_at, sent_at) WHERE delivered = 1 AND acked_at IS NULL");
+}
+
+// Session names without ASCII letters used to slugify to "", leaving a session
+// no client can address. Give such a session a real id, in every table.
+{
+  const orphan = db.query("SELECT created_at FROM sessions WHERE id = ''").get() as { created_at: number } | null;
+  if (orphan) {
+    let newId = `session-${orphan.created_at.toString(36)}`;
+    while (db.query("SELECT 1 FROM sessions WHERE id = ?").get(newId)) newId += "x";
+    const tables = (db.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as { name: string }[])
+      .map((t) => t.name)
+      .filter((t) => t !== "sessions" && (db.query(`PRAGMA table_info(${t})`).all() as { name: string }[]).some((c) => c.name === "session_id"));
+    db.transaction(() => {
+      db.run("PRAGMA defer_foreign_keys = ON");
+      db.run("UPDATE sessions SET id = ? WHERE id = ''", [newId]);
+      for (const t of tables) db.run(`UPDATE ${t} SET session_id = ? WHERE session_id = ''`, [newId]);
+    })();
+    console.error(`[multiagents broker] renamed the session with an empty id to "${newId}"`);
+  }
 }
 
 // --- Context snapshot builder ---
@@ -618,7 +676,8 @@ function handleSendMessage(body: SendMessageRequest): SendMessageResult {
   if (!toId) return { ok: false, error: "No target specified" };
 
   // Allow messages to "orchestrator" and driver-managed slots (no real peer_id)
-  const isSpecialTarget = toId === "orchestrator" || toId === "__orchestrator__" || toId.startsWith("__slot_");
+  // "human" is the person at the dashboard: its messages are read there, never polled
+  const isSpecialTarget = toId === "orchestrator" || toId === "__orchestrator__" || toId === "human" || toId.startsWith("__slot_");
 
   // Verify target exists (unless targeting orchestrator or driver-managed slot)
   if (!isSpecialTarget) {
@@ -663,7 +722,23 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   }
 
   const rows = (body.unclaimed_only ? selectUnclaimed : selectUnacked).all(body.id, peer?.slot_id ?? null) as Message[];
-  return { messages: handOff(rows, body.retain !== true) };
+  return { messages: handOff(qaFilter(peer?.slot_id ?? null, rows), body.retain !== true) };
+}
+
+const selectSlotSessionConfig = db.prepare(
+  "SELECT s.config AS config FROM slots sl JOIN sessions s ON s.id = sl.session_id WHERE sl.id = ?"
+);
+
+/**
+ * Q&A mode (session config `qa_mode`): the team's work is on hold and agents
+ * only hear the person and the orchestrator; teammates' messages wait (stay
+ * unclaimed) until the mode ends.
+ */
+function qaFilter(slotId: number | null, rows: Message[]): Message[] {
+  if (slotId === null || rows.length === 0) return rows;
+  const row = selectSlotSessionConfig.get(slotId) as { config: string | null } | null;
+  if (!safeJsonParse<Record<string, unknown>>(row?.config ?? "{}", {}).qa_mode) return rows;
+  return rows.filter((m) => m.from_id === "human" || m.from_id === "orchestrator" || m.from_id === "__orchestrator__");
 }
 
 /** Poll a slot's messages (driver-managed agents have no peer id). */
@@ -671,7 +746,7 @@ function handlePollBySlot(body: { slot_id: number; session_id?: string; retain?:
   const slot = db.query("SELECT paused FROM slots WHERE id = ?").get(body.slot_id) as { paused: number } | null;
   if (slot?.paused) return { messages: [], paused: true };
 
-  return { messages: handOff(selectUnackedBySlot.all(body.slot_id) as Message[], body.retain !== true) };
+  return { messages: handOff(qaFilter(body.slot_id, selectUnackedBySlot.all(body.slot_id) as Message[]), body.retain !== true) };
 }
 
 /**
@@ -816,6 +891,7 @@ function handleKnowledgeDelete(body: KnowledgeDeleteRequest): { ok: boolean } {
 // --- Sessions ---
 
 function handleCreateSession(body: CreateSessionRequest): Session {
+  if (typeof body.id !== "string" || !body.id.trim()) throw new Error("Session id must not be empty");
   const now = Date.now();
   db.run(
     "INSERT INTO sessions (id, name, project_dir, git_root, status, config, created_at, last_active_at) VALUES (?, ?, ?, ?, 'active', ?, ?, ?)",
@@ -864,8 +940,10 @@ function handleDeleteSession(body: { id: string }): { ok: boolean; deleted: { sl
   db.run("DELETE FROM guardrail_overrides WHERE session_id = ?", [body.id]);
   db.run("DELETE FROM guardrail_events WHERE session_id = ?", [body.id]);
 
-  // Delete knowledge entries
+  // Delete knowledge entries, the activity timeline and approvals
   db.run("DELETE FROM knowledge WHERE session_id = ?", [body.id]);
+  db.run("DELETE FROM activity WHERE session_id = ?", [body.id]);
+  db.run("DELETE FROM approvals WHERE session_id = ?", [body.id]);
 
   db.run("DELETE FROM sessions WHERE id = ?", [body.id]);
 
@@ -879,7 +957,12 @@ function handleUpdateSession(body: UpdateSessionRequest): Session | null {
   if (body.status !== undefined) { fields.push("status = ?"); values.push(body.status); }
   if (body.pause_reason !== undefined) { fields.push("pause_reason = ?"); values.push(body.pause_reason); }
   if (body.paused_at !== undefined) { fields.push("paused_at = ?"); values.push(body.paused_at); }
-  if (body.config !== undefined) { fields.push("config = ?"); values.push(JSON.stringify(body.config)); }
+  let config = body.config;
+  if (body.config_patch !== undefined) {
+    const current = config ?? parseSnapshot((db.query("SELECT config FROM sessions WHERE id = ?").get(body.id) as { config: string | null } | null)?.config ?? null);
+    config = { ...current, ...body.config_patch };
+  }
+  if (config !== undefined) { fields.push("config = ?"); values.push(JSON.stringify(config)); }
 
   fields.push("last_active_at = ?");
   values.push(Date.now());
@@ -942,6 +1025,7 @@ function handleUpdateSlot(body: UpdateSlotRequest): Slot | null {
   if (body.input_tokens !== undefined) { fields.push("input_tokens = input_tokens + ?"); values.push(body.input_tokens); }
   if (body.output_tokens !== undefined) { fields.push("output_tokens = output_tokens + ?"); values.push(body.output_tokens); }
   if (body.cache_read_tokens !== undefined) { fields.push("cache_read_tokens = cache_read_tokens + ?"); values.push(body.cache_read_tokens); }
+  if (body.cost_usd !== undefined) { fields.push("cost_usd = COALESCE(cost_usd, 0) + ?"); values.push(body.cost_usd); }
 
   if (fields.length > 0) {
     values.push(body.id);
@@ -1191,6 +1275,8 @@ function handleUpdateGuardrail(body: UpdateGuardrailRequest) {
 
 // --- Plans ---
 
+const PLAN_ITEM_STATUSES = new Set(["pending", "in_progress", "blocked", "done"]);
+
 interface CreatePlanRequest {
   session_id: string;
   title: string;
@@ -1258,6 +1344,64 @@ function handleUpdatePlanItem(body: { item_id: number; status: string; session_i
     return handleGetPlan({ session_id: body.session_id });
   }
   return { ok: true };
+}
+
+/** The plan item, provided it belongs to the session's plan. */
+function sessionPlanItem(sessionId: string, itemId: number): { id: number; plan_id: number } | null {
+  return db.query(
+    "SELECT pi.id, pi.plan_id FROM plan_items pi JOIN plans p ON p.id = pi.plan_id WHERE pi.id = ? AND p.session_id = ?",
+  ).get(itemId, sessionId) as { id: number; plan_id: number } | null;
+}
+
+/** Append an item to the session's plan, creating the plan if it has none. */
+function handleAddPlanItem(body: AddPlanItemRequest) {
+  if (!body.session_id) throw new Error("session_id required");
+  if (!body.label || !body.label.trim()) throw new Error("label required");
+  const now = Date.now();
+  let plan = db.query("SELECT id FROM plans WHERE session_id = ? ORDER BY id DESC LIMIT 1").get(body.session_id) as { id: number } | null;
+  if (!plan) {
+    const session = db.query("SELECT name FROM sessions WHERE id = ?").get(body.session_id) as { name: string } | null;
+    if (!session) throw new Error(`Session ${body.session_id} not found`);
+    db.run("INSERT INTO plans (session_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)", [body.session_id, body.title ?? session.name, now, now]);
+    plan = db.query("SELECT id FROM plans WHERE session_id = ? ORDER BY id DESC LIMIT 1").get(body.session_id) as { id: number };
+  }
+  const last = db.query("SELECT MAX(sort_order) AS max FROM plan_items WHERE plan_id = ?").get(plan.id) as { max: number | null };
+  db.run(
+    "INSERT INTO plan_items (plan_id, parent_id, label, status, assigned_to_slot, sort_order) VALUES (?, NULL, ?, 'pending', ?, ?)",
+    [plan.id, body.label.trim(), body.assigned_to_slot ?? null, (last.max ?? -1) + 1],
+  );
+  db.run("UPDATE plans SET updated_at = ? WHERE id = ?", [now, plan.id]);
+  return handleGetPlan({ session_id: body.session_id });
+}
+
+/** Change an item's label, status or assignee (null unassigns). */
+function handleEditPlanItem(body: EditPlanItemRequest) {
+  const item = sessionPlanItem(body.session_id, body.item_id);
+  if (!item) return null;
+  const fields: string[] = [];
+  const values: any[] = [];
+  if (body.label !== undefined) {
+    if (!body.label.trim()) throw new Error("label must not be empty");
+    fields.push("label = ?"); values.push(body.label.trim());
+  }
+  if (body.status !== undefined) {
+    if (!PLAN_ITEM_STATUSES.has(body.status)) throw new Error(`Invalid status "${body.status}"`);
+    fields.push("status = ?", "completed_at = ?"); values.push(body.status, body.status === "done" ? Date.now() : null);
+  }
+  if (body.assigned_to_slot !== undefined) { fields.push("assigned_to_slot = ?"); values.push(body.assigned_to_slot); }
+  if (fields.length > 0) {
+    db.run(`UPDATE plan_items SET ${fields.join(", ")} WHERE id = ?`, [...values, item.id]);
+    db.run("UPDATE plans SET updated_at = ? WHERE id = ?", [Date.now(), item.plan_id]);
+  }
+  return handleGetPlan({ session_id: body.session_id });
+}
+
+function handleDeletePlanItem(body: { session_id: string; item_id: number }) {
+  const item = sessionPlanItem(body.session_id, body.item_id);
+  if (!item) return null;
+  db.run("DELETE FROM plan_items WHERE id = ?", [item.id]);
+  db.run("UPDATE plans SET updated_at = ? WHERE id = ?", [Date.now(), item.plan_id]);
+  return handleGetPlan({ session_id: body.session_id });
 }
 
 // --- Message log ---
@@ -1328,6 +1472,117 @@ function handleReleaseHeld(body: { session_id: string; slot_id: number }) {
   return { messages };
 }
 
+// --- Activity timeline ---
+
+const ACTIVITY_KEEP_PER_SLOT = 3000;
+const ACTIVITY_TEXT_MAX = 20_000;
+
+function clip(s: unknown, max = ACTIVITY_TEXT_MAX): string | null {
+  if (s === undefined || s === null) return null;
+  const str = typeof s === "string" ? s : JSON.stringify(s);
+  return str.length > max ? str.slice(0, max) + `\n… (${str.length - max} more characters)` : str;
+}
+
+function handleActivityAdd(body: ActivityAddRequest): { ok: boolean; added: number } {
+  if (!body.session_id || !Number.isInteger(body.slot_id)) throw new Error("session_id and slot_id required");
+  const entries = Array.isArray(body.entries) ? body.entries.slice(0, 500) : [];
+  const insert = db.prepare("INSERT INTO activity (session_id, slot_id, kind, title, detail, data, ts) VALUES (?, ?, ?, ?, ?, ?, ?)");
+  db.transaction(() => {
+    for (const e of entries) {
+      insert.run(body.session_id, body.slot_id, String(e.kind), clip(e.title, 500) ?? "", clip(e.detail), e.data === undefined ? null : clip(e.data, 60_000), e.ts ?? Date.now());
+    }
+    // Keep the timeline bounded per agent
+    const cutoff = db.query("SELECT id FROM activity WHERE slot_id = ? ORDER BY id DESC LIMIT 1 OFFSET ?").get(body.slot_id, ACTIVITY_KEEP_PER_SLOT) as { id: number } | null;
+    if (cutoff) db.run("DELETE FROM activity WHERE slot_id = ? AND id <= ?", [body.slot_id, cutoff.id]);
+  })();
+  return { ok: true, added: entries.length };
+}
+
+/** Oldest first; `after_id` pages forward, otherwise the latest `limit` entries. */
+// --- Live activity: what each agent is doing right now (memory only) ---
+
+/** A busy entry not refreshed this long ago belongs to a host that went away */
+const LIVE_STALE_MS = 60_000;
+const liveActivity = new Map<string, Map<number, LiveActivity>>();
+
+function handleLiveSet(body: { session_id: string; slot_id: number; live: LiveActivity }): { ok: boolean } {
+  if (!body.session_id || !Number.isInteger(body.slot_id) || !body.live || typeof body.live !== "object") throw new Error("session_id, slot_id and live required");
+  const live = body.live;
+  const entry: LiveActivity = {
+    busy: live.busy === true,
+    phase: ["idle", "waiting", "thinking", "writing", "tool"].includes(live.phase) ? live.phase : "waiting",
+    text: typeof live.text === "string" ? live.text.slice(-8_000) : "",
+    tool: typeof live.tool === "string" ? live.tool.slice(0, 500) : null,
+    since: typeof live.since === "number" ? live.since : null,
+    updatedAt: Date.now(),
+  };
+  let session = liveActivity.get(body.session_id);
+  if (!session) liveActivity.set(body.session_id, (session = new Map()));
+  if (entry.busy) session.set(body.slot_id, entry);
+  else session.delete(body.slot_id);
+  return { ok: true };
+}
+
+function handleLiveList(body: { session_id: string }): Record<string, LiveActivity> {
+  const out: Record<string, LiveActivity> = {};
+  const now = Date.now();
+  for (const [slotId, live] of liveActivity.get(body.session_id) ?? []) {
+    if (now - live.updatedAt < LIVE_STALE_MS) out[slotId] = live;
+  }
+  return out;
+}
+
+function handleActivityList(body: { session_id: string; slot_id?: number; after_id?: number; limit?: number }): ActivityEntry[] {
+  const limit = Math.min(Math.max(body.limit ?? 300, 1), 2000);
+  const cond = ["session_id = ?"];
+  const params: any[] = [body.session_id];
+  if (body.slot_id !== undefined && body.slot_id !== null) { cond.push("slot_id = ?"); params.push(body.slot_id); }
+  if (body.after_id) {
+    cond.push("id > ?"); params.push(body.after_id);
+    return db.query(`SELECT * FROM activity WHERE ${cond.join(" AND ")} ORDER BY id ASC LIMIT ?`).all(...params, limit) as ActivityEntry[];
+  }
+  const rows = db.query(`SELECT * FROM activity WHERE ${cond.join(" AND ")} ORDER BY id DESC LIMIT ?`).all(...params, limit) as ActivityEntry[];
+  return rows.reverse();
+}
+
+// --- Approvals: a tool call waiting for a person ---
+
+function handleApprovalCreate(body: { session_id: string; slot_id: number; tool: string; title: string; input?: unknown }): ApprovalRequest {
+  if (!body.session_id || !Number.isInteger(body.slot_id) || !body.tool) throw new Error("session_id, slot_id and tool required");
+  const now = Date.now();
+  const res = db.run(
+    "INSERT INTO approvals (session_id, slot_id, tool, title, input, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+    [body.session_id, body.slot_id, body.tool, clip(body.title, 500) ?? body.tool, body.input === undefined ? null : clip(body.input, 60_000), now],
+  );
+  return db.query("SELECT * FROM approvals WHERE id = ?").get(Number(res.lastInsertRowid)) as ApprovalRequest;
+}
+
+function handleApprovalGet(body: { id: number }): ApprovalRequest | null {
+  return (db.query("SELECT * FROM approvals WHERE id = ?").get(body.id) as ApprovalRequest) ?? null;
+}
+
+function handleApprovalList(body: { session_id: string; status?: string; limit?: number }): ApprovalRequest[] {
+  const limit = Math.min(Math.max(body.limit ?? 100, 1), 500);
+  if (body.status) {
+    return db.query("SELECT * FROM approvals WHERE session_id = ? AND status = ? ORDER BY id ASC LIMIT ?").all(body.session_id, body.status, limit) as ApprovalRequest[];
+  }
+  return (db.query("SELECT * FROM approvals WHERE session_id = ? ORDER BY id DESC LIMIT ?").all(body.session_id, limit) as ApprovalRequest[]).reverse();
+}
+
+/** Decide a pending request; a request already decided or cancelled is not changed. */
+function handleApprovalDecide(body: { id: number; session_id: string; decision: "allow" | "deny" | "cancel"; note?: string; always?: boolean; decided_by?: string }): ApprovalRequest | null {
+  const status = body.decision === "allow" ? "allowed" : body.decision === "deny" ? "denied" : body.decision === "cancel" ? "cancelled" : null;
+  if (!status) throw new Error(`Invalid decision "${body.decision}"`);
+  const res = db.run(
+    "UPDATE approvals SET status = ?, always = ?, note = ?, decided_by = ?, decided_at = ? WHERE id = ? AND session_id = ? AND status = 'pending'",
+    [status, body.always ? 1 : 0, body.note ?? null, body.decided_by ?? null, Date.now(), body.id, body.session_id],
+  );
+  const row = handleApprovalGet({ id: body.id });
+  if (!row || row.session_id !== body.session_id) return null;
+  if (res.changes === 0 && body.decision !== "cancel") throw new Error(`Request ${body.id} is already ${row.status}`);
+  return row;
+}
+
 // --- Agent event ---
 
 function handleAgentEvent(body: { session_id: string; event_type: string; slot_id?: number; metadata?: unknown; data?: unknown }) {
@@ -1350,7 +1605,7 @@ Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length, pid: process.pid, version: BROKER_VERSION });
+        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length, pid: process.pid, version: BROKER_VERSION, features: BROKER_FEATURES });
       }
       return new Response("multiagents broker", { status: 200 });
     }
@@ -1461,6 +1716,38 @@ Bun.serve({
           return Response.json(handleGetPlan(body as { session_id: string }));
         case "/plan/update-item":
           return Response.json(handleUpdatePlanItem(body as { item_id: number; status: string; session_id?: string }));
+        // --- Activity & approvals ---
+        case "/activity/add":
+          return Response.json(handleActivityAdd(body as ActivityAddRequest));
+        case "/activity/list":
+          return Response.json(handleActivityList(body as { session_id: string; slot_id?: number; after_id?: number; limit?: number }));
+        case "/activity/live/set":
+          return Response.json(handleLiveSet(body as { session_id: string; slot_id: number; live: LiveActivity }));
+        case "/activity/live/list":
+          return Response.json(handleLiveList(body as { session_id: string }));
+        case "/approvals/create":
+          return Response.json(handleApprovalCreate(body as { session_id: string; slot_id: number; tool: string; title: string; input?: unknown }));
+        case "/approvals/get": {
+          const row = handleApprovalGet(body as { id: number });
+          return row ? Response.json(row) : Response.json({ error: "Approval not found" }, { status: 404 });
+        }
+        case "/approvals/list":
+          return Response.json(handleApprovalList(body as { session_id: string; status?: string; limit?: number }));
+        case "/approvals/decide": {
+          const row = handleApprovalDecide(body as { id: number; session_id: string; decision: "allow" | "deny" | "cancel"; note?: string; always?: boolean; decided_by?: string });
+          return row ? Response.json(row) : Response.json({ error: "Approval not found in session" }, { status: 404 });
+        }
+
+        case "/plan/add-item":
+          return Response.json(handleAddPlanItem(body as AddPlanItemRequest));
+        case "/plan/edit-item": {
+          const edited = handleEditPlanItem(body as EditPlanItemRequest);
+          return edited ? Response.json(edited) : Response.json({ error: "Plan item not found in session" }, { status: 404 });
+        }
+        case "/plan/delete-item": {
+          const remaining = handleDeletePlanItem(body as { session_id: string; item_id: number });
+          return remaining ? Response.json(remaining) : Response.json({ error: "Plan item not found in session" }, { status: 404 });
+        }
 
         // --- Message log ---
         case "/message-log":
@@ -1583,6 +1870,24 @@ Bun.serve({
           if (allReviewRolesApproved || singleReviewerApproved) {
             db.run("UPDATE slots SET task_state = 'approved' WHERE id = ?", [target_slot_id]);
             newState = "approved";
+
+            // If all non-reviewer workers are now approved, also transition active reviewers to approved
+            const liveSlots = db.query(
+              "SELECT id, role, task_state FROM slots WHERE session_id = ? AND task_state != 'released'"
+            ).all(session_id) as Array<{ id: number; role: string | null; task_state: string }>;
+
+            const unapprovedWorkers = liveSlots.filter(
+              (s) => !/qa|review|test|lead/i.test(s.role ?? "") && s.task_state !== "approved"
+            );
+
+            if (unapprovedWorkers.length === 0) {
+              const activeReviewers = liveSlots.filter(
+                (s) => /qa|review|test|lead/i.test(s.role ?? "") && s.task_state !== "approved"
+              );
+              for (const rev of activeReviewers) {
+                db.run("UPDATE slots SET task_state = 'approved' WHERE id = ?", [rev.id]);
+              }
+            }
           } else {
             // Keep in done_pending_review — still waiting for more approvals
             newState = targetSlot.task_state;
@@ -1665,3 +1970,13 @@ function shutdownBroker() {
 
 process.on("SIGINT", shutdownBroker);
 process.on("SIGTERM", shutdownBroker);
+
+// Restart (a newer build takes over): leave the agents running, they keep their
+// registrations in the database and talk to the next broker on the same port
+try {
+  process.on("SIGUSR2", () => {
+    console.error("[multiagents broker] exiting for a restart; agents stay up");
+    try { db.close(); } catch {}
+    process.exit(0);
+  });
+} catch { /* no SIGUSR2 on this platform */ }

@@ -9,14 +9,39 @@
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { Message } from "../shared/types.ts";
 import type { CodexDriver } from "./codex-driver.ts";
-import type { ClaudeDriver } from "./claude-driver.ts";
+import type { ClaudeSession } from "./claude-driver.ts";
 import { log } from "../shared/utils.ts";
+import { HUMAN_SENDER, HUMAN_SENDER_LABEL } from "../shared/constants.ts";
 
 const LOG_PREFIX = "delivery";
 
+/** Settings last applied to a running driver (compared with the slot's to apply changes live). */
+export interface AppliedSettings {
+  model?: string;
+  effort?: string;
+  approvalMode: string;
+}
+
+/** The settings an agent was launched with ("launch" for Claude's auto mode, which is switched to once running). */
+export function launchedSettings(kind: "claude" | "codex", s: { model?: string; effort?: string; approvalMode?: string }): AppliedSettings {
+  const mode = s.approvalMode ?? "bypass";
+  return { model: s.model, effort: s.effort, approvalMode: kind === "claude" && mode === "auto" ? "launch" : mode };
+}
+
+/** Supervision state kept next to every driver. */
+interface DriverSupervision {
+  busy: boolean;
+  lastNudge: number;
+  releasedAt?: number;
+  applied?: AppliedSettings;
+  /** The running turn was interrupted because the slot got paused */
+  pauseInterrupted?: boolean;
+}
+
 export type DriverSlot =
-  | { kind: "codex"; driver: CodexDriver; threadId: string | null; busy: boolean; lastNudge: number; releasedAt?: number }
-  | { kind: "claude"; driver: ClaudeDriver; busy: boolean; lastNudge: number; releasedAt?: number; inflight?: Set<number> };
+  | ({ kind: "codex"; driver: CodexDriver; threadId: string | null } & DriverSupervision)
+  // Claude CLI sessions and API agents (both speak Claude's stream-json events)
+  | ({ kind: "claude"; driver: ClaudeSession; inflight?: Set<number> } & DriverSupervision);
 
 export type DeliveryOutcome = "dead" | "not_ready" | "busy" | "none" | "in_flight" | "steered" | "replied" | "sent" | "failed";
 
@@ -25,6 +50,7 @@ type SenderInfo = { display_name: string | null; role: string | null };
 /** One line per message: type, sender name/role and the peer id to reply to. */
 export function formatForwardedMessages(messages: Message[], senders: Map<number, SenderInfo>): string {
   return messages.map((m) => {
+    if (m.from_id === HUMAN_SENDER) return `[${m.msg_type}] ${HUMAN_SENDER_LABEL}: ${m.text}`;
     const sender = m.from_slot_id !== null ? senders.get(m.from_slot_id) : undefined;
     const name = sender?.display_name ?? (m.from_slot_id !== null ? `slot ${m.from_slot_id}` : m.from_id);
     const role = sender?.role ? ` (${sender.role})` : "";

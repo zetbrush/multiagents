@@ -8,6 +8,45 @@
 import type { DriverSlot } from "./delivery.ts";
 import type { PeekResult } from "../shared/types.ts";
 
+export interface UsageLimits {
+  /** input + output tokens per agent */
+  agent_tokens?: number;
+  agent_cost_usd?: number;
+  /** input + output tokens summed over the session's agents */
+  session_tokens?: number;
+  session_cost_usd?: number;
+}
+
+export interface SlotUsage {
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cost_usd?: number | null;
+}
+
+export function slotTokens(slot: SlotUsage): number {
+  return (slot.input_tokens ?? 0) + (slot.output_tokens ?? 0);
+}
+
+/**
+ * Why an agent must stop (a limit it reached), or null. `agentTokenLimit` is
+ * the agent's own limit when set, else the session's per-agent limit.
+ */
+export function limitVerdict(slot: SlotUsage, all: SlotUsage[], limits: UsageLimits, agentTokenLimit?: number): string | null {
+  const positive = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined);
+  const perAgent = positive(agentTokenLimit) ?? positive(limits.agent_tokens);
+  const tokens = slotTokens(slot);
+  if (perAgent && tokens >= perAgent) return `token limit reached (${tokens.toLocaleString("en-US")} / ${perAgent.toLocaleString("en-US")})`;
+  const agentCost = positive(limits.agent_cost_usd);
+  if (agentCost && (slot.cost_usd ?? 0) >= agentCost) return `cost limit reached ($${(slot.cost_usd ?? 0).toFixed(2)} / $${agentCost.toFixed(2)})`;
+  const sessionTokens = positive(limits.session_tokens);
+  const total = all.reduce((a, s) => a + slotTokens(s), 0);
+  if (sessionTokens && total >= sessionTokens) return `session token limit reached (${total.toLocaleString("en-US")} / ${sessionTokens.toLocaleString("en-US")})`;
+  const sessionCost = positive(limits.session_cost_usd);
+  const cost = all.reduce((a, s) => a + (s.cost_usd ?? 0), 0);
+  if (sessionCost && cost >= sessionCost) return `session cost limit reached ($${cost.toFixed(2)} / $${sessionCost.toFixed(2)})`;
+  return null;
+}
+
 /** Driver-managed agents per session; a slot holds at most one driver. */
 export class DriverRegistry {
   private bySession = new Map<string, Map<number, DriverSlot>>();
@@ -123,4 +162,38 @@ export function watchdogInbox(slot: { status: string; paused: boolean }, peek: P
     return { count: peek.unclaimed_count, msg_types: peek.unclaimed_msg_types, oldest_at: peek.unclaimed_oldest_at };
   }
   return { count: peek.count, msg_types: peek.msg_types, oldest_at: peek.oldest_at };
+}
+
+// --- Dead slot cleanup ---
+
+/** A slot that has been disconnected this long may be an orphan */
+export const DEAD_SLOT_AFTER_MS = 5 * 60 * 1000;
+
+export interface DeadSlotInput {
+  slot: { status: string; task_state: string; last_connected: number | null; last_disconnected: number | null; paused?: boolean | number };
+  /** The slot's process is driven by this host (it controls the lifecycle) */
+  driven: boolean;
+  /** The slot ever sent a message or is assigned a plan item: it took part in the work */
+  tookPart: boolean;
+  /** The session is paused, waits on a person (human gate, Q&A) or is archived */
+  sessionOnHold: boolean;
+  now: number;
+}
+
+/**
+ * Whether the background loop may delete a disconnected slot. Only orphans go:
+ * an agent that connected, never started working and never took part. A slot
+ * whose agent worked — approved, done, released, or just in the middle of it —
+ * stays (shown as offline) until a person removes it, and nothing is deleted
+ * while the session is paused or waits on a person.
+ */
+export function deadSlotVerdict(input: DeadSlotInput): "keep" | "delete" {
+  const { slot } = input;
+  if (slot.status !== "disconnected") return "keep";
+  // Never connected: still starting up
+  if (!slot.last_connected) return "keep";
+  if (input.driven || input.sessionOnHold || slot.paused === true || slot.paused === 1) return "keep";
+  if (slot.task_state !== "idle" || input.tookPart) return "keep";
+  const disconnectedAt = slot.last_disconnected ?? slot.last_connected;
+  return input.now - disconnectedAt >= DEAD_SLOT_AFTER_MS ? "delete" : "keep";
 }

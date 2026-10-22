@@ -181,10 +181,53 @@ export async function runCli(args: string[]): Promise<void> {
       break;
     }
 
+    case "restart":
     case "web": {
+      const isRestart = command === "restart" || args.includes("--restart") || args.includes("-r");
+      if (isRestart) {
+        const { listeningPids } = await import("./update.ts");
+        const webPort = parseInt(process.env.MULTIAGENTS_WEB_PORT ?? "7900", 10);
+        const brokerPort = BROKER_PORT;
+        const pids = new Set([
+          ...(listeningPids(webPort) ?? []),
+          ...(listeningPids(brokerPort) ?? []),
+        ]);
+        if (pids.size > 0) {
+          console.log(`Stopping running instances (${Array.from(pids).join(", ")})...`);
+          for (const pid of pids) {
+            try { process.kill(parseInt(pid, 10), "SIGTERM"); } catch { /* ok */ }
+          }
+          await Bun.sleep(1000);
+        }
+      }
       // Launch web dashboard server (auto-opens browser)
+      const isDaemon = args.includes("--daemon") || args.includes("-d");
       const serverPath = new URL("../dashboard/server.ts", import.meta.url).pathname;
-      const proc = Bun.spawn(["bun", serverPath, ...(args[1] ? [args[1]] : [])], {
+      const targetArgs = args.filter((a) => a !== "--restart" && a !== "-r" && a !== "restart" && a !== "web" && a !== "--daemon" && a !== "-d");
+      const webPort = parseInt(process.env.MULTIAGENTS_WEB_PORT ?? "7900", 10);
+      
+      if (isDaemon) {
+        const path = await import("node:path");
+        const fs = await import("node:fs");
+        const { spawn } = await import("node:child_process");
+        const logFile = path.join(process.env.HOME ?? "", ".local/share/multiagents/server.log");
+        const logFd = fs.openSync(logFile, "a");
+        const bunBin = process.execPath || "/Users/liuzeyu/.local/share/multiagents/bin/bun";
+        const env = { ...process.env, http_proxy: "http://127.0.0.1:3067", https_proxy: "http://127.0.0.1:3067", all_proxy: "http://127.0.0.1:3067" };
+        const child = spawn(bunBin, [serverPath, ...targetArgs], {
+          detached: true,
+          stdio: ["ignore", logFd, logFd],
+          env,
+          cwd: process.cwd(),
+        });
+        child.unref();
+        console.log(`multiagents web dashboard started in background (PID ${child.pid})`);
+        console.log(`URL: http://127.0.0.1:${webPort}`);
+        console.log(`Logs: ${logFile}`);
+        break;
+      }
+
+      const proc = Bun.spawn(["bun", serverPath, ...targetArgs], {
         cwd: process.cwd(),
         stdio: ["inherit", "inherit", "inherit"],
       });

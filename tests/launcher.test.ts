@@ -180,25 +180,14 @@ describe("buildCliArgs — claude and codex", () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildCliArgs — Gemini
+// buildCliArgs — Gemini (upgraded to Antigravity CLI)
 // ---------------------------------------------------------------------------
 describe("buildCliArgs — gemini", () => {
   const task = "Do something";
 
-  test("starts with -y @google/gemini-cli for npx invocation", () => {
+  test("includes --dangerously-skip-permissions for autonomous operation", () => {
     const args = buildCliArgs("gemini", task);
-    expect(args[0]).toBe("-y");
-    expect(args[1]).toBe("@google/gemini-cli");
-  });
-
-  test("includes --sandbox", () => {
-    const args = buildCliArgs("gemini", task);
-    expect(args).toContain("--sandbox");
-  });
-
-  test("includes --approval-mode yolo for autonomous operation", () => {
-    const args = buildCliArgs("gemini", task);
-    expect(getFlagValue(args, "--approval-mode")).toBe("yolo");
+    expect(args).toContain("--dangerously-skip-permissions");
   });
 
   test("includes --output-format stream-json", () => {
@@ -206,16 +195,16 @@ describe("buildCliArgs — gemini", () => {
     expect(getFlagValue(args, "--output-format")).toBe("stream-json");
   });
 
-  test("restricts MCP to multiagents only via --allowed-mcp-server-names", () => {
-    const args = buildCliArgs("gemini", task);
-    expect(getFlagValue(args, "--allowed-mcp-server-names")).toBe("multiagents-peer");
-  });
-
   test("ends with -p and the task", () => {
     const args = buildCliArgs("gemini", task);
     const pIdx = args.lastIndexOf("-p");
     expect(pIdx).toBeGreaterThan(-1);
     expect(args[pIdx + 1]).toBe(task);
+  });
+
+  test("passes optional model flag when specified", () => {
+    const args = buildCliArgs("gemini", task, { model: "gemini-2.5-pro" });
+    expect(getFlagValue(args, "--model")).toBe("gemini-2.5-pro");
   });
 });
 
@@ -487,6 +476,21 @@ describe("detectAgent", () => {
     const result = await detectAgent("codex");
     if (result.available) {
       expect(result.path).toBeDefined();
+    }
+  });
+
+  test("a command override is what has to exist, not the real CLI", async () => {
+    const saved = process.env.MULTIAGENTS_CLAUDE_COMMAND;
+    try {
+      process.env.MULTIAGENTS_CLAUDE_COMMAND = "bun tests/fakes/fake-claude.ts";
+      const found = await detectAgent("claude");
+      expect(found.available).toBe(true);
+      expect(found.path).toMatch(/bun$/);
+      process.env.MULTIAGENTS_CLAUDE_COMMAND = "definitely-not-a-binary --flag";
+      expect((await detectAgent("claude")).available).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.MULTIAGENTS_CLAUDE_COMMAND;
+      else process.env.MULTIAGENTS_CLAUDE_COMMAND = saved;
     }
   });
 

@@ -202,3 +202,42 @@ describe("CodexDriver process lifecycle", () => {
     expect(driver.alive).toBe(false);
   });
 });
+
+describe("CodexDriver approvals and turn settings", () => {
+  test("an approval handler decides command and file-change requests", async () => {
+    const { driver, dir, entries } = await spawnFake();
+    const seen: string[] = [];
+    driver.onApprovalRequest(async (req) => {
+      seen.push(`${req.kind}:${String(req.params.command ?? req.params.itemId)}`);
+      return req.kind === "command" ? "decline" : "acceptForSession";
+    });
+    const first = await driver.startSession({ prompt: "warm up", cwd: dir });
+    await driver.reply(first.threadId, "SCENARIO:command");
+    await driver.reply(first.threadId, "SCENARIO:filechange");
+    await driver.reply(first.threadId, "SCENARIO:legacy");
+    expect(seen).toEqual(["command:rm -rf build", "fileChange:item_fc", "command:ls"]);
+    const responses = Object.fromEntries(entries().filter((e) => e.serverRequest).map((e) => [e.serverRequest, e.response.result]));
+    expect(responses["item/commandExecution/requestApproval"]).toEqual({ decision: "decline" });
+    expect(responses["item/fileChange/requestApproval"]).toEqual({ decision: "acceptForSession" });
+    expect(responses["execCommandApproval"]).toEqual({ decision: "denied" });
+  });
+
+  test("settings changed between turns apply to the next turn/start", async () => {
+    const { driver, dir, entries } = await spawnFake();
+    const first = await driver.startSession({ prompt: "warm up", cwd: dir });
+    driver.settings = { approvalPolicy: "untrusted", model: "gpt-5", effort: "high" };
+    await driver.reply(first.threadId, "next");
+    const turns = entries().filter((e) => e.request === "turn/start").map((e) => e.params);
+    expect(turns[0].approvalPolicy).toBe("never");
+    expect(turns[1]).toMatchObject({ approvalPolicy: "untrusted", model: "gpt-5", effort: "high" });
+  });
+
+  test("a read-only sandbox override (Q&A mode) reaches the next turn", async () => {
+    const { driver, dir, entries } = await spawnFake();
+    const first = await driver.startSession({ prompt: "warm up", cwd: dir });
+    driver.settings = { approvalPolicy: "untrusted", sandbox: "read-only" };
+    await driver.reply(first.threadId, "what is left?");
+    const turns = entries().filter((e) => e.request === "turn/start").map((e) => e.params);
+    expect(turns[1].sandboxPolicy).toMatchObject({ type: "readOnly" });
+  });
+});
