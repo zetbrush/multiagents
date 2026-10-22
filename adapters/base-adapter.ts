@@ -41,6 +41,8 @@ import {
   BROKER_STARTUP_POLL_MS,
   BROKER_STARTUP_MAX_ATTEMPTS,
   SESSION_FILE,
+  HUMAN_SENDER,
+  HUMAN_SENDER_LABEL,
 } from "../shared/constants.ts";
 import { resolveBrokerPort, brokerUrl } from "../shared/broker-url.ts";
 import {
@@ -77,7 +79,7 @@ const TOOLS = [
         },
         agent_type: {
           type: "string" as const,
-          enum: ["claude", "codex", "gemini", "custom", "all"],
+          enum: ["claude", "codex", "gemini", "api", "custom", "all"],
           description: "Optional filter by agent type. Defaults to all.",
         },
       },
@@ -1752,7 +1754,7 @@ export abstract class BaseAdapter {
     const role = msg.from_role ? ` (${msg.from_role})` : "";
     const isOrchestrator = msg.from_id === "orchestrator" || msg.from_id === "__orchestrator__";
     const idTag = msg.from_display_name && !isOrchestrator ? ` [id ${msg.from_id}]` : "";
-    const sender = `${name}${role}${idTag}`;
+    const sender = msg.from_id === HUMAN_SENDER ? HUMAN_SENDER_LABEL : `${name}${role}${idTag}`;
 
     switch (msg.msg_type) {
       case "chat":

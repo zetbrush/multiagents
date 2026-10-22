@@ -211,7 +211,7 @@ Session monitoring stats and enforced limits:
 | Messages Per Agent | Monitor | Per agent | Observe |
 | Longest Idle | Monitor | Per agent | Observe |
 
-Adjustable from the TUI dashboard (+/- keys) or via the `adjust_guardrail` tool; the web dashboard shows them read-only (its `/api/guardrail` endpoint exists but has no UI yet).
+Adjustable from the TUI dashboard (+/- keys), the web dashboard's Stats tab, or the `adjust_guardrail` tool.
 
 ## Web Dashboard
 
@@ -219,16 +219,52 @@ Adjustable from the TUI dashboard (+/- keys) or via the `adjust_guardrail` tool;
 multiagents web [session-id]
 ```
 
-Real-time web dashboard on `localhost:7900` with live WebSocket updates. Auto-opens in browser when a team is created via the orchestrator. 6-tab interface:
+Web control center on `localhost:7900` with live WebSocket updates. Auto-opens in browser when a team is created via the orchestrator, and starts the broker itself when it is not running. Besides watching, you can run a team from the browser. The layout has three panes, and both side panes can be collapsed (`Ctrl+B` / `Ctrl+J`) and resized:
 
-- **Agents**: agent cards with connection status, task state, role, summaries, token usage
-- **Messages**: live message feed with type badges and sender names
-- **Plan**: task progress with completion bar and assignee labels
-- **Knowledge**: shared knowledge entries with categories and provenance
-- **Files**: file locks and ownership zones
-- **Stats**: session metrics (connected agents, working, tokens) and guardrail bars
+- **Left: sessions and an explorer** of the session's project directory (read-only, refreshed while agents work; locked files show a lock).
+- **Center: the team chat.** Your messages sit on the right, the agents' on the left with avatar, role and message type (feedback, task complete, approval…). System notices are folded into small centered lines. Send to one agent or the whole team (Enter sends, Shift+Enter starts a new line, IME-safe). File names that agents mention become links once the file is found in the project.
+- **Right: file preview** (Markdown, code with line numbers, images, PDF, Word `.docx`, CSV, HTML in a sandbox, audio/video). It follows the open file as agents edit it. The **Team** tab lists every agent with quick actions.
 
-Dark theme, responsive layout, keyboard shortcuts (`1-6` to switch tabs).
+Light, dark, or follow the system: pick it from the theme button in the top bar. The language button switches between English and 中文 (Chinese is the default for a Chinese-language browser). Text the agents write stays as they wrote it.
+
+**Making it yours.** Agents show their CLI's icon (Claude, Gemini; Codex gets a neutral terminal glyph because OpenAI's logo isn't redistributable). Click an avatar on an agent card or in its settings to use initials, a color or your own image instead. The **Appearance** button in the top bar sets a background image under the whole page, how strongly it shows, how see-through the panels are, and your own avatar. These choices are kept in the browser (localStorage), not on the server.
+
+**Watching and approving each step.** The **Activity** tab is a live timeline of what every agent does: its thinking, the files it reads, each edit as a diff, every command with its output, and the cost of each turn. Claude and Codex report every step; Gemini reports its tool calls. Each agent has an approval mode (**Settings** on its card, or when you add it):
+
+| Mode | Claude | Codex |
+|---|---|---|
+| Fully autonomous (default) | `bypassPermissions` | approval policy `never` |
+| Auto review — the CLI's reviewer passes safe steps, risky ones come to you | `auto` | `on-request` |
+| Auto-approve edits — commands and other tools ask | `acceptEdits` | `untrusted` |
+| Ask me every step | `default` | `untrusted` |
+
+A step that needs you shows up as a card with the exact command or diff: **Allow**, **Always allow** (this tool, or this shell program, for the rest of the agent's session), or **Deny** with a note the agent reads. Team-protocol tools (`check_messages`, `send_message`…) never ask. Gemini runs unattended (yolo), so it is always fully autonomous.
+
+**Models, usage and limit locks.** The same Settings dialog switches an agent's model (an alias such as `opus`/`sonnet`, or a full name) and its effort. Claude switches live via `set_model`; Codex switches at its next turn; Gemini and Claude's effort switch at the agent's next start. The **Usage** tab shows tokens (input, output, cache reads) and Claude's reported cost per agent. There you can set limits per agent or for the whole session, in tokens or USD. An agent that reaches a limit is paused and its running turn is interrupted; raise the limit, then resume it.
+
+**Plan limits (5-hour / weekly).** The **Usage** tab starts with each CLI's subscription quota, read the way the CLIs' own `/usage` screens read it and without starting a model turn; the fullest window of each also shows in the top bar. Claude: the claude.ai plan's 5-hour window and weekly windows (all models, Opus, Sonnet, per-model ones), via Claude Code's `get_usage` control request. Codex: the ChatGPT plan's 5-hour (primary) and weekly (secondary) windows, via `account/rateLimits/read`. Gemini has no 5-hour or weekly windows; with a Google login it shows the daily per-model quota (Code Assist `retrieveUserQuota`, using the token Gemini CLI stored, only while it is valid). API-key logins have no plan windows and say so. Answers are cached for two minutes; **Refresh** asks again.
+
+**Other models (any OpenAI-compatible API).** Besides Claude, Codex and Gemini, an agent can run on DeepSeek, Qwen, Kimi, GLM, OpenRouter, a local Ollama, the OpenAI API, or anything else with an OpenAI-compatible chat API. Add the service under **More ▾ → API providers…** (or **Manage providers…** in Add Agent / New Team): a name, the base URL (the part before `/chat/completions`), the API key and a default model — presets fill in the URL of the well-known ones, **Fetch models** reads the model list, an optional price per million tokens turns on cost and cost limits, and extra request fields (JSON) pass provider options such as Qwen's built-in web search. Keys stay in `~/.multiagents/providers.json` (mode 0600) and never reach the page; `$NAME` reads a key from an environment variable. Then pick **Other (OpenAI-compatible API)** as the agent type. Such an agent works like the others: it talks to the team and to you with the same team tools, reads, edits and searches the project's files and runs commands (inside the project directory), and fetches web pages; its thinking streams into the chat, its steps fill the Activity timeline, approval modes, Q&A mode, interrupting, live model switches, token and cost accounting and limit locks all apply. It is driven in-process by the dashboard, so no CLI is installed; plan limits (5-hour / weekly) do not exist for API keys.
+
+**Talking to agents while they work.** Pick one agent under **To** and ask it anything: agents reply to you with `send_message(to_id="human")` and the answer lands in the chat. Tick **Interrupt** to stop what that agent is doing first, so it answers you right away. **Q&A mode** (session toolbar) puts the whole team on hold: every running turn stops, agents are told to wait and only answer you, edits and commands are refused (reading files stays allowed, so they can check before answering), and teammates' messages wait. Ask one agent, then another; **End Q&A** resumes everyone where they stopped, with the messages that waited.
+
+**Seeing an agent think.** While an agent works, the chat shows it under the last message: typing dots, what it is doing (thinking, writing a reply, running `$ bun test`…) and how long, and its thinking as it forms, token by token (Claude with `--include-partial-messages`, Codex reasoning summaries, Gemini replies). **Collapse** keeps it to a few lines.
+
+The tabs in the center hold everything else:
+
+- **Sessions** (sidebar): New Team, empty session, open, pause/resume, relaunch disconnected agents, export JSON, archive, end, delete (typed confirmation)
+- **Agents**: message, pause/resume, change role, rename, send back for revision, release, remove; Add Agent; Release all approved / Release all
+- **Plan**: add, edit, reassign, change status (pending / in progress / blocked / done), delete
+- **Knowledge**: add, edit, delete entries by category
+- **Locks**: locks with holder and expiry, force unlock, reserve a file for an agent, assign ownership zones
+- **Activity**: the step-by-step timeline and pending approvals (see above)
+- **Usage**: plan limits, tokens and cost per agent, limit locks, and guardrail steppers (changes logged as "Adjusted via web dashboard")
+
+**Human gate.** A team started from the browser can wait for you once every agent is approved: instead of ending itself, the session shows *Waiting for human approval* with **Approve & Release** and **Send back for revision** (actionable feedback to a worker, which restarts the review loop). Toggle it per session with the `human gate` chip; MCP's `create_team` takes `human_gate: true`.
+
+Teams and agents launched from the browser are supervised by the dashboard process (the same orchestrator runtime the MCP server runs), so keep `multiagents web` running while they work; stopping it stops them. Agents another orchestrator launched stay under that orchestrator. See [docs/web-control-center.md](docs/web-control-center.md) for the API.
+
+On narrow screens the side panes become drawers. Keyboard shortcuts: `1-6` switch tabs.
 
 ## TUI Dashboard
 
@@ -278,6 +314,7 @@ multiagents/
 │   ├── broker-client.ts    HTTP client for broker API
 │   ├── broker-url.ts       The one place MULTIAGENTS_PORT is resolved
 │   ├── constants.ts        Ports, intervals, thresholds
+│   ├── session-ops.ts      Session create/export shared by the CLI and the web dashboard
 │   ├── summarize.ts        Git-based activity summary (no API calls)
 │   └── utils.ts            Shared utilities
 ├── adapters/
@@ -289,9 +326,14 @@ multiagents/
 │   ├── gemini-adapter.ts   Gemini adapter (tool-result delivery + file inbox)
 │   └── role-practices.ts   Role-specific best practices injection
 ├── orchestrator/
-│   ├── orchestrator-server.ts  Orchestrator MCP server (team management, driver delivery loop)
+│   ├── orchestrator-server.ts  Orchestrator MCP server (stdio host of runtime.ts)
+│   ├── runtime.ts          Orchestrator runtime: tools, agent processes, supervision loops (shared with the web dashboard)
+│   ├── activity.ts         Activity timeline from each CLI's stream; tool approvals through the broker
+│   ├── live.ts             What each agent is doing right now (streamed thinking, typing indicator)
+│   ├── plan-usage.ts       Subscription plan limits of the CLIs (5-hour / weekly / daily)
 │   ├── claude-driver.ts    ClaudeDriver: long-lived `claude -p --input-format stream-json` session
 │   ├── codex-driver.ts     CodexDriver: persistent codex app-server via JSON-RPC (steer/interrupt)
+│   ├── api-driver.ts       ApiDriver: agents on any OpenAI-compatible API (team + local tools, Claude-style events)
 │   ├── delivery.ts         Hands unacked messages to drivers, acks on confirmed hand-off
 │   ├── launcher.ts         Agent spawning (drivers, MCP configs, prompts)
 │   ├── monitor.ts          Process/driver monitoring (event parsing, token tracking)
@@ -311,7 +353,12 @@ multiagents/
 │   └── update.ts           `multiagents update`
 ├── dashboard/
 │   ├── server.ts           Web dashboard (Bun.serve + WebSocket, localhost:7900)
-│   └── index.html          Web dashboard UI
+│   ├── control.ts          Web control API (POST /api/*)
+│   ├── files.ts            Read-only project files for the explorer and preview (GET /api/fs/*)
+│   ├── index.html          Web dashboard layout
+│   ├── app.js              Web dashboard UI logic
+│   ├── i18n.js             Web dashboard translations (English / 中文)
+│   └── styles.css          Web dashboard themes and layout
 └── scripts/
     ├── version.ts          Version bump + release commit/tag
     ├── postinstall.ts      Configures MCP servers after install

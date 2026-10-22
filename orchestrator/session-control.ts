@@ -32,6 +32,7 @@ export async function controlSession(
   brokerClient: BrokerClient,
   target?: string,
   value?: number,
+  opts: { changedBy?: string; reason?: string } = {},
 ): Promise<ControlResult> {
   switch (action) {
     case "pause_all":
@@ -93,7 +94,8 @@ export async function controlSession(
         session_id: sessionId,
         guardrail_id: target,
         new_value: value,
-        changed_by: "orchestrator",
+        changed_by: opts.changedBy ?? "orchestrator",
+        reason: opts.reason,
       });
 
       // Check if this resolves a pause
@@ -264,6 +266,7 @@ export async function broadcastToTeam(
   message: string,
   brokerClient: BrokerClient,
   excludeRoles?: string[],
+  fromId = "orchestrator",
 ): Promise<{ delivered_to: number }> {
   const slots = await brokerClient.listSlots(sessionId);
   const excludeSet = new Set((excludeRoles ?? []).map((r) => r.toLowerCase()));
@@ -279,7 +282,7 @@ export async function broadcastToTeam(
     if (slot.role && excludeSet.has(slot.role.toLowerCase())) continue;
 
     await brokerClient.sendMessage({
-      from_id: "orchestrator",
+      from_id: fromId,
       to_id: slot.peer_id,
       text: message,
       msg_type: "broadcast",

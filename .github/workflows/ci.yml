@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Run it by hand from the Actions tab (Run workflow) on any branch
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -108,7 +108,7 @@ describe.skipIf(!LIVE)("live: Claude driver end-to-end", () => {
       const unacked = await post("/peek-undelivered", { slot_id: launched.slotId });
       expect(unacked.count).toBe(0);
     } finally {
-      console.log(`[live] session=${driver.sessionId} turns=${driver.turnsCompleted}\n[live] observed events:\n${observed.join("\n")}`);
+      console.log(`[live] session=${driver.sessionId} turns=${(driver as { turnsCompleted?: number }).turnsCompleted}\n[live] observed events:\n${observed.join("\n")}`);
       const code = await driver.close(30_000);
       expect(code).toBe(0);
     }

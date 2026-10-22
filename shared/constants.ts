@@ -18,6 +18,7 @@ export const POLL_INTERVALS: Record<AgentType, number> = {
   claude: 1000, // Also pushes a channel notification; headless sessions drop those
   codex: 300, // Aggressive: piggyback delivery depends on fast buffering
   gemini: 300, // Same as Codex — no push capability
+  api: 1000, // Driver-managed (the adapter runs in driver mode)
   custom: 500, // Reasonable default for unknown agents
 };
 
@@ -48,6 +49,7 @@ export const AGENT_ID_PREFIXES: Record<AgentType, string> = {
   claude: "cl",
   codex: "cx",
   gemini: "gm",
+  api: "ap",
   custom: "cu",
 };
 
@@ -148,3 +150,18 @@ export const FLAP_WINDOW_MS = 5 * 60 * 1000; // 5 min window for flap detection
 export const FLAP_THRESHOLD = 3; // crashes in window before declaring flapping
 export const GUARDRAIL_CHECK_INTERVAL = 30_000; // 30s
 export const CONFLICT_CHECK_INTERVAL = 10_000; // 10s
+
+// --- The person at the dashboard ---
+
+/** Sender / recipient id of the person using the web dashboard. */
+export const HUMAN_SENDER = "human";
+/** How agents see that sender, with the id to reply to. */
+export const HUMAN_SENDER_LABEL = 'The human user (reply with send_message to_id="human")';
+
+/**
+ * What this broker build can do, reported on /health. The broker is a daemon
+ * that keeps running old code across updates; a dashboard that misses a
+ * feature here offers to restart it. Add an entry with each new endpoint or
+ * behavior the dashboard depends on.
+ */
+export const BROKER_FEATURES = ["human-target", "qa-mode", "live-activity", "graceful-restart"] as const;

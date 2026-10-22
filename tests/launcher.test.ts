@@ -490,6 +490,21 @@ describe("detectAgent", () => {
     }
   });
 
+  test("a command override is what has to exist, not the real CLI", async () => {
+    const saved = process.env.MULTIAGENTS_CLAUDE_COMMAND;
+    try {
+      process.env.MULTIAGENTS_CLAUDE_COMMAND = "bun tests/fakes/fake-claude.ts";
+      const found = await detectAgent("claude");
+      expect(found.available).toBe(true);
+      expect(found.path).toMatch(/bun$/);
+      process.env.MULTIAGENTS_CLAUDE_COMMAND = "definitely-not-a-binary --flag";
+      expect((await detectAgent("claude")).available).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.MULTIAGENTS_CLAUDE_COMMAND;
+      else process.env.MULTIAGENTS_CLAUDE_COMMAND = saved;
+    }
+  });
+
   test("returns available: false for custom type", async () => {
     const result = await detectAgent("custom");
     expect(result.available).toBe(false);

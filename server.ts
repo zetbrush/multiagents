@@ -35,6 +35,12 @@ async function main() {
       await new GeminiAdapter().start();
       break;
     }
+    case "api": {
+      // API agents get Claude's team tools in driver mode, registered under their own type
+      const { ClaudeAdapter } = await import("./adapters/claude-adapter.ts");
+      await new ClaudeAdapter("api").start();
+      break;
+    }
     default: {
       // For 'custom' or unknown types, fall back to Claude adapter behavior
       const { ClaudeAdapter } = await import("./adapters/claude-adapter.ts");

@@ -57,6 +57,27 @@ export interface CodexSessionOptions {
   model?: string;
 }
 
+/** Turn settings that can change between turns. */
+export interface CodexTurnSettings {
+  /** never | on-request | on-failure | untrusted */
+  approvalPolicy: string;
+  model?: string;
+  /** Reasoning effort: minimal | low | medium | high */
+  effort?: string;
+  /** Overrides the thread's sandbox for the next turns (Q&A mode: read-only) */
+  sandbox?: "read-only";
+}
+
+/** A command or file change waiting for approval (item/*\/requestApproval). */
+export interface CodexApprovalRequest {
+  kind: "command" | "fileChange" | "permissions";
+  method: string;
+  params: Record<string, unknown>;
+}
+
+export type CodexApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
+export type CodexApprovalHandler = (req: CodexApprovalRequest) => Promise<CodexApprovalDecision>;
+
 export interface CodexSpawnOptions {
   /** Command to run instead of `codex app-server` (tests use a fake). */
   command?: string[];
@@ -129,6 +150,9 @@ export class CodexDriver {
    *  Unlike _lastActivity, this is NOT updated by heartbeat responses. */
   private _lastNotificationActivity = Date.now();
   private _approvalsReviewer: string | null = null;
+  private _approvalHandler: CodexApprovalHandler | null = null;
+  /** Applied to every thread/start, thread/resume and turn/start from now on. */
+  settings: CodexTurnSettings = { approvalPolicy: "never" };
   private _threadStatus: string = "notLoaded";
   private _activeFlags: string[] = [];
   private _activeItems = 0;
@@ -201,6 +225,9 @@ export class CodexDriver {
     this._onExitCallbacks.push(cb);
   }
 
+  /** Who answers approval requests; without one they are accepted for the session. */
+  onApprovalRequest(handler: CodexApprovalHandler): void { this._approvalHandler = handler; }
+
   /** Register a listener for notifications from the app-server. */
   onNotification(cb: NotificationListener): void { this._notificationListeners.push(cb); }
 
@@ -247,7 +274,7 @@ export class CodexDriver {
   async startSession(opts: CodexSessionOptions): Promise<CodexTurnResult> {
     log(LOG_PREFIX, `Starting session: ${opts.prompt.slice(0, 100)}...`);
 
-    const threadParams: Record<string, unknown> = { approvalPolicy: "never" };
+    const threadParams: Record<string, unknown> = { approvalPolicy: this.settings.approvalPolicy };
     if (opts.cwd) threadParams.cwd = opts.cwd;
     if (opts.sandbox) threadParams.sandbox = opts.sandbox;
     if (opts.developerInstructions) threadParams.developerInstructions = opts.developerInstructions;
@@ -269,7 +296,7 @@ export class CodexDriver {
     const turnInput: Record<string, unknown> = {
       threadId,
       input: [{ type: "text", text: opts.prompt }],
-      approvalPolicy: "never",
+      approvalPolicy: this.settings.approvalPolicy,
     };
     if (opts.cwd) turnInput.cwd = opts.cwd;
     if (opts.sandbox) turnInput.sandboxPolicy = sandboxPolicyObject(opts.sandbox, opts.cwd);
@@ -285,7 +312,7 @@ export class CodexDriver {
    * continue it. Throws if the app-server does not know the thread.
    */
   async resumeSession(opts: { threadId: string } & Omit<CodexSessionOptions, "prompt">): Promise<void> {
-    const params: Record<string, unknown> = { threadId: opts.threadId, approvalPolicy: "never" };
+    const params: Record<string, unknown> = { threadId: opts.threadId, approvalPolicy: this.settings.approvalPolicy };
     if (opts.cwd) params.cwd = opts.cwd;
     if (opts.sandbox) params.sandbox = opts.sandbox;
     if (opts.developerInstructions) params.developerInstructions = opts.developerInstructions;
@@ -310,7 +337,7 @@ export class CodexDriver {
     const result = await this.startTurnAndWait(threadId, {
       threadId,
       input: [{ type: "text", text: prompt }],
-      approvalPolicy: "never",
+      approvalPolicy: this.settings.approvalPolicy,
     });
 
     log(LOG_PREFIX, `Reply complete: content=${result.content.slice(0, 100)}...`);
@@ -353,6 +380,11 @@ export class CodexDriver {
     }
   }
 
+  /** Send any app-server request (account reads and the like) and wait for its result. */
+  request(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
+    return this.sendRequest(method, params, timeoutMs);
+  }
+
   async kill(): Promise<void> {
     if (!this._alive) return;
     this.stopHeartbeat();
@@ -369,6 +401,10 @@ export class CodexDriver {
     params: Record<string, unknown>,
     timeoutMs = 10 * 60_000,
   ): Promise<CodexTurnResult> {
+    params = { ...params, approvalPolicy: this.settings.approvalPolicy };
+    if (this.settings.model) params.model = this.settings.model;
+    if (this.settings.effort) params.effort = this.settings.effort;
+    if (this.settings.sandbox) params.sandboxPolicy = sandboxPolicyObject(this.settings.sandbox);
     const turnMeta = await this.sendRequest("turn/start", params, 30_000) as {
       turn?: { id: string; status: string };
     };
@@ -651,10 +687,18 @@ export class CodexDriver {
     switch (method) {
       case "item/commandExecution/requestApproval":
       case "item/fileChange/requestApproval":
-        return this.writeResponse(id, { result: { decision: "acceptForSession" } });
+        if (!this._approvalHandler) return this.writeResponse(id, { result: { decision: "acceptForSession" } });
+        void this.askApproval(method === "item/fileChange/requestApproval" ? "fileChange" : "command", method, params)
+          .then((decision) => this.writeResponse(id, { result: { decision } }));
+        return;
       case "execCommandApproval":
-      case "applyPatchApproval":
-        return this.writeResponse(id, { result: { decision: "approved_for_session" } });
+      case "applyPatchApproval": {
+        if (!this._approvalHandler) return this.writeResponse(id, { result: { decision: "approved_for_session" } });
+        const legacy: Record<CodexApprovalDecision, string> = { accept: "approved", acceptForSession: "approved_for_session", decline: "denied", cancel: "abort" };
+        void this.askApproval(method === "applyPatchApproval" ? "fileChange" : "command", method, params)
+          .then((decision) => this.writeResponse(id, { result: { decision: legacy[decision] } }));
+        return;
+      }
       case "item/permissions/requestApproval":
         return this.writeResponse(id, { result: { permissions: params.permissions ?? {}, scope: "session" } });
       case "item/tool/requestUserInput":
@@ -670,6 +714,15 @@ export class CodexDriver {
         });
       default:
         return this.writeResponse(id, { error: { code: -32601, message: `${method} is not supported by multiagents-orchestrator` } });
+    }
+  }
+
+  private async askApproval(kind: CodexApprovalRequest["kind"], method: string, params: Record<string, unknown>): Promise<CodexApprovalDecision> {
+    try {
+      return await this._approvalHandler!({ kind, method, params });
+    } catch (err) {
+      log(LOG_PREFIX, `Approval handler failed (${err instanceof Error ? err.message : err}) — declining`);
+      return "decline";
     }
   }
 

@@ -157,3 +157,73 @@ describe("ClaudeDriver lifecycle", () => {
     expect(driver.alive).toBe(false);
   });
 });
+
+describe("ClaudeDriver control protocol", () => {
+  test("permission modes: bypass skips checks; other modes route prompts to the host and keep bypass switchable", () => {
+    const bypass = buildClaudeArgs({ mcpConfig: MCP });
+    expect(bypass[bypass.indexOf("--permission-prompt-tool") + 1]).toBe("stdio");
+    expect(bypass).toContain("--dangerously-skip-permissions");
+
+    const edits = buildClaudeArgs({ mcpConfig: MCP, permissionMode: "acceptEdits", effort: "high" });
+    expect(edits).not.toContain("--dangerously-skip-permissions");
+    expect(edits).toContain("--allow-dangerously-skip-permissions");
+    expect(edits[edits.indexOf("--permission-mode") + 1]).toBe("acceptEdits");
+    expect(edits[edits.indexOf("--effort") + 1]).toBe("high");
+
+    const ask = buildClaudeArgs({ mcpConfig: MCP, permissionMode: "default" });
+    expect(ask).not.toContain("--permission-mode");
+    expect(ask).not.toContain("--dangerously-skip-permissions");
+  });
+
+  test("a tool call waits for the host's decision; a denial reaches the model as a failed tool result", async () => {
+    const { driver } = await spawnFake({ permissionMode: "default" });
+    const asked: string[] = [];
+    driver.onPermissionRequest(async (req) => {
+      asked.push(`${req.toolName}:${String(req.input.command ?? req.input.file_path)}`);
+      return req.toolName === "Bash" ? { behavior: "deny", message: "not now" } : { behavior: "allow" };
+    });
+    const results: Array<{ content: string; is_error: boolean }> = [];
+    driver.onEvent((e) => {
+      if (e.type === "user") for (const b of (e.message as any)?.content ?? []) if (b.type === "tool_result") results.push({ content: b.content, is_error: b.is_error });
+    });
+    const turn = await driver.prompt("go TOOL:Bash:rm-rf TOOL:Read:notes.md");
+    expect(turn.subtype).toBe("success");
+    expect(asked).toEqual(["Bash:rm-rf", "Read:notes.md"]);
+    expect(results).toEqual([{ content: "denied: not now", is_error: true }, { content: "ran Read notes.md", is_error: false }]);
+  });
+
+  test("a prompt that arrives before a handler is set waits for it", async () => {
+    const { driver } = await spawnFake({ permissionMode: "default" });
+    const turn = driver.prompt("TOOL:Write:a.txt");
+    await Bun.sleep(300);
+    driver.onPermissionRequest(async () => ({ behavior: "allow" }));
+    expect((await turn).subtype).toBe("success");
+  });
+
+  test("set_model and set_permission_mode are sent as control requests; a refused mode name falls back to its alias", async () => {
+    const { driver, entries } = await spawnFake({ firstPrompt: "hi", model: "haiku" }, { FAKE_CLAUDE_REJECT_MODES: "default" });
+    expect(driver.model).toBe("haiku");
+    await driver.setModel("opus");
+    expect(driver.model).toBe("opus");
+    await driver.setPermissionMode("default");
+    expect(driver.permissionMode).toBe("default");
+    const sent = entries().filter((e) => e.stdin?.type === "control_request").map((e) => e.stdin.request);
+    expect(sent).toEqual([
+      { subtype: "set_model", model: "opus" },
+      { subtype: "set_permission_mode", mode: "default" },
+      { subtype: "set_permission_mode", mode: "manual" },
+    ]);
+  });
+
+  test("interrupt ends the running turn", async () => {
+    const { driver } = await spawnFake({ permissionMode: "default" });
+    let release!: () => void;
+    driver.onPermissionRequest(() => new Promise((resolve) => { release = () => resolve({ behavior: "allow" }); }));
+    const turn = driver.prompt("TOOL:Bash:long TOOL:Bash:more");
+    await waitFor(() => typeof release === "function");
+    await driver.interrupt();
+    release();
+    const result = await turn;
+    expect(result.isError).toBe(true);
+  });
+});
