@@ -30,6 +30,7 @@ type PipedSubprocess = Subprocess<"pipe", "pipe", "pipe">;
 const LOG_PREFIX = "antigravity-driver";
 const STDERR_TAIL_LINES = 5;
 const EXIT_DRAIN_MS = 250;
+export const EARLY_EVENT_LIMIT = 1000;
 
 export interface AntigravityLaunchOptions {
   model?: string;
@@ -101,6 +102,8 @@ export class AntigravityDriver {
   private _exitCode: number | null = null;
   private _onExit: Array<(code: number) => void> = [];
   private _listeners: AntigravityEventListener[] = [];
+  /** The newest EARLY_EVENT_LIMIT events from before the first listener attached; that listener gets them. */
+  private _early: AntigravityEvent[] | null = [];
   private _initWaiter: { resolve: () => void; reject: (e: Error) => void } | null = null;
   private _initPromise: Promise<void> | null = null;
   private _turnWaiters: Array<{ resolve: (r: AntigravityTurnResult) => void; reject: (e: Error) => void }> = [];
@@ -151,7 +154,16 @@ export class AntigravityDriver {
     }
     this._onExit.push(cb);
   }
-  onEvent(cb: AntigravityEventListener): void { this._listeners.push(cb); }
+  onEvent(cb: AntigravityEventListener): void {
+    this._listeners.push(cb);
+    const early = this._early ?? [];
+    this._early = null;
+    for (const event of early) this.notify(cb, event);
+  }
+
+  private notify(listener: AntigravityEventListener, event: AntigravityEvent): void {
+    try { listener(event); } catch { /* listener errors must not break the reader */ }
+  }
 
   /** Spawn the session; with `firstPrompt` this resolves once the session reported init. */
   static async spawn(opts: AntigravityDriverOptions): Promise<AntigravityDriver> {
@@ -277,9 +289,8 @@ export class AntigravityDriver {
 
   private handleEvent(event: AntigravityEvent): void {
     this._lastActivity = Date.now();
-    for (const listener of this._listeners) {
-      try { listener(event); } catch { /* listener errors must not break the reader */ }
-    }
+    if (this._early && this._early.push(event) > EARLY_EVENT_LIMIT) this._early.shift();
+    for (const listener of this._listeners) this.notify(listener, event);
 
     switch (event.event) {
       case "init": {

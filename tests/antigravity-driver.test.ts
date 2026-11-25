@@ -8,7 +8,7 @@ import { test, expect, describe, afterEach } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { AntigravityDriver, buildAntigravityArgs } from "../orchestrator/antigravity-driver.ts";
+import { AntigravityDriver, buildAntigravityArgs, EARLY_EVENT_LIMIT } from "../orchestrator/antigravity-driver.ts";
 
 const FAKE = new URL("./fakes/fake-agy.ts", import.meta.url).pathname;
 const drivers: AntigravityDriver[] = [];
@@ -197,6 +197,39 @@ describe("AntigravityDriver turns", () => {
     driver.onEvent((event) => { seen.push(event.event); });
     await driver.prompt("hello");
     expect(seen).toContain("step_update");
+    expect(seen.at(-1)).toBe("result");
+  });
+
+  test("events from before the first listener attached are handed to it, in order and once", async () => {
+    const { driver } = await spawnFake({ firstPrompt: "early turn" });
+    await waitFor(() => driver.turnsCompleted === 1);
+
+    const seen: string[] = [];
+    driver.onEvent((event) => { seen.push(event.event); });
+    expect(seen[0]).toBe("init");
+    expect(seen.at(-1)).toBe("result");
+    expect(seen.filter((e) => e === "result")).toHaveLength(1);
+
+    const late: string[] = [];
+    driver.onEvent((event) => { late.push(event.event); });
+    expect(late).toEqual([]);
+
+    await driver.prompt("second turn");
+    expect(seen.filter((e) => e === "result")).toHaveLength(2);
+    expect(late.at(-1)).toBe("result");
+  });
+
+  test("a session nobody listens to keeps only its latest events", async () => {
+    const { driver } = await spawnFake();
+    // the fake emits four events per turn
+    const turns = Math.ceil(EARLY_EVENT_LIMIT / 4) + 5;
+    for (let i = 0; i < turns; i++) void driver.send(`turn ${i}`, { awaitEcho: false, echoTimeoutMs: Infinity });
+    await waitFor(() => driver.turnsCompleted === turns, 20_000);
+
+    const seen: string[] = [];
+    driver.onEvent((event) => { seen.push(event.event); });
+    expect(seen).toHaveLength(EARLY_EVENT_LIMIT);
+    expect(seen[0]).not.toBe("init");
     expect(seen.at(-1)).toBe("result");
   });
 });

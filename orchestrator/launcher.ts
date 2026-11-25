@@ -204,11 +204,7 @@ async function ensureAntigravityMcpConfig(projectDir: string, portOverride: stri
     throw new Error(`${workspacePath} is not a valid JSON object — fix or remove it, then launch the Antigravity agent again`);
   }
   delete workspace.servers["multiagents"];
-  const entry: Record<string, unknown> = { ...(workspace.servers["multiagents-peer"] as Record<string, unknown> | undefined), ...antigravityMcpServer() };
-  const env = { ...((entry.env as Record<string, string> | undefined) ?? {}) };
-  if (portOverride) env.MULTIAGENTS_PORT = portOverride; else delete env.MULTIAGENTS_PORT;
-  if (Object.keys(env).length > 0) entry.env = env; else delete entry.env;
-  workspace.servers["multiagents-peer"] = entry;
+  workspace.servers["multiagents-peer"] = antigravityPeerEntry(workspace.servers["multiagents-peer"], portOverride);
   await writeAntigravityMcpConfig(workspacePath, workspace);
 
   const globalPath = antigravityMcpConfigPath();
@@ -217,11 +213,20 @@ async function ensureAntigravityMcpConfig(projectDir: string, portOverride: stri
     log(LOG_PREFIX, `${globalPath} is not valid JSON — left as it is`);
     return;
   }
-  const shadowing = global.servers["multiagents-peer"] as Record<string, unknown> | undefined;
+  const shadowing = global.servers["multiagents-peer"];
   if (!shadowing && !("multiagents" in global.servers)) return;
   delete global.servers["multiagents"];
-  if (shadowing) global.servers["multiagents-peer"] = { ...shadowing, ...antigravityMcpServer() };
+  if (shadowing) global.servers["multiagents-peer"] = antigravityPeerEntry(shadowing, portOverride);
   await writeAntigravityMcpConfig(globalPath, global);
+}
+
+/** An existing multiagents-peer entry pointed at this install and the launcher's broker port; its other settings stay. */
+function antigravityPeerEntry(existing: unknown, portOverride: string | null): Record<string, unknown> {
+  const entry: Record<string, unknown> = { ...(existing as Record<string, unknown> | undefined), ...antigravityMcpServer() };
+  const env = { ...((entry.env as Record<string, string> | undefined) ?? {}) };
+  if (portOverride) env.MULTIAGENTS_PORT = portOverride; else delete env.MULTIAGENTS_PORT;
+  if (Object.keys(env).length > 0) entry.env = env; else delete entry.env;
+  return entry;
 }
 
 type TomlTable = { head: string; lines: string[] };

@@ -20,6 +20,8 @@ import {
   antigravityMcpServer,
   launchAgent,
 } from "../orchestrator/launcher.ts";
+import type { AntigravityDriver } from "../orchestrator/antigravity-driver.ts";
+import { monitorAntigravityDriver } from "../orchestrator/monitor.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 import { FULL_PROTOCOL, SHORT_PROTOCOL } from "../adapters/protocol-text.ts";
 
@@ -715,6 +717,24 @@ describe("ensureMcpConfigs — antigravity", () => {
     expect(servers.linter).toEqual({ command: "lint-mcp" });
   });
 
+  test("a global multiagents-peer entry follows the broker port like the project one", async () => {
+    const stale = { command: "/other/bun", args: ["/other/install/server.ts", "--agent-type", "antigravity"], env: { MULTIAGENTS_PORT: "17998", DEBUG: "1" } };
+    writeGlobal(JSON.stringify({ mcpServers: { "multiagents-peer": stale } }));
+    const globalEntry = () => JSON.parse(fs.readFileSync(globalPath, "utf-8")).mcpServers["multiagents-peer"];
+
+    const previous = process.env.MULTIAGENTS_PORT;
+    process.env.MULTIAGENTS_PORT = "17999";
+    try {
+      await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+    } finally {
+      if (previous === undefined) delete process.env.MULTIAGENTS_PORT; else process.env.MULTIAGENTS_PORT = previous;
+    }
+    expect(globalEntry()).toEqual({ ...antigravityMcpServer(), env: { MULTIAGENTS_PORT: "17999", DEBUG: "1" } });
+
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+    expect(globalEntry()).toEqual({ ...antigravityMcpServer(), env: { DEBUG: "1" } });
+  });
+
   test("a global multiagents entry is dropped so the agent does not load the tools twice", async () => {
     writeGlobal(JSON.stringify({ mcpServers: { multiagents: { command: "bun", args: ["server.ts", "--agent-type", "agy"] }, linter: { command: "lint-mcp" } } }));
 
@@ -755,6 +775,44 @@ describe("ensureMcpConfigs — antigravity", () => {
     for (let i = 0; i < 50 && alive(); i++) await Bun.sleep(100);
     expect(alive()).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, ".multiagents", "slots", `${pid}.json`))).toBe(false);
+  });
+
+  test("a first turn that finishes during a slow slot update still reaches the monitor", async () => {
+    const FAKE_AGY = new URL("./fakes/fake-agy.ts", import.meta.url).pathname;
+    const previous = { command: process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND, log: process.env.FAKE_AGY_LOG };
+    process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND = `bun ${FAKE_AGY}`;
+    process.env.FAKE_AGY_LOG = path.join(tmpDir, "agy.log");
+    const updates: Array<Record<string, unknown>> = [];
+    let launching = true;
+    const broker = {
+      createSlot: async () => ({ id: 42 }),
+      updateSlot: async (update: Record<string, unknown>) => {
+        updates.push(update);
+        if (launching) await Bun.sleep(300);
+        return {};
+      },
+      getSlot: async () => ({ task_state: "working" }),
+    } as any;
+    const tokenUpdate = () => updates.find((u) => u.input_tokens !== undefined);
+    let driver: AntigravityDriver | undefined;
+    try {
+      const launched = await launchAgent("agy-session", tmpDir, {
+        agent_type: "antigravity", name: "Designer", role: "UI/UX Designer", role_description: "", initial_task: "draw the screen",
+      }, broker);
+      launching = false;
+      driver = launched.antigravityDriver!;
+      for (let i = 0; i < 100 && driver.turnsCompleted === 0; i++) await Bun.sleep(50);
+      expect(driver.turnsCompleted).toBe(1);
+
+      monitorAntigravityDriver(driver, 42, "agy-session", broker, () => {});
+      for (let i = 0; i < 100 && !tokenUpdate(); i++) await Bun.sleep(20);
+
+      expect(tokenUpdate()).toEqual({ id: 42, input_tokens: 100, output_tokens: 20, cache_read_tokens: 40 });
+    } finally {
+      await driver?.kill();
+      if (previous.command === undefined) delete process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND; else process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND = previous.command;
+      if (previous.log === undefined) delete process.env.FAKE_AGY_LOG; else process.env.FAKE_AGY_LOG = previous.log;
+    }
   });
 
   test("launching a Claude agent writes no Antigravity config", async () => {
