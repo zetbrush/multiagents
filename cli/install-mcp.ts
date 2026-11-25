@@ -11,7 +11,10 @@
  * Gemini CLI: `gemini mcp add -s user --trust` → writes to ~/.gemini/settings.json
  *   Docs: https://geminicli.com/docs/tools/mcp-server/
  *
- * Each agent has its own config format and location. This script handles all three.
+ * Antigravity CLI: writes to ~/.gemini/config/mcp_config.json (what `agy mcp list` reads)
+ *   Docs: https://antigravity.google/docs/mcp
+ *
+ * Each agent has its own config format and location. This script handles all of them.
  *
  * Error-isolation guarantee: every configure* function catches its own errors and
  * returns them as warning log lines. A failure in one agent never stops others.
@@ -26,6 +29,9 @@ const CLAUDE_PERMISSION_ENTRIES = ["mcp__multiagents", "mcp__multiagents-orch"] 
 const CLAUDE_STALE_PERMISSION_ENTRIES = ["mcp__multiagents__*", "mcp__multiagents-orch__*"] as const;
 const CODEX_ARGS_TOML = '["--agent-type", "codex"]';
 const GEMINI_ARGS = ["--agent-type", "gemini"] as const;
+const ANTIGRAVITY_ARGS = ["--agent-type", "antigravity"] as const;
+const ANTIGRAVITY_SERVER = "multiagents-peer";
+const ANTIGRAVITY_PERMISSION = `mcp(${ANTIGRAVITY_SERVER}/*)`;
 
 // --- Self-resolving paths ---
 // Compute script paths relative to THIS file's location in the installed package.
@@ -86,6 +92,11 @@ function findAgentCli(name: string): string | null {
       "/usr/local/bin/gemini",
       "/opt/homebrew/bin/gemini",
     ],
+    agy: [
+      path.join(HOME, ".local", "bin", "agy"),
+      "/usr/local/bin/agy",
+      "/opt/homebrew/bin/agy",
+    ],
   };
 
   for (const p of (knownPaths[name] ?? [])) {
@@ -104,13 +115,15 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function readJsonObject(filePath: string): { value: Record<string, unknown> | null; error?: string } {
+function readJsonObject(filePath: string, opts: { emptyIsObject?: boolean } = {}): { value: Record<string, unknown> | null; error?: string } {
   if (!fs.existsSync(filePath)) {
     return { value: {} };
   }
 
   try {
-    const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    const text = fs.readFileSync(filePath, "utf-8");
+    if (opts.emptyIsObject && !text.trim()) return { value: {} };
+    const parsed = JSON.parse(text);
     const record = asRecord(parsed);
     if (!record) {
       return { value: null, error: `${filePath} is not a JSON object` };
@@ -500,6 +513,80 @@ function configureGemini(serverCmd: string, serverArgs: string[]): AgentConfigRe
   return { logs, ok };
 }
 
+// --- Antigravity CLI ---
+// Servers live in ~/.gemini/config/mcp_config.json, which the CLI shares with the
+// Antigravity app and IDE. The entry carries the name the orchestrator registers
+// per project (multiagents-peer): agy loads same-named entries once, global first.
+// Docs: https://antigravity.google/docs/mcp
+
+function writeAntigravityServer(serverCmd: string, serverArgs: string[]): AgentConfigResult {
+  const configPath = path.join(HOME, ".gemini", "config", "mcp_config.json");
+  // The Antigravity app creates this file empty.
+  const readResult = readJsonObject(configPath, { emptyIsObject: true });
+  if (!readResult.value) {
+    return {
+      logs: [`  \x1b[33m!\x1b[0m Antigravity CLI: ${readResult.error}, skipping ~/.gemini/config/mcp_config.json update`],
+      ok: false,
+    };
+  }
+
+  const config = readResult.value;
+  const mcpServers = asRecord(config.mcpServers) ?? {};
+  const existing = asRecord(mcpServers[ANTIGRAVITY_SERVER]) ?? {};
+  const args = [...serverArgs, ...ANTIGRAVITY_ARGS];
+  const duplicate = mcpServers["multiagents"] !== undefined;
+  if (existing.command === serverCmd && JSON.stringify(existing.args) === JSON.stringify(args) && !duplicate) {
+    return { logs: ["  \x1b[90m✔\x1b[0m Antigravity CLI: MCP server already configured"], ok: true };
+  }
+
+  delete mcpServers["multiagents"];
+  mcpServers[ANTIGRAVITY_SERVER] = { ...existing, command: serverCmd, args };
+  config.mcpServers = mcpServers;
+  try {
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+    return { logs: ["  \x1b[32m✔\x1b[0m Antigravity CLI: MCP server written to ~/.gemini/config/mcp_config.json"], ok: true };
+  } catch (e) {
+    return {
+      logs: [`  \x1b[33m!\x1b[0m Antigravity CLI: could not write ~/.gemini/config/mcp_config.json — ${errMsg(e)}`],
+      ok: false,
+    };
+  }
+}
+
+/** Interactive sessions ask before every MCP tool call unless the server is allowed in the CLI settings. */
+function addAntigravityPermission(): AgentConfigResult {
+  const settingsPath = path.join(HOME, ".gemini", "antigravity-cli", "settings.json");
+  const readResult = readJsonObject(settingsPath, { emptyIsObject: true });
+  if (!readResult.value) {
+    return { logs: [`  \x1b[33m!\x1b[0m Antigravity CLI: ${readResult.error}, skipping permissions`], ok: false };
+  }
+
+  const settings = readResult.value;
+  const permissions = asRecord(settings.permissions) ?? {};
+  const allow = Array.isArray(permissions.allow) ? [...(permissions.allow as string[])] : [];
+  if (allow.includes(ANTIGRAVITY_PERMISSION)) {
+    return { logs: ["  \x1b[90m✔\x1b[0m Antigravity CLI: MCP permissions already configured"], ok: true };
+  }
+
+  permissions.allow = [...allow, ANTIGRAVITY_PERMISSION];
+  settings.permissions = permissions;
+  try {
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+    return { logs: [`  \x1b[32m✔\x1b[0m Antigravity CLI: permission added to ~/.gemini/antigravity-cli/settings.json (${ANTIGRAVITY_PERMISSION})`], ok: true };
+  } catch (e) {
+    return { logs: [`  \x1b[33m!\x1b[0m Antigravity CLI: could not write permissions — ${errMsg(e)}`], ok: false };
+  }
+}
+
+function configureAntigravity(serverCmd: string, serverArgs: string[]): AgentConfigResult {
+  const server = writeAntigravityServer(serverCmd, serverArgs);
+  if (!server.ok) return server;
+  const permission = addAntigravityPermission();
+  return { logs: [...server.logs, ...permission.logs], ok: permission.ok };
+}
+
 // --- Public API ---
 
 interface ConfigResult {
@@ -555,6 +642,19 @@ function configureMcp(): ConfigResult {
     logs.push("  \x1b[90m-\x1b[0m Gemini CLI: not detected, skipping");
   }
 
+  // Antigravity CLI (only when the `agy` binary exists: the config file alone may belong to the desktop app)
+  if (findAgentCli("agy")) {
+    try {
+      const result = configureAntigravity(serverBin, serverArgs);
+      logs.push(...result.logs);
+      if (result.ok) configured.push("antigravity");
+    } catch (e) {
+      logs.push(`  \x1b[33m!\x1b[0m Antigravity CLI: unexpected error — ${errMsg(e)}`);
+    }
+  } else {
+    logs.push("  \x1b[90m-\x1b[0m Antigravity CLI: not detected, skipping");
+  }
+
   return { logs, configured };
 }
 
@@ -573,12 +673,13 @@ export async function installMcp(): Promise<void> {
 \x1b[1mNext step:\x1b[0m Restart your agent CLIs to load the new tools.
 
 \x1b[1mVerify:\x1b[0m
-${configured.includes("claude") ? "  Claude:  \x1b[90mclaude mcp list | grep multiagents\x1b[0m\n" : ""}${configured.includes("codex") ? "  Codex:   \x1b[90mcodex mcp list\x1b[0m\n" : ""}${configured.includes("gemini") ? "  Gemini:  \x1b[90mgemini mcp list\x1b[0m\n" : ""}
+${configured.includes("claude") ? "  Claude:  \x1b[90mclaude mcp list | grep multiagents\x1b[0m\n" : ""}${configured.includes("codex") ? "  Codex:   \x1b[90mcodex mcp list\x1b[0m\n" : ""}${configured.includes("gemini") ? "  Gemini:  \x1b[90mgemini mcp list\x1b[0m\n" : ""}${configured.includes("antigravity") ? "  Antigravity: \x1b[90magy mcp list\x1b[0m\n" : ""}
 \x1b[1mManual setup:\x1b[0m
   Claude:  \x1b[90mclaude mcp add multiagents -s user -- multiagents-server\x1b[0m
   Codex:   \x1b[90mcodex mcp add multiagents -- multiagents-server --agent-type codex\x1b[0m
   Gemini:  \x1b[90mgemini mcp add -s user --trust multiagents multiagents-server --agent-type gemini\x1b[0m
            \x1b[90m(or add trust:true under ~/.gemini/settings.json if the CLI is unavailable)\x1b[0m
+  Antigravity: \x1b[90magy mcp add multiagents-peer -- multiagents-server --agent-type antigravity\x1b[0m
 `);
 }
 

@@ -54,6 +54,8 @@ export interface CodexSessionOptions {
   sandbox?: "read-only" | "workspace-write" | "danger-full-access";
   baseInstructions?: string;
   developerInstructions?: string;
+  /** Config overrides for this thread only (the keys of config.toml, dotted or nested). */
+  config?: Record<string, unknown>;
   model?: string;
 }
 
@@ -253,6 +255,7 @@ export class CodexDriver {
     if (opts.developerInstructions) threadParams.developerInstructions = opts.developerInstructions;
     if (opts.baseInstructions) threadParams.baseInstructions = opts.baseInstructions;
     if (opts.model) threadParams.model = opts.model;
+    if (opts.config) threadParams.config = opts.config;
 
     const threadResult = await this.sendRequest("thread/start", threadParams, 30_000) as {
       thread?: { id: string };
@@ -291,6 +294,7 @@ export class CodexDriver {
     if (opts.developerInstructions) params.developerInstructions = opts.developerInstructions;
     if (opts.baseInstructions) params.baseInstructions = opts.baseInstructions;
     if (opts.model) params.model = opts.model;
+    if (opts.config) params.config = opts.config;
 
     const result = await this.sendRequest("thread/resume", params, 30_000) as {
       thread?: { id: string };

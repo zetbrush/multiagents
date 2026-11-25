@@ -15,6 +15,10 @@ import {
   claudeMcpConfig,
   claudeSystemPromptAppend,
   codexDeveloperInstructions,
+  antigravityFirstPrompt,
+  antigravityMcpConfigPath,
+  antigravityMcpServer,
+  launchAgent,
 } from "../orchestrator/launcher.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 import { FULL_PROTOCOL, SHORT_PROTOCOL } from "../adapters/protocol-text.ts";
@@ -591,5 +595,193 @@ describe("buildTeamContext", () => {
 
     const result = await buildTeamContext("session-1", 1, mockClient);
     expect(result).toContain("paused");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Antigravity CLI (driven over stream-json, MCP from the global config file)
+// ---------------------------------------------------------------------------
+describe("antigravity launch contract", () => {
+  const identity = { sessionId: "s1", projectDir: "/tmp/p", slotId: 7, name: "Designer", role: "UI/UX Designer", roleDescription: "Owns the look." };
+
+  test("the MCP server entry runs this install's adapter through an absolute runtime path", () => {
+    const server = antigravityMcpServer();
+    // the host may start MCP servers without the launcher's PATH
+    expect(path.isAbsolute(server.command)).toBe(true);
+    expect(fs.existsSync(server.command)).toBe(true);
+    expect(server.args[0]).toBe(path.resolve("server.ts"));
+    expect(server.args.slice(1)).toEqual(["--agent-type", "antigravity"]);
+  });
+
+  test("buildCliArgs refuses antigravity: it is driven over its session protocol", () => {
+    expect(() => buildCliArgs("antigravity", "task")).toThrow(/session protocol/);
+  });
+
+  test("the first prompt carries the task, the full team protocol and the role practices", () => {
+    const prompt = antigravityFirstPrompt(identity, "Your task: design the settings screen");
+    expect(prompt.startsWith("Your task: design the settings screen")).toBe(true);
+    expect(prompt).toContain(FULL_PROTOCOL);
+    expect(prompt).toContain("--- ROLE-SPECIFIC PRACTICES ---");
+  });
+});
+
+describe("ensureMcpConfigs — antigravity", () => {
+  // agy 1.5.13 loads <workspace>/.agents/mcp_config.json headless; a same-named entry in the global file takes precedence over it.
+  const globalPath = antigravityMcpConfigPath();
+  let original: string | null = null;
+  beforeEach(() => {
+    try { original = fs.readFileSync(globalPath, "utf-8"); } catch { original = null; }
+  });
+  afterEach(() => {
+    if (original !== null) fs.writeFileSync(globalPath, original);
+    else fs.rmSync(globalPath, { force: true });
+  });
+  const workspacePath = () => path.join(tmpDir, ".agents", "mcp_config.json");
+  const workspace = () => JSON.parse(fs.readFileSync(workspacePath(), "utf-8"));
+  const writeGlobal = (content: string) => {
+    fs.mkdirSync(path.dirname(globalPath), { recursive: true });
+    fs.writeFileSync(globalPath, content);
+  };
+
+  test("the global config path is the one the Antigravity CLI, app and IDE share", () => {
+    expect(globalPath).toBe(path.join(process.env.HOME ?? "", ".gemini", "config", "mcp_config.json"));
+  });
+
+  test("launching an Antigravity agent registers multiagents-peer in the project's own MCP config", async () => {
+    fs.rmSync(globalPath, { force: true });
+
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+
+    expect(workspace().mcpServers["multiagents-peer"]).toEqual(antigravityMcpServer());
+    expect(fs.existsSync(globalPath)).toBe(false);
+  });
+
+  test("the project's other servers are kept and a second multiagents entry is dropped", async () => {
+    fs.mkdirSync(path.dirname(workspacePath()), { recursive: true });
+    fs.writeFileSync(workspacePath(), JSON.stringify({ mcpServers: { linter: { command: "lint-mcp", args: ["--stdio"] }, multiagents: { command: "bun", args: ["server.ts"] } } }));
+
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+
+    expect(Object.keys(workspace().mcpServers).sort()).toEqual(["linter", "multiagents-peer"]);
+    expect(workspace().mcpServers.linter).toEqual({ command: "lint-mcp", args: ["--stdio"] });
+  });
+
+  test("an entry from another install is repointed at this one and keeps its other settings", async () => {
+    fs.mkdirSync(path.dirname(workspacePath()), { recursive: true });
+    const other = { command: "/other/bun", args: ["/other/install/server.ts", "--agent-type", "antigravity"], timeoutSeconds: 60, env: { DEBUG: "1" } };
+    fs.writeFileSync(workspacePath(), JSON.stringify({ mcpServers: { "multiagents-peer": other } }));
+
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+
+    expect(workspace().mcpServers["multiagents-peer"]).toEqual({ ...antigravityMcpServer(), timeoutSeconds: 60, env: { DEBUG: "1" } });
+  });
+
+  test("a broker port override is written to the project entry and removed once back on the default port", async () => {
+    const previous = process.env.MULTIAGENTS_PORT;
+    process.env.MULTIAGENTS_PORT = "17999";
+    try {
+      await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+    } finally {
+      if (previous === undefined) delete process.env.MULTIAGENTS_PORT; else process.env.MULTIAGENTS_PORT = previous;
+    }
+    expect(workspace().mcpServers["multiagents-peer"].env).toEqual({ MULTIAGENTS_PORT: "17999" });
+
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+    expect(workspace().mcpServers["multiagents-peer"].env).toBeUndefined();
+  });
+
+  test("running twice leaves the project file byte-identical", async () => {
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+    const before = fs.readFileSync(workspacePath(), "utf-8");
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+    expect(fs.readFileSync(workspacePath(), "utf-8")).toBe(before);
+  });
+
+  test("a project config that is not valid JSON fails the launch instead of being overwritten", async () => {
+    fs.mkdirSync(path.dirname(workspacePath()), { recursive: true });
+    fs.writeFileSync(workspacePath(), "{ mcpServers: oops");
+
+    await expect(ensureMcpConfigs(tmpDir, "agy-session", "antigravity")).rejects.toThrow(/mcp_config\.json/);
+    expect(fs.readFileSync(workspacePath(), "utf-8")).toBe("{ mcpServers: oops");
+  });
+
+  test("a global multiagents-peer entry, which agy prefers over the project one, is repointed at this install", async () => {
+    writeGlobal(JSON.stringify({ mcpServers: { linter: { command: "lint-mcp" }, "multiagents-peer": { command: "/other/bun", args: ["/other/install/server.ts", "--agent-type", "antigravity"] } } }));
+
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+
+    const servers = JSON.parse(fs.readFileSync(globalPath, "utf-8")).mcpServers;
+    expect(servers["multiagents-peer"]).toEqual(antigravityMcpServer());
+    expect(servers.linter).toEqual({ command: "lint-mcp" });
+  });
+
+  test("a global multiagents entry is dropped so the agent does not load the tools twice", async () => {
+    writeGlobal(JSON.stringify({ mcpServers: { multiagents: { command: "bun", args: ["server.ts", "--agent-type", "agy"] }, linter: { command: "lint-mcp" } } }));
+
+    await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+
+    expect(Object.keys(JSON.parse(fs.readFileSync(globalPath, "utf-8")).mcpServers)).toEqual(["linter"]);
+  });
+
+  test("a global config without multiagents entries is left exactly as it is", async () => {
+    for (const content of ["", JSON.stringify({ mcpServers: { linter: { command: "lint-mcp" } } }), "{ not json"]) {
+      writeGlobal(content);
+      await ensureMcpConfigs(tmpDir, "agy-session", "antigravity");
+      expect(fs.readFileSync(globalPath, "utf-8")).toBe(content);
+    }
+  });
+
+  test("a launch that cannot record its session on the slot does not leave the agy process behind", async () => {
+    const FAKE_AGY = new URL("./fakes/fake-agy.ts", import.meta.url).pathname;
+    const logPath = path.join(tmpDir, "agy.log");
+    const previous = { command: process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND, log: process.env.FAKE_AGY_LOG };
+    process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND = `bun ${FAKE_AGY}`;
+    process.env.FAKE_AGY_LOG = logPath;
+    const broker = {
+      createSlot: async () => ({ id: 41 }),
+      updateSlot: async () => { throw new Error("broker is down"); },
+    } as any;
+    try {
+      await expect(launchAgent("agy-session", tmpDir, {
+        agent_type: "antigravity", name: "Designer", role: "UI/UX Designer", role_description: "", initial_task: "SLEEP:5000",
+      }, broker)).rejects.toThrow(/broker is down/);
+    } finally {
+      if (previous.command === undefined) delete process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND; else process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND = previous.command;
+      if (previous.log === undefined) delete process.env.FAKE_AGY_LOG; else process.env.FAKE_AGY_LOG = previous.log;
+    }
+
+    const pid = fs.readFileSync(logPath, "utf-8").trim().split("\n").map((l) => JSON.parse(l)).find((e) => e.argv)!.pid as number;
+    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    for (let i = 0; i < 50 && alive(); i++) await Bun.sleep(100);
+    expect(alive()).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, ".multiagents", "slots", `${pid}.json`))).toBe(false);
+  });
+
+  test("launching a Claude agent writes no Antigravity config", async () => {
+    fs.rmSync(globalPath, { force: true });
+    await ensureMcpConfigs(tmpDir, "claude-only", "claude");
+    expect(fs.existsSync(globalPath)).toBe(false);
+    expect(fs.existsSync(workspacePath())).toBe(false);
+  });
+});
+
+describe("detectAgent — antigravity", () => {
+  const FAKE_AGY = new URL("./fakes/fake-agy.ts", import.meta.url).pathname;
+  let previous: string | undefined;
+  beforeEach(() => { previous = process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND; });
+  afterEach(() => {
+    if (previous === undefined) delete process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND; else process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND = previous;
+  });
+
+  test("honours MULTIAGENTS_ANTIGRAVITY_COMMAND and reports the CLI version", async () => {
+    process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND = `bun ${FAKE_AGY}`;
+    const detection = await detectAgent("antigravity");
+    expect(detection.available).toBe(true);
+    expect(detection.version).toBe("1.9.0-fake");
+  });
+
+  test("is unavailable when the command is not installed", async () => {
+    process.env.MULTIAGENTS_ANTIGRAVITY_COMMAND = "agy-binary-that-does-not-exist";
+    expect((await detectAgent("antigravity")).available).toBe(false);
   });
 });

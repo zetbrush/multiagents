@@ -10,15 +10,22 @@ import type { BrokerClient } from "../shared/broker-client.ts";
 import type { Message } from "../shared/types.ts";
 import type { CodexDriver } from "./codex-driver.ts";
 import type { ClaudeDriver } from "./claude-driver.ts";
+import type { AntigravityDriver } from "./antigravity-driver.ts";
 import { log } from "../shared/utils.ts";
 
 const LOG_PREFIX = "delivery";
 
 export type DriverSlot =
   | { kind: "codex"; driver: CodexDriver; threadId: string | null; busy: boolean; lastNudge: number; releasedAt?: number }
-  | { kind: "claude"; driver: ClaudeDriver; busy: boolean; lastNudge: number; releasedAt?: number; inflight?: Set<number> };
+  | { kind: "claude"; driver: ClaudeDriver; busy: boolean; lastNudge: number; releasedAt?: number; inflight?: Set<number> }
+  | { kind: "antigravity"; driver: AntigravityDriver; busy: boolean; lastNudge: number; releasedAt?: number; inflight?: Set<number>; retryAfter?: number };
 
-export type DeliveryOutcome = "dead" | "not_ready" | "busy" | "none" | "in_flight" | "steered" | "replied" | "sent" | "failed";
+/** How long delivery to a live Antigravity session pauses after it rejected a prompt. */
+const REJECTED_PROMPT_RETRY_MS = 30_000;
+
+type StdinDriverSlot = Extract<DriverSlot, { kind: "claude" | "antigravity" }>;
+
+export type DeliveryOutcome = "dead" | "not_ready" | "busy" | "backoff" | "none" | "in_flight" | "steered" | "replied" | "sent" | "failed";
 
 type SenderInfo = { display_name: string | null; role: string | null };
 
@@ -52,12 +59,15 @@ export async function deliverPendingMessages(
   const threadId = state.kind === "codex" ? (state.threadId ?? state.driver.threadId) : null;
   if (state.kind === "codex" && !threadId) return "not_ready";
   if (state.busy) return "busy";
+  // Antigravity runs one turn per prompt: mid-turn, messages stay unclaimed so the agent's own tool calls can pick them up.
+  if (state.kind === "antigravity" && state.driver.busy) return "busy";
+  if (state.kind === "antigravity" && Date.now() < (state.retryAfter ?? 0)) return "backoff";
 
   const poll = await brokerClient.pollBySlot(slotId, { retain: true });
   const pending = poll.messages ?? [];
   if (pending.length === 0) return "none";
 
-  if (state.kind === "claude") return deliverToClaude(sessionId, slotId, state, pending, brokerClient);
+  if (state.kind !== "codex") return deliverOverStdin(sessionId, slotId, state, pending, brokerClient);
 
   const prompt = buildForwardingPrompt(formatForwardedMessages(pending, await senderMap(sessionId, brokerClient)));
   const ids = pending.map((m) => m.id);
@@ -100,14 +110,15 @@ export async function deliverPendingMessages(
 
 /**
  * Claude reads queued stdin at its next tool-call boundary and echoes a message
- * only then — minutes later during a long tool call. The ack waits for that
- * echo; meanwhile the ids are in flight so no tick writes them again, and a
+ * only then — minutes later during a long tool call; Antigravity reports a
+ * prompt as read when the turn it starts begins. The ack waits for that
+ * signal; meanwhile the ids are in flight so no tick writes them again, and a
  * host that exits first leaves them unacked for its successor.
  */
-async function deliverToClaude(
+async function deliverOverStdin(
   sessionId: string,
   slotId: number,
-  state: Extract<DriverSlot, { kind: "claude" }>,
+  state: StdinDriverSlot,
   pending: Message[],
   brokerClient: BrokerClient,
 ): Promise<DeliveryOutcome> {
@@ -118,15 +129,21 @@ async function deliverToClaude(
   const prompt = buildForwardingPrompt(formatForwardedMessages(messages, await senderMap(sessionId, brokerClient)));
   const ids = messages.map((m) => m.id);
   if (!state.driver.alive) return "dead";
-  log(LOG_PREFIX, `Forwarding ${messages.length} message(s) to claude slot ${slotId}`);
+  log(LOG_PREFIX, `Forwarding ${messages.length} message(s) to ${state.kind} slot ${slotId}`);
 
   for (const id of ids) inflight.add(id);
   state.driver.send(prompt, { echoTimeoutMs: Infinity })
     .then(async (echoed) => {
-      if (echoed) await ack(brokerClient, ids);
-      else log(LOG_PREFIX, `Claude slot ${slotId} exited before reading ${ids.length} message(s) — left for its successor`);
+      if (echoed) {
+        await ack(brokerClient, ids);
+      } else if (state.kind === "antigravity" && state.driver.alive) {
+        state.retryAfter = Date.now() + REJECTED_PROMPT_RETRY_MS;
+        log(LOG_PREFIX, `antigravity slot ${slotId} rejected a prompt carrying ${ids.length} message(s) — retrying in ${REJECTED_PROMPT_RETRY_MS / 1000}s`);
+      } else {
+        log(LOG_PREFIX, `${state.kind} slot ${slotId} exited before reading ${ids.length} message(s) — left for its successor`);
+      }
     })
-    .catch((err) => log(LOG_PREFIX, `Claude slot ${slotId} send failed (messages stay unacked): ${err instanceof Error ? err.message : String(err)}`))
+    .catch((err) => log(LOG_PREFIX, `${state.kind} slot ${slotId} send failed (messages stay unacked): ${err instanceof Error ? err.message : String(err)}`))
     .finally(() => { for (const id of ids) inflight.delete(id); });
   return "sent";
 }

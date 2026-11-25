@@ -9,9 +9,10 @@ import type { BrokerClient } from "../shared/broker-client.ts";
 import type { AgentEvent } from "./monitor.ts";
 import type { CodexDriver } from "./codex-driver.ts";
 import type { ClaudeDriver } from "./claude-driver.ts";
+import type { AntigravityDriver } from "./antigravity-driver.ts";
 import { FLAP_THRESHOLD, FLAP_WINDOW_MS } from "../shared/constants.ts";
 import { log, safeJsonParse, formatDuration } from "../shared/utils.ts";
-import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH, codexDeveloperInstructions } from "./launcher.ts";
+import { relaunchIntoSlot, buildTeamContext, ENRICHED_PATH, codexDeveloperInstructions, codexThreadConfig } from "./launcher.ts";
 
 const LOG_PREFIX = "recovery";
 
@@ -127,6 +128,7 @@ export interface RespawnResult {
   process: import("bun").Subprocess;
   codexDriver?: CodexDriver;
   claudeDriver?: ClaudeDriver;
+  antigravityDriver?: AntigravityDriver;
 }
 
 /**
@@ -216,12 +218,13 @@ export async function respawnAgent(
     await brokerClient.updateSlot({ id: slotId, status: "connected" });
 
     const developerInstructions = codexDeveloperInstructions(identity);
+    const config = codexThreadConfig();
     const previousThreadId = snapshot.codex_thread_id;
     let threadId: string | null = null;
 
     if (previousThreadId) {
       try {
-        await driver.resumeSession({ threadId: previousThreadId, cwd: projectDir, sandbox: "workspace-write", developerInstructions });
+        await driver.resumeSession({ threadId: previousThreadId, cwd: projectDir, sandbox: "workspace-write", developerInstructions, config });
         threadId = previousThreadId;
         log(LOG_PREFIX, `Resumed Codex thread ${previousThreadId} for slot ${slotId} (PID ${driver.pid})`);
       } catch (err) {
@@ -235,6 +238,7 @@ export async function respawnAgent(
         cwd: projectDir,
         sandbox: "workspace-write",
         developerInstructions,
+        config,
       });
       threadId = bootstrap.threadId;
     }
@@ -260,10 +264,16 @@ export async function respawnAgent(
     return { pid: driver.pid, process: driver.process, codexDriver: driver };
   }
 
-  // Claude (driver, resumes its session when the snapshot has one) and Gemini (process)
+  // Claude and Antigravity (drivers, resuming their session when the snapshot has one) and Gemini (process)
   const result = await relaunchIntoSlot(sessionId, projectDir, slot, handoffTask, brokerClient);
 
   log(LOG_PREFIX, `Respawned into existing slot ${slotId} (PID ${result.pid})`);
 
-  return { pid: result.pid, process: result.process, codexDriver: result.codexDriver, claudeDriver: result.claudeDriver };
+  return {
+    pid: result.pid,
+    process: result.process,
+    codexDriver: result.codexDriver,
+    claudeDriver: result.claudeDriver,
+    antigravityDriver: result.antigravityDriver,
+  };
 }

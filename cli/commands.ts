@@ -12,7 +12,7 @@ const BROKER_URL = brokerUrl();
 const COMMAND_HELP: Record<string, string> = {
   "setup": `multiagents setup
 
-  Interactive setup wizard. Detects installed agent CLIs (Claude Code, Codex, Gemini),
+  Interactive setup wizard. Detects installed agent CLIs (Claude Code, Codex, Antigravity, Gemini),
   configures MCP servers, and starts the broker daemon.
 
   Run this once after installing multiagents.
@@ -97,7 +97,7 @@ const COMMAND_HELP: Record<string, string> = {
 
   Configure MCP servers for all detected agent CLIs.
   Writes to ~/.claude/.mcp.json (Claude), ~/.codex/config.toml (Codex),
-  and ~/.gemini/settings.json (Gemini).
+  ~/.gemini/config/mcp_config.json (Antigravity) and ~/.gemini/settings.json (Gemini).
 
   Example:
     multiagents install-mcp`,

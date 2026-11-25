@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Pre-uninstall script: removes MCP server configs that were added by postinstall.
- * Cleans up Claude Code, Codex CLI, and Gemini CLI configurations.
+ * Cleans up Claude Code, Codex CLI, Gemini CLI, and Antigravity CLI configurations.
  * If it fails, prints a message — never breaks the uninstall.
  */
 
@@ -121,11 +121,42 @@ function removeGemini(): void {
   }
 }
 
+// --- Antigravity CLI ---
+function removeAntigravity(): void {
+  const configPath = path.join(HOME, ".gemini", "config", "mcp_config.json");
+  if (fs.existsSync(configPath)) {
+    try {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      const mcpServers = asRecord(config.mcpServers);
+      if (mcpServers && (mcpServers["multiagents-peer"] || mcpServers["multiagents"])) {
+        delete mcpServers["multiagents-peer"];
+        delete mcpServers["multiagents"];
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+        console.log("[multiagents] Removed MCP server from ~/.gemini/config/mcp_config.json");
+      }
+    } catch { /* ok */ }
+  }
+
+  const settingsPath = path.join(HOME, ".gemini", "antigravity-cli", "settings.json");
+  if (fs.existsSync(settingsPath)) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+      const allow = asRecord(settings.permissions)?.allow;
+      if (Array.isArray(allow) && allow.includes("mcp(multiagents-peer/*)")) {
+        settings.permissions.allow = allow.filter((rule: string) => rule !== "mcp(multiagents-peer/*)");
+        fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
+        console.log("[multiagents] Removed MCP permission from ~/.gemini/antigravity-cli/settings.json");
+      }
+    } catch { /* ok */ }
+  }
+}
+
 // --- Main ---
 try {
   removeClaude();
   removeCodex();
   removeGemini();
+  removeAntigravity();
   console.log("[multiagents] MCP cleanup complete. Restart your agent CLIs to apply.");
 } catch (e) {
   console.error(`[multiagents] preuninstall warning: ${e instanceof Error ? e.message : String(e)}`);

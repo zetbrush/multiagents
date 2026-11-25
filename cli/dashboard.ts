@@ -680,6 +680,9 @@ function getControlsLine(state: DashboardState, sid: string | null): string {
 }
 
 // === TAB: AGENTS ===
+/** Wide enough for the longest agent type ("antigravity") plus a gap. */
+const AGENT_TYPE_COL = 12;
+
 function renderAgentsTab(state: DashboardState, sid: string | null, cols: number, maxRows: number, lines: string[]): void {
   if (state.slots.length === 0 && state.allPeers.length === 0) {
     lines.push("");
@@ -694,7 +697,7 @@ function renderAgentsTab(state: DashboardState, sid: string | null, cols: number
     const hdrParts = [
       " ",
       "Name".padEnd(18),
-      "Type".padEnd(8),
+      "Type".padEnd(AGENT_TYPE_COL),
       "Role".padEnd(18),
       "Conn".padEnd(14),
       "Task".padEnd(14),
@@ -707,7 +710,7 @@ function renderAgentsTab(state: DashboardState, sid: string | null, cols: number
       const prefix = isSelected ? `${CYAN}▸${RESET}` : " ";
 
       const name = truncate(slot.display_name ?? "—", 16);
-      const type = slot.agent_type.padEnd(8);
+      const type = slot.agent_type.padEnd(AGENT_TYPE_COL);
       const role = truncate(slot.role ?? "—", 16);
       const connStatus = colorStatus(r.status);
       const taskState = colorTaskState(slot.task_state ?? "idle");
@@ -733,11 +736,11 @@ function renderAgentsTab(state: DashboardState, sid: string | null, cols: number
   } else {
     // Raw peers mode
     lines.push(`${BOLD} Peers (${state.allPeers.length})${RESET}`);
-    lines.push(`${DIM} ${"ID".padEnd(14)}${"Type".padEnd(10)}${"Summary".padEnd(40)}${RESET}`);
+    lines.push(`${DIM} ${"ID".padEnd(14)}${"Type".padEnd(AGENT_TYPE_COL)}${"Summary".padEnd(40)}${RESET}`);
 
     for (const peer of state.allPeers) {
       const id = truncate(peer.id, 12);
-      const agentType = (peer.agent_type ?? "?").padEnd(10);
+      const agentType = (peer.agent_type ?? "?").padEnd(AGENT_TYPE_COL);
       const summary = truncate(peer.summary ?? "—", 38);
       lines.push(` ${id.padEnd(14)}${agentType}${summary}`);
     }

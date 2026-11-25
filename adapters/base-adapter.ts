@@ -3,7 +3,7 @@
  * BaseAdapter — Abstract base class for all agent MCP adapters.
  *
  * Extracts ALL shared logic from the original server.ts into a reusable
- * base that Claude, Codex, Gemini, and custom adapters extend.
+ * base that Claude, Codex, Gemini, Antigravity, and custom adapters extend.
  *
  * Subclasses override:
  *   - deliverMessage(msg)  — how inbound messages reach the agent
@@ -50,6 +50,7 @@ import {
   safeJsonParse,
   formatTime,
   timeSince,
+  processStartTime,
 } from "../shared/utils.ts";
 import {
   generateSummary,
@@ -77,7 +78,7 @@ const TOOLS = [
         },
         agent_type: {
           type: "string" as const,
-          enum: ["claude", "codex", "gemini", "custom", "all"],
+          enum: ["claude", "codex", "gemini", "antigravity", "custom", "all"],
           description: "Optional filter by agent type. Defaults to all.",
         },
       },
@@ -389,9 +390,12 @@ import { SHORT_PROTOCOL } from "./protocol-text.ts";
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
 type EnrichCache = { peers: Peer[]; slots: Slot[] };
+type SlotFileData = { slot_id?: number; session_id?: string; role?: string; name?: string; driver_mode?: boolean; host_started?: string };
+
 
 /** How many acked message ids to remember so a stale poll cannot re-deliver them. */
 const ACKED_MEMORY = 500;
+const REGISTRATION_WAIT_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // BaseAdapter
@@ -433,6 +437,11 @@ export abstract class BaseAdapter {
   private checkMessagesWaiting = 0;
   /** Set when an orchestrator driver owns delivery for this agent (no polling, no piggyback). */
   protected driverMode = false;
+  /** Under a driver that cannot reach the model mid-turn, tool results still carry what the driver has not claimed. */
+  protected piggybackUnderDriver = false;
+  private slotFileData: SlotFileData | null | undefined;
+  /** Settles when the background broker registration started by `start()` is over, whatever its outcome. */
+  private registration: Promise<void> | null = null;
   /** Subclasses whose host rarely reads instructions inject team context into the first tool result. */
   protected autoStartupOnFirstCall = false;
   private hasRunStartup = false;
@@ -494,7 +503,7 @@ export abstract class BaseAdapter {
         return require("node:fs").existsSync(p);
       } catch { return false; }
     })();
-    const driverMode = driverModeEnv || driverModeFile;
+    const driverMode = driverModeEnv || driverModeFile || this.slotFile()?.driver_mode === true;
     this.driverMode = driverMode;
 
     // 1. Resolve session/slot info eagerly (before any async work)
@@ -528,6 +537,7 @@ export abstract class BaseAdapter {
     //    Without registration, this.myId stays null and ALL tool handlers return
     //    "Not registered with broker yet" — making every MCP call a silent no-op.
     const brokerPromise = driverMode ? this.registerDriverModePeer() : this.registerWithBroker();
+    this.registration = brokerPromise.then(() => {}, () => {});
 
     // 5. Connect MCP over stdio — blocks until parent sends `initialize`
     //    Broker registration runs concurrently with this wait.
@@ -587,8 +597,8 @@ export abstract class BaseAdapter {
    *
    * Slot discovery priority:
    *   1. MULTIAGENTS_SLOT env var (may be stripped by Codex sandbox)
-   *   2. .multiagents/.driver-mode file (JSON with slot_id, session_id)
-   *   3. .multiagents/slots/<ppid>.json (per-PID slot file)
+   *   2. .multiagents/.driver-mode file (JSON with slot_id, session_id; Codex only)
+   *   3. .multiagents/slots/<pid>.json (per-PID slot file of the host CLI)
    */
   private async registerDriverModePeer(): Promise<void> {
     try {
@@ -602,8 +612,8 @@ export abstract class BaseAdapter {
       const envSlot = process.env.MULTIAGENTS_SLOT;
       if (envSlot) slotId = parseInt(envSlot, 10);
 
-      // 2. Try driver-mode file (written by launcher with slot/session info)
-      if (!slotId) {
+      // 2. Try driver-mode file (written by launcher with slot/session info); it describes the Codex agent only
+      if (!slotId && this.agentType === "codex") {
         try {
           const driverModePath = require("node:path").join(this.myCwd, ".multiagents", ".driver-mode");
           const raw = require("node:fs").readFileSync(driverModePath, "utf-8");
@@ -618,16 +628,12 @@ export abstract class BaseAdapter {
 
       // 3. Try per-PID slot file
       if (!slotId) {
-        try {
-          const ppid = process.ppid ?? process.pid;
-          const slotFilePath = require("node:path").join(this.myCwd, ".multiagents", "slots", `${ppid}.json`);
-          const slotData = JSON.parse(require("node:fs").readFileSync(slotFilePath, "utf-8"));
-          if (slotData.slot_id) slotId = slotData.slot_id;
-          if (slotData.session_id && !sessionId) {
-            sessionId = slotData.session_id;
-            this.sessionId = sessionId;
-          }
-        } catch { /* no per-PID file */ }
+        const slotData = this.slotFile();
+        if (slotData?.slot_id) slotId = slotData.slot_id;
+        if (slotData?.session_id && !sessionId) {
+          sessionId = slotData.session_id;
+          this.sessionId = sessionId;
+        }
       }
 
       this.log(`Driver mode slot discovery: slot_id=${slotId}, session_id=${sessionId}`);
@@ -730,17 +736,13 @@ export abstract class BaseAdapter {
     // .multiagents/slots/<parent-pid>.json with { slot_id, role, name } for
     // each agent. The MCP server's parent PID is the agent CLI (claude/codex).
     if (!envSlot) {
-      try {
-        const ppid = process.ppid ?? process.pid;
-        const slotFilePath = require("node:path").join(process.cwd(), ".multiagents", "slots", `${ppid}.json`);
-        const slotData = JSON.parse(require("node:fs").readFileSync(slotFilePath, "utf-8"));
-        if (slotData.slot_id) {
-          envSlot = String(slotData.slot_id);
-          if (slotData.role && !envRole) process.env.MULTIAGENTS_ROLE = slotData.role;
-          if (slotData.name && !envName) process.env.MULTIAGENTS_NAME = slotData.name;
-          this.log(`Slot info from PID file (ppid=${ppid}): slot=${envSlot}`);
-        }
-      } catch { /* no per-PID file — ok */ }
+      const slotData = this.slotFile();
+      if (slotData?.slot_id) {
+        envSlot = String(slotData.slot_id);
+        if (slotData.role && !envRole) process.env.MULTIAGENTS_ROLE = slotData.role;
+        if (slotData.name && !envName) process.env.MULTIAGENTS_NAME = slotData.name;
+        this.log(`Slot info from PID file: slot=${envSlot}`);
+      }
     }
     if (envSlot) {
       regBody.slot_id = parseInt(envSlot, 10);
@@ -793,6 +795,23 @@ export abstract class BaseAdapter {
         await this.deliverMessage(enriched);
       }
     }
+  }
+
+  /** The launcher's slot assignment for the host CLI that started this server (.multiagents/slots/<parent pid>.json). */
+  private slotFile(): SlotFileData | null {
+    if (this.slotFileData !== undefined) return this.slotFileData;
+    const fs = require("node:fs") as typeof import("node:fs");
+    const path = require("node:path") as typeof import("node:path");
+    const pid = process.ppid ?? process.pid;
+    let found: SlotFileData | null = null;
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(process.cwd(), ".multiagents", "slots", `${pid}.json`), "utf-8")) as SlotFileData;
+      // A file whose host started at another time describes an earlier process that had this pid.
+      const started = data.host_started ? processStartTime(pid) : null;
+      if (!started || started === data.host_started) found = data;
+    } catch { /* no slot file for this host */ }
+    this.slotFileData = found;
+    return found;
   }
 
   // --- Broker lifecycle ---
@@ -894,6 +913,8 @@ export abstract class BaseAdapter {
 
     this.mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const { name, arguments: args } = req.params;
+      // The handshake does not wait for the broker registration; a first call that beats it does.
+      if (!this.myId && this.registration) await Promise.race([this.registration, Bun.sleep(REGISTRATION_WAIT_MS)]);
       const result = await this.dispatchTool(name, args as Record<string, unknown>);
       return this.decorateResult(result);
     });
@@ -949,7 +970,9 @@ export abstract class BaseAdapter {
   /** Prepend first-call team context and any pending teammate messages, acking what was surfaced. */
   private async decorateResult(result: ToolResult): Promise<ToolResult> {
     const startup = this.autoStartupOnFirstCall ? await this.runAutoStartup() : "";
-    const pendingBlock = this.driverMode ? "" : await this.flushPendingBlock();
+    const pendingBlock = !this.driverMode
+      ? await this.flushPendingBlock()
+      : this.piggybackUnderDriver ? await this.flushUnclaimedBlock() : "";
     if (!startup && !pendingBlock) return result;
     const text = result.content.map((c) => c.text).join("\n");
     return { ...result, content: [{ type: "text", text: startup + pendingBlock + text }] };
@@ -959,6 +982,24 @@ export abstract class BaseAdapter {
     if (this.pending.size === 0) return "";
     const msgs = this.takePending();
     await this.ack(msgs.map((m) => m.id));
+    return this.pendingBlock(msgs);
+  }
+
+  /** Driver mode: the poll consumes whatever the driver has not claimed, so the block is the only delivery. */
+  private async flushUnclaimedBlock(): Promise<string> {
+    if (!this.myId) return "";
+    try {
+      await this.stagePending();
+    } catch (e) {
+      this.log(`Poll for unclaimed messages failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (this.pending.size === 0) return "";
+    const msgs = this.takePending();
+    this.markSeen(msgs.map((m) => m.id));
+    return this.pendingBlock(msgs);
+  }
+
+  private pendingBlock(msgs: BufferedMessage[]): string {
     const lines = msgs.map((m) => this.formatMessage(m)).join("\n");
     return `[PENDING MESSAGES]\n${lines}\n[END PENDING MESSAGES]\n\n`;
   }

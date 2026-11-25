@@ -32,7 +32,7 @@ const GUIDES: Record<GuideTopic, string> = {
   overview: `# Multiagents — Overview
 
 ## What It Is
-Multiagents is a multi-agent orchestration platform that lets you manage teams of AI coding agents (Claude Code, Codex CLI, Gemini CLI) working together on the same codebase. Agents discover each other, communicate in real-time, coordinate file edits, and follow structured feedback loops.
+Multiagents is a multi-agent orchestration platform that lets you manage teams of AI coding agents (Claude Code, Codex CLI, Antigravity CLI, and the legacy Gemini CLI) working together on the same codebase. Agents discover each other, communicate in real-time, coordinate file edits, and follow structured feedback loops.
 
 ## Architecture
 \`\`\`

@@ -8,6 +8,7 @@
  *   bun server.ts                    # defaults to claude
  *   bun server.ts --agent-type codex
  *   bun server.ts --agent-type gemini
+ *   bun server.ts --agent-type antigravity
  */
 
 import type { AgentType } from "./shared/types.ts";
@@ -33,6 +34,11 @@ async function main() {
     case "gemini": {
       const { GeminiAdapter } = await import("./adapters/gemini-adapter.ts");
       await new GeminiAdapter().start();
+      break;
+    }
+    case "antigravity": {
+      const { AntigravityAdapter } = await import("./adapters/antigravity-adapter.ts");
+      await new AntigravityAdapter().start();
       break;
     }
     default: {

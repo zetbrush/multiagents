@@ -4,21 +4,23 @@
 // Spawns agent processes and ensures each one has MCP access to the
 // multiagents tools for inter-agent communication through the broker.
 //
-// Claude and Codex agents run under orchestrator drivers (long-lived headless
-// sessions the orchestrator feeds messages into); Gemini runs as a one-shot
-// `gemini -p` process that receives messages through tool results.
+// Claude, Codex and Antigravity agents run under orchestrator drivers
+// (long-lived headless sessions the orchestrator feeds messages into); Gemini
+// runs as a one-shot `gemini -p` process that receives messages through tool
+// results.
 // ============================================================================
 
 import type { Subprocess } from "bun";
 import type { AgentType, AgentLaunchConfig, Slot } from "../shared/types.ts";
 import type { BrokerClient } from "../shared/broker-client.ts";
-import { log } from "../shared/utils.ts";
+import { log, processStartTime } from "../shared/utils.ts";
 import { DEFAULT_BROKER_PORT } from "../shared/constants.ts";
 import { resolveBrokerPort } from "../shared/broker-url.ts";
 import { FULL_PROTOCOL, SHORT_PROTOCOL } from "../adapters/protocol-text.ts";
 import { getStructuredRolePractices } from "../adapters/role-practices.ts";
 import { ClaudeDriver } from "./claude-driver.ts";
 import { CodexDriver } from "./codex-driver.ts";
+import { AntigravityDriver, antigravityCommand } from "./antigravity-driver.ts";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
@@ -76,6 +78,8 @@ export interface LaunchResult {
   codexDriver?: CodexDriver;
   /** Present for Claude agents (driven over stream-json stdin). */
   claudeDriver?: ClaudeDriver;
+  /** Present for Antigravity agents (driven over stream-json stdin). */
+  antigravityDriver?: AntigravityDriver;
 }
 
 /** CLI binary name for each agent type. */
@@ -83,6 +87,7 @@ const AGENT_COMMANDS: Record<AgentType, string> = {
   claude: "claude",
   codex: "codex",
   gemini: "npx",
+  antigravity: "agy",
   custom: "",
 };
 
@@ -113,7 +118,9 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
     return { available: false };
   }
 
-  const which = Bun.spawnSync(["which", cmd], { env: spawnEnv });
+  // MULTIAGENTS_ANTIGRAVITY_COMMAND may name another binary plus leading arguments
+  const command = type === "antigravity" ? antigravityCommand() : [cmd];
+  const which = Bun.spawnSync(["which", command[0]!], { env: spawnEnv });
   const binPath = new TextDecoder().decode(which.stdout).trim();
 
   if (which.exitCode !== 0 || !binPath) {
@@ -123,7 +130,7 @@ export async function detectAgent(type: AgentType): Promise<AgentDetection> {
   // Try to get version
   let version: string | undefined;
   try {
-    const proc = Bun.spawnSync([binPath, "--version"], { env: spawnEnv });
+    const proc = Bun.spawnSync([binPath, ...command.slice(1), "--version"], { env: spawnEnv, timeout: 15_000 });
     const out = new TextDecoder().decode(proc.stdout).trim();
     if (proc.exitCode === 0 && out) {
       version = out.split("\n")[0];
@@ -146,16 +153,135 @@ export function mcpServerCommand(agentType: AgentType): { command: string; args:
   };
 }
 
+/** The MCP config the Antigravity CLI, app and IDE share (https://antigravity.google/docs/mcp). */
+export function antigravityMcpConfigPath(): string {
+  return path.join(process.env.HOME ?? "", ".gemini", "config", "mcp_config.json");
+}
+
+/**
+ * The adapter this install runs for Antigravity. The runtime path is absolute
+ * so the entry also works where the host's PATH lacks bun.
+ */
+export function antigravityMcpServer(): { command: string; args: string[] } {
+  return {
+    command: Bun.which("bun", { PATH: ENRICHED_PATH }) ?? process.execPath,
+    args: [path.resolve(import.meta.dir, "..", "server.ts"), "--agent-type", "antigravity"],
+  };
+}
+
+type McpConfigFile = { raw: string; config: Record<string, unknown>; servers: Record<string, unknown> };
+
+/** Parses an Antigravity MCP config; a missing or empty file is an empty config, anything else unreadable is null. */
+async function readAntigravityMcpConfig(configPath: string): Promise<McpConfigFile | null> {
+  let raw = "";
+  try { raw = await Bun.file(configPath).text(); } catch { /* not created yet */ }
+  if (!raw.trim()) return { raw, config: {}, servers: {} };
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const config = parsed as Record<string, unknown>;
+  return { raw, config, servers: { ...((config.mcpServers as Record<string, unknown> | undefined) ?? {}) } };
+}
+
+async function writeAntigravityMcpConfig(configPath: string, file: McpConfigFile): Promise<void> {
+  const next = JSON.stringify({ ...file.config, mcpServers: file.servers }, null, 2);
+  if (next === file.raw) return;
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  await Bun.write(configPath, next);
+}
+
+/**
+ * Register multiagents-peer for Antigravity agents working in `projectDir`.
+ * agy has no per-launch MCP flag; it loads <workspace>/.agents/mcp_config.json
+ * and the global file, where a same-named global entry wins (agy 1.5.13). The
+ * project file gets the entry; the global one is only repaired when it already
+ * holds an entry that would shadow it or load the tools a second time.
+ */
+async function ensureAntigravityMcpConfig(projectDir: string, portOverride: string | null): Promise<void> {
+  const workspacePath = path.join(projectDir, ".agents", "mcp_config.json");
+  const workspace = await readAntigravityMcpConfig(workspacePath);
+  if (!workspace) {
+    throw new Error(`${workspacePath} is not a valid JSON object — fix or remove it, then launch the Antigravity agent again`);
+  }
+  delete workspace.servers["multiagents"];
+  const entry: Record<string, unknown> = { ...(workspace.servers["multiagents-peer"] as Record<string, unknown> | undefined), ...antigravityMcpServer() };
+  const env = { ...((entry.env as Record<string, string> | undefined) ?? {}) };
+  if (portOverride) env.MULTIAGENTS_PORT = portOverride; else delete env.MULTIAGENTS_PORT;
+  if (Object.keys(env).length > 0) entry.env = env; else delete entry.env;
+  workspace.servers["multiagents-peer"] = entry;
+  await writeAntigravityMcpConfig(workspacePath, workspace);
+
+  const globalPath = antigravityMcpConfigPath();
+  const global = await readAntigravityMcpConfig(globalPath);
+  if (!global) {
+    log(LOG_PREFIX, `${globalPath} is not valid JSON — left as it is`);
+    return;
+  }
+  const shadowing = global.servers["multiagents-peer"] as Record<string, unknown> | undefined;
+  if (!shadowing && !("multiagents" in global.servers)) return;
+  delete global.servers["multiagents"];
+  if (shadowing) global.servers["multiagents-peer"] = { ...shadowing, ...antigravityMcpServer() };
+  await writeAntigravityMcpConfig(globalPath, global);
+}
+
+type TomlTable = { head: string; lines: string[] };
+
+/** Splits TOML into its tables, each running from its header line to the next line that starts with `[`. */
+function tomlTables(toml: string): TomlTable[] {
+  const tables: TomlTable[] = [{ head: "", lines: [] }];
+  for (const line of toml.split("\n")) {
+    if (line.startsWith("[")) tables.push({ head: line.trim(), lines: [line] });
+    else tables.at(-1)!.lines.push(line);
+  }
+  return tables;
+}
+
+const isMcpServerTable = (head: string, name: string) => head === `[mcp_servers.${name}]` || head === `[mcp_servers."${name}"]`;
+const isUnderMcpServer = (head: string, name: string) => head.startsWith(`[mcp_servers.${name}.`) || head.startsWith(`[mcp_servers."${name}".`);
+
+/**
+ * ~/.codex/config.toml with a fresh multiagents-peer entry. The standalone
+ * `multiagents` server that `multiagents setup` installs is left alone;
+ * orchestrated threads switch it off themselves (see codexThreadConfig).
+ */
+export function rewriteCodexMcpConfig(toml: string, peer: { args: string[]; port: string | null }): string {
+  const tables = tomlTables(toml);
+  const hasStandalone = tables.some((t) => isMcpServerTable(t.head, "multiagents"));
+  // Tool tables whose server is gone make Codex fail with "invalid transport".
+  const kept = tables.filter((t) => !isMcpServerTable(t.head, "multiagents-peer") && (hasStandalone || !isUnderMcpServer(t.head, "multiagents")));
+  const envLine = peer.port ? `env = { MULTIAGENTS_PORT = ${JSON.stringify(peer.port)} }\n` : "";
+  // Agents run with approval_policy "never", under which Codex denies MCP tool
+  // calls that would need approval; the team tools must be pre-approved.
+  const entry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${peer.args.map((a) => JSON.stringify(a)).join(", ")}]\ndefault_tools_approval_mode = "approve"\n${envLine}`;
+  return kept.flatMap((t) => t.lines).join("\n").trimEnd() + "\n" + entry;
+}
+
+/** The thread override that keeps a configured standalone server from loading next to multiagents-peer. */
+export function codexThreadConfigFor(toml: string): Record<string, unknown> | undefined {
+  // Codex rejects the override for a server it does not know ("invalid transport"), so it is only sent when the table exists.
+  return tomlTables(toml).some((t) => isMcpServerTable(t.head, "multiagents")) ? { "mcp_servers.multiagents.enabled": false } : undefined;
+}
+
+/** Config overrides for a Codex thread the orchestrator drives. */
+export function codexThreadConfig(): Record<string, unknown> | undefined {
+  try {
+    return codexThreadConfigFor(fs.readFileSync(path.join(process.env.HOME ?? "", ".codex", "config.toml"), "utf-8"));
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Ensure the project directory has MCP configs and session file so spawned
  * agents auto-discover the multiagents MCP server and join the session.
  * Writes config files idempotently — preserves existing entries. The global
- * Codex/Gemini configs are only touched when launching that agent type
- * (or when no type is given).
+ * Codex/Gemini configs are only touched when launching that agent type (or
+ * when no type is given), the Antigravity ones only for an Antigravity agent.
  */
 export async function ensureMcpConfigs(projectDir: string, sessionId: string, agentType?: AgentType): Promise<void> {
   const writeCodex = agentType === undefined || agentType === "codex";
   const writeGemini = agentType === undefined || agentType === "gemini";
+  const writeAntigravity = agentType === "antigravity";
 
   // --- Claude: .mcp.json ---
   const mcpJsonPath = path.join(projectDir, ".mcp.json");
@@ -189,30 +315,8 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string, ag
     let codexToml = "";
     try { codexToml = await Bun.file(codexTomlPath).text(); } catch { /* ok */ }
 
-    // Helper: remove a TOML section by header. Matches from the header line
-    // up to (but not including) the next section header or end of file.
-    // Uses `^[` anchor to detect next section — handles values containing `[`.
-    const removeTomlSection = (toml: string, header: RegExp): string =>
-      toml.replace(new RegExp(header.source + "\\n(?:(?!^\\[).)*", "ms"), "");
-
-    // Remove stale "multiagents" entries AND their nested subsections (e.g.
-    // [mcp_servers.multiagents.tools.check_messages] with approval_mode).
-    // Without removing subsections, Codex sees tool configs for a server
-    // with no command/url and fails with "invalid transport".
-    while (codexToml.match(/^\[mcp_servers\.multiagents[.\]]/m)) {
-      codexToml = removeTomlSection(codexToml, /^\[mcp_servers\.multiagents[^\-][^\]]*\]\s*$/m);
-    }
-
-    // Remove existing multiagents-peer section (will be re-added below with fresh path)
-    if (codexToml.includes("multiagents-peer")) {
-      codexToml = removeTomlSection(codexToml, /^\[mcp_servers[.]"?multiagents-peer"?\]\s*$/m);
-    }
     const codexMcp = mcpServerCommand("codex");
-    const codexEnvLine = portOverride ? `env = { MULTIAGENTS_PORT = ${JSON.stringify(portOverride)} }\n` : "";
-    // Agents run with approval_policy "never", under which Codex denies MCP tool
-    // calls that would need approval; the team tools must be pre-approved.
-    const codexEntry = `\n[mcp_servers."multiagents-peer"]\ncommand = "bun"\nargs = [${codexMcp.args.map(a => JSON.stringify(a)).join(", ")}]\ndefault_tools_approval_mode = "approve"\n${codexEnvLine}`;
-    await Bun.write(codexTomlPath, codexToml.trimEnd() + "\n" + codexEntry);
+    await Bun.write(codexTomlPath, rewriteCodexMcpConfig(codexToml, { args: codexMcp.args, port: portOverride }));
   }
 
   // --- Gemini: ~/.gemini/settings.json ---
@@ -242,6 +346,8 @@ export async function ensureMcpConfigs(projectDir: string, sessionId: string, ag
   } catch {
     // Gemini config is optional — skip if ~/.gemini doesn't exist
   }
+
+  if (writeAntigravity) await ensureAntigravityMcpConfig(projectDir, portOverride);
 
   // --- Session file: .multiagents/session.json ---
   // The MCP adapter reads this to auto-join the correct session.
@@ -331,14 +437,20 @@ function rolePracticesText(role: string, roleDescription: string): string {
   ].join("\n");
 }
 
+/** How teammate messages reach the agent; `turn_driver` hosts only take a new prompt between turns. */
+type DeliveryMode = "driver" | "turn_driver" | "inbox" | "channel";
+
+const TURN_DRIVER_ARRIVAL = "While you work, teammate messages arrive inside multiagents-peer tool results under [PENDING MESSAGES], so call check_messages often; once your turn has ended they are delivered as user messages starting with [Teammate messages].";
+
 /**
  * The task prompt every agent receives first. The startup instructions live
  * here (not only in MCP instructions) because agents start working before
  * they read tool descriptions.
  */
-function buildTaskPrompt(identity: AgentIdentity, task: string, delivery: "driver" | "inbox" | "channel"): string {
+function buildTaskPrompt(identity: AgentIdentity, task: string, delivery: DeliveryMode): string {
   const arrival = {
     driver: "Teammate messages are delivered to you automatically as user messages starting with [Teammate messages]. Also call check_messages after any long operation.",
+    turn_driver: TURN_DRIVER_ARRIVAL,
     inbox: `Teammate messages arrive inside tool results under [PENDING MESSAGES] and in .multiagents/inbox/${identity.name}.md.`,
     channel: "Teammate messages arrive as channel notifications and inside tool results under [PENDING MESSAGES].",
   }[delivery];
@@ -394,10 +506,12 @@ function buildTaskPrompt(identity: AgentIdentity, task: string, delivery: "drive
 }
 
 /** Prompt for an agent restarted into an existing slot. */
-function buildHandoffPrompt(identity: AgentIdentity, handoffTask: string, delivery: "driver" | "inbox" | "channel"): string {
+function buildHandoffPrompt(identity: AgentIdentity, handoffTask: string, delivery: DeliveryMode): string {
   const arrival = delivery === "driver"
     ? "Teammate messages are delivered to you automatically as user messages starting with [Teammate messages]."
-    : `Teammate messages arrive inside tool results under [PENDING MESSAGES]${delivery === "inbox" ? ` and in .multiagents/inbox/${identity.name}.md` : ""}.`;
+    : delivery === "turn_driver"
+      ? TURN_DRIVER_ARRIVAL
+      : `Teammate messages arrive inside tool results under [PENDING MESSAGES]${delivery === "inbox" ? ` and in .multiagents/inbox/${identity.name}.md` : ""}.`;
   return [
     `You are "${identity.name}", role: ${identity.role}.`,
     identity.roleDescription,
@@ -548,6 +662,7 @@ async function spawnCodexAgent(
         cwd: identity.projectDir,
         sandbox: "workspace-write",
         developerInstructions: codexDeveloperInstructions(identity),
+        config: codexThreadConfig(),
       });
       log(LOG_PREFIX, `${identity.name} bootstrap complete: thread=${bootstrap.threadId} (${bootstrap.content.slice(0, 50)})`);
 
@@ -581,6 +696,92 @@ async function spawnCodexAgent(
   return { slotId: identity.slotId, pid: driver.pid, process: driver.process, codexDriver: driver };
 }
 
+/**
+ * Per-PID slot assignment file: the MCP server subprocess finds its slot through
+ * its parent CLI's pid even when that CLI strips the MULTIAGENTS_* env vars.
+ */
+function writeSlotFile(identity: AgentIdentity, pid: number, opts: { driverMode?: boolean } = {}): string | null {
+  try {
+    const slotsDir = path.join(identity.projectDir, ".multiagents", "slots");
+    if (!fs.existsSync(slotsDir)) fs.mkdirSync(slotsDir, { recursive: true });
+    const file = path.join(slotsDir, `${pid}.json`);
+    fs.writeFileSync(file, JSON.stringify({
+      slot_id: identity.slotId,
+      role: identity.role,
+      name: identity.name,
+      session_id: identity.sessionId,
+      ...(opts.driverMode ? { driver_mode: true, host_started: processStartTime(pid) ?? undefined } : {}),
+    }));
+    return file;
+  } catch {
+    return null;
+  }
+}
+
+/** Antigravity has no system-prompt flag, so the protocol and role practices ride on the first prompt. */
+export function antigravityFirstPrompt(identity: AgentIdentity, prompt: string): string {
+  return `${prompt}\n${FULL_PROTOCOL}\n${rolePracticesText(identity.role, identity.roleDescription)}`;
+}
+
+/** Spawn an Antigravity agent driver and hand it its first prompt (the turn runs in the background). */
+async function spawnAntigravityAgent(
+  identity: AgentIdentity,
+  firstPrompt: string,
+  brokerClient: BrokerClient,
+  resumeConversationId?: string,
+): Promise<LaunchResult> {
+  const env = agentEnv(identity);
+  env.MULTIAGENTS_DRIVER_MODE = "1";
+
+  const start = (resume?: string) => AntigravityDriver.spawn({
+    cwd: identity.projectDir,
+    env,
+    model: process.env.MULTIAGENTS_ANTIGRAVITY_MODEL || undefined,
+    resumeConversationId: resume,
+    firstPrompt: antigravityFirstPrompt(identity, firstPrompt),
+    onSpawn: (pid) => {
+      const slotFile = writeSlotFile(identity, pid, { driverMode: true });
+      return slotFile ? () => fs.rmSync(slotFile, { force: true }) : undefined;
+    },
+  });
+
+  let driver: AntigravityDriver;
+  if (resumeConversationId) {
+    try {
+      driver = await start(resumeConversationId);
+    } catch (err) {
+      log(LOG_PREFIX, `Resuming Antigravity conversation ${resumeConversationId} failed (${err instanceof Error ? err.message : err}) — starting fresh`);
+      driver = await start();
+    }
+  } else {
+    driver = await start();
+  }
+
+  if (resumeConversationId && driver.conversationId !== resumeConversationId) {
+    log(LOG_PREFIX, `Antigravity conversation ${resumeConversationId} is gone — ${identity.name} continues in a new one`);
+  }
+
+  try {
+    await brokerClient.updateSlot({
+      id: identity.slotId,
+      context_patch: {
+        antigravity_conversation_id: driver.conversationId,
+        last_summary: `Starting: ${firstPrompt.slice(0, 100)}`,
+        last_status: "working",
+        updated_at: Date.now(),
+      },
+    });
+  } catch (err) {
+    // Nothing tracks the session yet, so it would run on unsupervised.
+    await driver.kill();
+    throw err;
+  }
+
+  log(LOG_PREFIX, `Antigravity ${identity.name} (pid ${driver.pid}, conversation ${driver.conversationId}) started`);
+
+  return { slotId: identity.slotId, pid: driver.pid, process: driver.process, antigravityDriver: driver };
+}
+
 /** Spawn a one-shot Gemini (or custom) process; messages reach it through tool results. */
 function spawnProcessAgent(agentType: AgentType, identity: AgentIdentity, taskPrompt: string): LaunchResult {
   const cmd = AGENT_COMMANDS[agentType];
@@ -595,16 +796,7 @@ function spawnProcessAgent(agentType: AgentType, identity: AgentIdentity, taskPr
     env: agentEnv(identity),
   });
 
-  // Per-PID slot assignment file so the MCP server subprocess can discover its
-  // slot even if env vars are stripped by the parent CLI (read via process.ppid).
-  try {
-    const slotsDir = path.join(identity.projectDir, ".multiagents", "slots");
-    if (!fs.existsSync(slotsDir)) fs.mkdirSync(slotsDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(slotsDir, `${proc.pid}.json`),
-      JSON.stringify({ slot_id: identity.slotId, role: identity.role, name: identity.name, session_id: identity.sessionId }),
-    );
-  } catch { /* best effort */ }
+  writeSlotFile(identity, proc.pid);
 
   return { slotId: identity.slotId, pid: proc.pid, process: proc };
 }
@@ -684,6 +876,11 @@ export async function launchAgent(
         "",
         "Focus on completing the task first. Use multiagents-peer MCP tools for team communication only when needed.",
       ].join("\n"), brokerClient);
+    case "antigravity": {
+      const result = await spawnAntigravityAgent(identity, buildTaskPrompt(identity, config.initial_task, "turn_driver"), brokerClient);
+      log(LOG_PREFIX, `Launched ${config.name} (PID ${result.pid}) in slot ${slot.id}`);
+      return result;
+    }
     default: {
       const result = spawnProcessAgent(config.agent_type, identity, buildTaskPrompt(identity, config.initial_task, "inbox"));
       log(LOG_PREFIX, `Launched ${config.name} (PID ${result.pid}) in slot ${slot.id}`);
@@ -696,7 +893,8 @@ export async function launchAgent(
  * Relaunch an agent into an EXISTING disconnected slot (resume/respawn).
  * No new slot is created: the identity points at the existing slot and the
  * broker's registration logic reconnects the adapter to it. Claude sessions
- * are resumed by id when the slot's snapshot remembers one.
+ * and Antigravity conversations are resumed by id when the slot's snapshot
+ * remembers one.
  */
 export async function relaunchIntoSlot(
   sessionId: string,
@@ -734,6 +932,15 @@ export async function relaunchIntoSlot(
     }
     case "codex":
       return spawnCodexAgent(identity, buildHandoffPrompt(identity, handoffTask, "driver"), brokerClient);
+    case "antigravity": {
+      let resumeConversationId: string | undefined;
+      try {
+        resumeConversationId = JSON.parse(slot.context_snapshot ?? "{}").antigravity_conversation_id ?? undefined;
+      } catch { /* no snapshot */ }
+      const result = await spawnAntigravityAgent(identity, buildHandoffPrompt(identity, handoffTask, "turn_driver"), brokerClient, resumeConversationId);
+      log(LOG_PREFIX, `Relaunched ${identity.name} (PID ${result.pid}) into existing slot ${slot.id}`);
+      return result;
+    }
     default: {
       const result = spawnProcessAgent(slot.agent_type, identity, buildHandoffPrompt(identity, handoffTask, "inbox"));
       log(LOG_PREFIX, `Relaunched ${identity.name} (PID ${result.pid}) into existing slot ${slot.id}`);
@@ -743,8 +950,8 @@ export async function relaunchIntoSlot(
 }
 
 /**
- * Build CLI arguments for the process-based agent types. Claude and Codex are
- * driven over their session protocols instead (see ClaudeDriver/CodexDriver).
+ * Build CLI arguments for the process-based agent types. Claude, Codex and
+ * Antigravity are driven over their session protocols instead (see the drivers).
  */
 export function buildCliArgs(agentType: AgentType, task: string): string[] {
   switch (agentType) {

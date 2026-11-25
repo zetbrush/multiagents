@@ -1,7 +1,7 @@
 /**
  * multiagents
  *
- * Multi-agent orchestration platform for Claude Code, Codex CLI, and Gemini CLI.
+ * Multi-agent orchestration platform for Claude Code, Codex CLI, and Antigravity CLI (plus the legacy Gemini CLI).
  *
  * Entry points:
  *   - server.ts                         — MCP server (one per agent instance)
