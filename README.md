@@ -3,7 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/multiagents.svg)](https://www.npmjs.com/package/multiagents)
 [![npm downloads](https://img.shields.io/npm/dm/multiagents.svg)](https://www.npmjs.com/package/multiagents)
 
-Multi-agent orchestration platform for **Claude Code**, **Codex CLI**, and **Gemini CLI**. Enables AI agents to discover each other, communicate in real-time, coordinate file edits, and work as a team on shared codebases.
+Multi-agent orchestration platform for **Claude Code**, **Codex CLI**, and **Antigravity CLI** (the legacy **Gemini CLI** still works for accounts that can run it). Enables AI agents to discover each other, communicate in real-time, coordinate file edits, and work as a team on shared codebases.
 
 Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 
@@ -11,10 +11,10 @@ Built on [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Claude Code  │     │  Codex CLI  │     │ Gemini CLI  │
+│ Claude Code  │     │  Codex CLI  │     │ Antigravity │
 │ (Engineer)   │     │ (Reviewer)  │     │ (Designer)  │
 └──────┬───────┘     └──────┬──────┘     └──────┬──────┘
-       │ ClaudeDriver + MCP │ CodexDriver + MCP  │ MCP (stdio)
+       │ ClaudeDriver + MCP │ CodexDriver + MCP  │ AntigravityDriver + MCP
        └────────────┬───────┴────────────────────┘
                     │
             ┌───────▼────────┐
@@ -50,7 +50,7 @@ bun install -g multiagents
 # Setup (detects CLIs, configures MCP servers, starts broker)
 multiagents setup
 
-# Restart your Claude Code / Codex / Gemini sessions to load MCP tools
+# Restart your Claude Code / Codex / Antigravity sessions to load MCP tools
 
 # Monitor
 multiagents dashboard
@@ -63,7 +63,7 @@ multiagents update
 
 `multiagents setup` registers two MCP servers in Claude Code (`~/.claude.json`): `multiagents` (the agent tools) and `multiagents-orch` (the orchestrator). Claude Desktop or any other MCP client can run the orchestrator too (`multiagents orchestrator`). Ask Claude to create a team:
 
-> "Create a team of 3 agents: a Claude engineer, a Codex reviewer, and a Gemini designer.
+> "Create a team of 3 agents: a Claude engineer, a Codex reviewer, and an Antigravity designer.
 > Build a calculator web app in TypeScript."
 
 The orchestrator handles everything: spawning agents, assigning roles, creating slots, launching the dashboards, delivering messages between agents, and respawning agents that crash.
@@ -74,9 +74,12 @@ The orchestrator handles everything: spawning agents, assigning roles, creating 
 |-------|-------------------|---------|--------|
 | Claude Code | ClaudeDriver (`claude -p --input-format stream-json`): messages written as user messages, read mid-turn. Interactive sessions additionally get channel notifications. | ≤3s | `~/.claude.json` (driver-launched agents get an inline `--mcp-config`) |
 | Codex CLI | CodexDriver (`codex app-server`): `turn/steer` mid-turn, new turn when idle | <3s mid-turn, 3-9s between turns | `~/.codex/config.toml` |
-| Gemini CLI | Prepended to MCP tool results + file inbox | next tool call | `~/.gemini/settings.json` |
+| Antigravity CLI (`agy`) | AntigravityDriver (`agy --input-format stream-json --output-format stream-json`): a new turn when idle; while a turn runs, messages ride on the agent's next multiagents tool result | ≤3s when idle, next tool call mid-turn | `<project>/.agents/mcp_config.json` (driver-launched agents), `~/.gemini/config/mcp_config.json` (`multiagents setup`) |
+| Gemini CLI (legacy) | Prepended to MCP tool results + file inbox | next tool call | `~/.gemini/settings.json` |
 
-All three also receive unread messages under `[PENDING MESSAGES]` at the top of their next MCP tool result; a message counts as delivered only once it was surfaced to the model (acked), so a dropped delivery is retried instead of lost.
+All of them also receive unread messages under `[PENDING MESSAGES]` at the top of their next MCP tool result; a message counts as delivered only once it was surfaced to the model (acked), so a dropped delivery is retried instead of lost.
+
+Google stopped serving Gemini CLI to free, AI Pro and AI Ultra accounts on June 18, 2026 in favour of Antigravity CLI; it keeps working with a paid Gemini API key or a Gemini Code Assist Standard/Enterprise licence, so the `gemini` agent type stays available for those accounts.
 
 ### Codex Integration (CodexDriver)
 
@@ -89,11 +92,21 @@ Codex CLI uses the **app-server protocol** — a JSON-RPC stdio interface with t
 5. Answers server-initiated requests unattended: command execution, file changes and permission requests are approved for the session; elicitations and user-input questions are declined; dynamic tool calls are refused
 6. Reads token usage from `thread/tokenUsage/updated` (cumulative per thread) and, after a crash, resumes the same thread (`thread/resume`)
 
+Codex only loads MCP servers from the global `~/.codex/config.toml`, so each launch refreshes the `multiagents-peer` section there. The standalone `multiagents` server that `multiagents setup` installs in the same file is left untouched; orchestrated threads switch it off for themselves with a per-thread config override (`mcp_servers.multiagents.enabled = false` on `thread/start` and `thread/resume`), so an agent gets the team tools once.
+
 The orchestrator **drives Codex turns**: the delivery loop polls the broker every 3s. If Codex has an active turn, messages are steered in and acked at once. If idle, a new turn is started via `driver.reply()` and the messages are acked when it completes.
 
 ### Claude Integration (ClaudeDriver)
 
 Headless `claude -p` sessions drop MCP channel notifications, so orchestrator-launched Claude agents run inside a **ClaudeDriver**: one long-lived `claude -p --input-format stream-json --output-format stream-json --replay-user-messages` process per agent, with the team MCP server passed inline (`--mcp-config`). Teammate messages are written to its stdin as user messages, which Claude reads at its next tool-call boundary — even in the middle of a long turn. A message is acked only when Claude echoes it back (`isReplay`); until then it stays in flight so no tick writes it again, and if the process dies first the message stays queued for the respawned agent, which resumes the same session (`--resume`). Input and cache tokens are metered per API call from `assistant` events; output tokens at the turn's `result`. A released agent is closed gracefully (stdin EOF) once it goes idle.
+
+### Antigravity Integration (AntigravityDriver)
+
+Orchestrator-launched Antigravity agents run inside an **AntigravityDriver**: one long-lived `agy --input-format stream-json --output-format stream-json --dangerously-skip-permissions` process per agent, fed prompts on stdin as `{"event":"user","message":{"content":…}}` lines. The CLI has no system-prompt or per-launch MCP flag, so the team protocol and role practices ride on the first prompt and the `multiagents-peer` server is registered in the project's own `.agents/mcp_config.json`. The config the CLI shares with the Antigravity app and IDE (`~/.gemini/config/mcp_config.json`) is only touched when it already holds a multiagents entry, because `agy` prefers a same-named global entry over the project one. `agy` starts the adapter as its own child with its working directory and environment, so the adapter gets its slot from the launcher's environment variables, with a per-PID slot file as the fallback.
+
+Antigravity runs one turn per prompt, so the delivery loop only starts a new turn when the session is idle and acks the messages once the CLI reports the prompt as read (`user_input` step). While a turn runs, messages stay unclaimed and reach the model on its next `multiagents-peer` tool call. Token usage comes from each turn's `result` event (cumulative over the conversation, so only the increase is recorded). After a crash the agent is respawned into its conversation (`--conversation <id>`; an id the CLI no longer knows simply starts a new one), and a released agent is closed gracefully (stdin EOF) once idle. `agy` must be signed in (it reuses the Antigravity app's sign-in from the keychain) or configured for a Gemini API key before the orchestrator can run it headless.
+
+The driver follows the CLI's [headless-mode reference](https://antigravity.google/docs/cli/headless) and was checked against `agy` 1.5.13; `MULTIAGENTS_LIVE_TESTS=1 bun test tests/live-antigravity.test.ts` repeats that check against the `agy` installed on your machine, and the rest of the suite runs against a protocol fake (`tests/fakes/fake-agy.ts`).
 
 ## Task State Machine
 
@@ -262,7 +275,7 @@ multiagents version                   Print the installed version
 multiagents help [command]            Detailed help
 ```
 
-`multiagents mcp-server --agent-type <claude|codex|gemini>` and `multiagents orchestrator` are the MCP server entry points the agent CLIs and the orchestrator host run; `multiagents setup` configures them.
+`multiagents mcp-server --agent-type <claude|codex|antigravity|gemini>` and `multiagents orchestrator` are the MCP server entry points the agent CLIs and the orchestrator host run; `multiagents setup` configures them.
 
 ## Architecture
 
@@ -283,15 +296,17 @@ multiagents/
 ├── adapters/
 │   ├── base-adapter.ts     Abstract MCP adapter (tools, registration, pending-message delivery + ack)
 │   ├── protocol-text.ts    Team protocol text (short form for MCP instructions, full form for prompts)
-│   ├── inbox.ts            File-based inbox for hosts without push (Codex, Gemini)
+│   ├── inbox.ts            File-based inbox for hosts without push (Codex, Antigravity, Gemini)
 │   ├── claude-adapter.ts   Claude Code adapter (tool-result delivery + best-effort channel push)
 │   ├── codex-adapter.ts    Codex adapter (tool-result delivery + file inbox)
+│   ├── antigravity-adapter.ts  Antigravity adapter (tool-result delivery, also under its driver)
 │   ├── gemini-adapter.ts   Gemini adapter (tool-result delivery + file inbox)
 │   └── role-practices.ts   Role-specific best practices injection
 ├── orchestrator/
 │   ├── orchestrator-server.ts  Orchestrator MCP server (team management, driver delivery loop)
 │   ├── claude-driver.ts    ClaudeDriver: long-lived `claude -p --input-format stream-json` session
 │   ├── codex-driver.ts     CodexDriver: persistent codex app-server via JSON-RPC (steer/interrupt)
+│   ├── antigravity-driver.ts  AntigravityDriver: long-lived `agy --input-format stream-json` session
 │   ├── delivery.ts         Hands unacked messages to drivers, acks on confirmed hand-off
 │   ├── launcher.ts         Agent spawning (drivers, MCP configs, prompts)
 │   ├── monitor.ts          Process/driver monitoring (event parsing, token tracking)
@@ -324,6 +339,7 @@ multiagents/
 ### Delivery and Supervision
 
 - The orchestrator's delivery loop runs every 3s (one tick at a time): unacked messages for each driver-managed slot are handed to its driver and acked only on confirmed hand-off; a released slot's driver is closed once it is idle (a Codex driver is judged by its notifications, not heartbeats, with a 10-minute hard cap).
+- Antigravity sessions take a new prompt only between turns: the loop leaves their messages unclaimed while a turn runs, so the agent's next multiagents tool call picks them up.
 - Agents launched as plain processes (Gemini) get messages in their next tool result; a watchdog respawns one whose actionable messages stay unclaimed for more than 2 minutes, and respawns disconnected slots with pending messages.
 - Every component resolves the broker port through `MULTIAGENTS_PORT`, and the orchestrator forwards it to the agents it spawns.
 
@@ -368,6 +384,8 @@ Every pull request runs `.github/workflows/ci.yml` (`bun install --frozen-lockfi
 | `MULTIAGENTS_NO_DASHBOARD` | - | Orchestrator: do not launch the terminal or web dashboards (tests, headless hosts) |
 | `MULTIAGENTS_CLAUDE_MODEL` | - | Model for driver-launched Claude agents (e.g. `haiku`) |
 | `MULTIAGENTS_CLAUDE_COMMAND` / `MULTIAGENTS_CODEX_COMMAND` | `claude` / `codex app-server` | Override the CLI binaries the drivers run |
+| `MULTIAGENTS_ANTIGRAVITY_COMMAND` | `agy` | Override the Antigravity CLI binary; extra words are passed as leading arguments (e.g. `agy --sandbox`) |
+| `MULTIAGENTS_ANTIGRAVITY_MODEL` | - | Model slug for driver-launched Antigravity agents (see `agy models`) |
 | `MULTIAGENTS_CLEANUP_INTERVAL_MS` | `30000` | Broker stale-peer sweep interval |
 | `MULTIAGENTS_LIVE_TESTS` | - | `1` runs the live tests against the real CLIs (costs API usage) |
 | `MULTIAGENTS_SESSION` / `MULTIAGENTS_SLOT` / `MULTIAGENTS_ROLE` / `MULTIAGENTS_NAME` | - | Agent identity, set by the orchestrator (also passed as `--session/--slot/--role/--name` args) |
@@ -380,14 +398,15 @@ HOME=$(mktemp -d) bun test          # unit + integration suite (the launcher tes
 bunx tsc --noEmit
 MULTIAGENTS_PORT=17910 bun tests/e2e-team.ts --timeout 600   # real Claude + Codex team on an isolated broker
 MULTIAGENTS_LIVE_TESTS=1 bun test tests/live-orchestrator.test.ts   # real team through the orchestrator server
+MULTIAGENTS_LIVE_TESTS=1 bun test tests/live-antigravity.test.ts    # real `agy` agent (needs a signed-in Antigravity CLI)
 ```
 
-Driver tests run against protocol fakes in `tests/fakes/`; adapters are exercised as real processes over MCP stdio. The e2e and live tests launch real CLIs and rewrite `~/.codex/config.toml` for the run's broker port — back it up first (the live tests restore it themselves). Every pull request runs the unit/integration suite in CI.
+Driver tests run against protocol fakes in `tests/fakes/`; adapters are exercised as real processes over MCP stdio. The e2e and live tests launch real CLIs and rewrite the `multiagents-peer` section of `~/.codex/config.toml` for the run's broker port — back it up first (the live tests restore it themselves, keeping anything your own Codex wrote meanwhile). Every pull request runs the unit/integration suite in CI.
 
 ## Requirements
 
 - [Bun](https://bun.sh/) runtime (v1.1+)
-- At least one of: Claude Code, Codex CLI, or Gemini CLI
+- At least one of: Claude Code, Codex CLI, or Antigravity CLI (`agy`); Gemini CLI is supported as a legacy agent
 - `lsof` (optional; ships with macOS): used by `multiagents broker stop`, and by `multiagents update` to find a broker that does not report its pid
 
 ## License

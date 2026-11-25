@@ -119,3 +119,16 @@ export function slugify(text: string): string {
 
 // Re-export AGENT_ID_PREFIXES for convenience
 export { AGENT_ID_PREFIXES };
+
+/**
+ * When the process with this pid started (`ps` lstart, C locale), or null if
+ * that cannot be told. Distinguishes a process from a later one reusing its pid.
+ */
+export function processStartTime(pid: number): string | null {
+  try {
+    const out = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { env: { ...process.env, LC_ALL: "C" } }).stdout.toString().trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}

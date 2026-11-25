@@ -9,6 +9,7 @@ import type { Subprocess } from "bun";
 import type { BrokerClient } from "../shared/broker-client.ts";
 import type { CodexDriver, CodexNotification } from "./codex-driver.ts";
 import type { ClaudeDriver, ClaudeEvent } from "./claude-driver.ts";
+import type { AntigravityDriver, AntigravityEvent } from "./antigravity-driver.ts";
 import { log } from "../shared/utils.ts";
 
 const LOG_PREFIX = "monitor";
@@ -542,5 +543,122 @@ async function handleCodexNotification(
   if (method === "item/started") {
     await autoTransitionToWorking(slotId, brokerClient);
     return;
+  }
+}
+
+/**
+ * Monitor an AntigravityDriver via its stream-json events. A result's usage is
+ * cumulative over the conversation, so only its growth counts; the baseline
+ * lives with the driver. After --conversation the first result already holds
+ * the earlier turns, so that turn is counted from its steps' own usage instead.
+ */
+export function monitorAntigravityDriver(
+  driver: AntigravityDriver,
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+  onEvent: (event: AgentEvent) => void,
+): void {
+  const zero = (): TokenCounts => ({ input: 0, output: 0, cacheRead: 0 });
+  const tracking: AntigravityTracking = { resultsSeen: 0, totals: zero(), turn: zero(), meteredSteps: new Set(), responseStep: null, responseText: "" };
+  driver.onEvent((event: AntigravityEvent) => {
+    void handleAntigravityEvent(event, tracking, slotId, sessionId, brokerClient, onEvent);
+  });
+}
+
+interface AntigravityTracking {
+  resultsSeen: number;
+  /** Totals of the last result. */
+  totals: TokenCounts;
+  /** Usage of the steps finished since the last result. */
+  turn: TokenCounts;
+  meteredSteps: Set<number>;
+  responseStep: number | null;
+  responseText: string;
+}
+
+function antigravityUsage(usage: Record<string, number>): TokenCounts {
+  return { input: usage.input_tokens ?? 0, output: usage.output_tokens ?? 0, cacheRead: usage.cache_read_tokens ?? 0 };
+}
+
+async function handleAntigravityEvent(
+  event: AntigravityEvent,
+  tracking: AntigravityTracking,
+  slotId: number,
+  sessionId: string,
+  brokerClient: BrokerClient,
+  onEvent: (event: AgentEvent) => void,
+): Promise<void> {
+  try {
+    if (event.event === "step_update") {
+      const step = (event.step_update ?? {}) as {
+        step_index?: number; state?: string; step_type?: string; tool_name?: string; text_delta?: string; usage?: Record<string, number>;
+        tool_info?: { name?: string; parameters?: Record<string, unknown> };
+      };
+
+      if (step.state === "DONE" && step.usage && typeof step.step_index === "number" && !tracking.meteredSteps.has(step.step_index)) {
+        tracking.meteredSteps.add(step.step_index);
+        const used = antigravityUsage(step.usage);
+        tracking.turn = { input: tracking.turn.input + used.input, output: tracking.turn.output + used.output, cacheRead: tracking.turn.cacheRead + used.cacheRead };
+      }
+
+      if (step.step_type === "agent_response") {
+        if (step.step_index !== tracking.responseStep) {
+          tracking.responseStep = step.step_index ?? null;
+          tracking.responseText = "";
+        }
+        tracking.responseText += step.text_delta ?? "";
+        if (step.state !== "DONE") return;
+        const text = tracking.responseText.trim();
+        tracking.responseStep = null;
+        tracking.responseText = "";
+        await autoTransitionToWorking(slotId, brokerClient);
+        if (text) await patchSummary(slotId, text.slice(0, 200), brokerClient);
+        return;
+      }
+
+      if (step.step_type === "tool" && step.state === "DONE") {
+        await autoTransitionToWorking(slotId, brokerClient);
+        const name = step.tool_info?.name ?? step.tool_name ?? "unknown";
+        const params = step.tool_info?.parameters ?? {};
+        const summary = typeof params.CommandLine === "string"
+          ? `Running: ${params.CommandLine}`
+          : typeof params.ToolName === "string"
+            ? `MCP: ${typeof params.ServerName === "string" ? params.ServerName : ""}/${params.ToolName}`
+            : `Tool: ${name}`;
+        await patchSummary(slotId, summary.slice(0, 100), brokerClient);
+        onEvent({ type: "agent_progress", severity: "info", slotId, sessionId, message: `Antigravity ${name} in slot ${slotId}` });
+      }
+      return;
+    }
+
+    if (event.event === "result") {
+      const result = (event.result ?? {}) as { status?: string; response?: string; num_turns?: number; usage?: Record<string, number> };
+      onEvent({
+        type: "agent_output",
+        severity: "info",
+        slotId,
+        sessionId,
+        message: `Antigravity turn ${result.status ?? "finished"} in slot ${slotId}`,
+        data: { result: result.response, status: result.status },
+      });
+
+      const first = tracking.resultsSeen++ === 0;
+      const turn = tracking.turn;
+      tracking.turn = { input: 0, output: 0, cacheRead: 0 };
+      tracking.meteredSteps.clear();
+      if (!result.usage) return;
+      const totals = antigravityUsage(result.usage);
+      const previous = tracking.totals;
+      tracking.totals = totals;
+      const resumed = first && (result.num_turns ?? 1) > 1;
+      await updateTokenUsage(slotId, resumed ? turn : {
+        input: Math.max(0, totals.input - previous.input),
+        output: Math.max(0, totals.output - previous.output),
+        cacheRead: Math.max(0, totals.cacheRead - previous.cacheRead),
+      }, brokerClient, "per_turn");
+    }
+  } catch (err) {
+    log(LOG_PREFIX, `antigravity event handling error for slot ${slotId}: ${err}`);
   }
 }

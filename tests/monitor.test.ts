@@ -5,8 +5,9 @@
  */
 
 import { test, expect, describe } from "bun:test";
-import { processEvent, monitorCodexDriver } from "../orchestrator/monitor.ts";
+import { processEvent, monitorCodexDriver, monitorAntigravityDriver, clearAllTracking } from "../orchestrator/monitor.ts";
 import type { CodexNotification } from "../orchestrator/codex-driver.ts";
+import type { AntigravityEvent } from "../orchestrator/antigravity-driver.ts";
 
 function fakeBroker() {
   const updates: Array<Record<string, unknown>> = [];
@@ -118,5 +119,116 @@ describe("monitorCodexDriver — app-server notifications", () => {
     const patch = updates.find((u) => u.context_patch !== undefined);
     expect((patch!.context_patch as Record<string, unknown>).last_summary).toBe("Tests are green.");
     expect(updates.some((u) => u.context_snapshot !== undefined)).toBe(false);
+  });
+});
+
+describe("monitorAntigravityDriver — stream-json events", () => {
+  function fakeDriver() {
+    let listener: ((e: AntigravityEvent) => void) | null = null;
+    return {
+      driver: { onEvent: (cb: (e: AntigravityEvent) => void) => { listener = cb; } } as any,
+      emit: (event: AntigravityEvent) => listener!(event),
+    };
+  }
+  const result = (numTurns: number, usage: Record<string, number>): AntigravityEvent =>
+    ({ event: "result", result: { conversation_id: "c1", status: "SUCCESS", response: "ok\n", num_turns: numTurns, usage } });
+  const step = (fields: Record<string, unknown>): AntigravityEvent =>
+    ({ event: "step_update", step_update: { conversation_id: "c1", ...fields } });
+
+  test("result usage is cumulative over the session, so only the increase is recorded", async () => {
+    const { broker, updates } = fakeBroker();
+    const { driver, emit } = fakeDriver();
+    monitorAntigravityDriver(driver, 4250, "session-a", broker, () => {});
+    emit(result(1, { input_tokens: 30384, output_tokens: 4, cache_read_tokens: 0, thinking_tokens: 0, total_tokens: 30388 }));
+    emit(result(2, { input_tokens: 30662, output_tokens: 8, cache_read_tokens: 30214, thinking_tokens: 0, total_tokens: 30670 }));
+    await untilUpdates(updates, 2);
+
+    expect(tokenUpdates(updates)).toEqual([
+      { id: 4250, input_tokens: 30384, output_tokens: 4, cache_read_tokens: 0 },
+      { id: 4250, input_tokens: 278, output_tokens: 4, cache_read_tokens: 30214 },
+    ]);
+  });
+
+  test("a new process in the same slot counts from zero again", async () => {
+    const { broker, updates } = fakeBroker();
+    const first = fakeDriver();
+    monitorAntigravityDriver(first.driver, 4251, "session-a", broker, () => {});
+    first.emit(result(1, { input_tokens: 5000, output_tokens: 900, cache_read_tokens: 100 }));
+    await untilUpdates(updates, 1);
+
+    const second = fakeDriver();
+    monitorAntigravityDriver(second.driver, 4251, "session-a", broker, () => {});
+    second.emit(result(1, { input_tokens: 200, output_tokens: 30, cache_read_tokens: 0 }));
+    await untilUpdates(updates, 2);
+
+    expect(tokenUpdates(updates).at(-1)).toEqual({ id: 4251, input_tokens: 200, output_tokens: 30, cache_read_tokens: 0 });
+  });
+
+  test("clearing another session's tracking does not make a live session's total count again", async () => {
+    const { broker, updates } = fakeBroker();
+    const { driver, emit } = fakeDriver();
+    monitorAntigravityDriver(driver, 4255, "session-a", broker, () => {});
+    emit(result(1, { input_tokens: 1000, output_tokens: 100, cache_read_tokens: 0 }));
+    await untilUpdates(updates, 1);
+    clearAllTracking();
+    emit(result(2, { input_tokens: 1200, output_tokens: 130, cache_read_tokens: 0 }));
+    await untilUpdates(updates, 2);
+
+    expect(tokenUpdates(updates).at(-1)).toEqual({ id: 4255, input_tokens: 200, output_tokens: 30, cache_read_tokens: 0 });
+  });
+
+  test("a resumed conversation's first turn is counted from its steps, later turns from the growth of the totals", async () => {
+    const { broker, updates } = fakeBroker();
+    const { driver, emit } = fakeDriver();
+    monitorAntigravityDriver(driver, 4252, "session-a", broker, () => {});
+    // totals as agy 1.5.13 reports them after --conversation: the earlier turns are included
+    emit(step({ step_index: 6, state: "DONE", step_type: "user_input" }));
+    emit(step({ step_index: 8, state: "DONE", step_type: "agent_response", text_delta: "\n", usage: { input_tokens: 23115, output_tokens: 46, cache_read_tokens: 0 } }));
+    emit(result(3, { input_tokens: 50022, output_tokens: 407, cache_read_tokens: 40885 }));
+    emit(step({ step_index: 10, state: "DONE", step_type: "agent_response", usage: { input_tokens: 300, output_tokens: 10, cache_read_tokens: 100 } }));
+    emit(result(4, { input_tokens: 50322, output_tokens: 417, cache_read_tokens: 40985 }));
+    await untilUpdates(tokenUpdates(updates), 2);
+
+    expect(tokenUpdates(updates)).toEqual([
+      { id: 4252, input_tokens: 23115, output_tokens: 46, cache_read_tokens: 0 },
+      { id: 4252, input_tokens: 300, output_tokens: 10, cache_read_tokens: 100 },
+    ]);
+  });
+
+  test("an MCP tool step is summarised by server and tool", async () => {
+    const { broker, updates } = fakeBroker();
+    const { driver, emit } = fakeDriver();
+    monitorAntigravityDriver(driver, 4256, "session-a", broker, () => {});
+    emit(step({ step_index: 7, state: "DONE", step_type: "tool", tool_name: "call_mcp_tool", tool_info: { name: "call_mcp_tool", parameters: { Arguments: { summary: "ready" }, ServerName: "multiagents-peer", ToolName: "set_summary" }, output: "ok" } }));
+    await untilUpdates(updates, 1);
+
+    const patch = updates.find((u) => u.context_patch !== undefined);
+    expect((patch!.context_patch as Record<string, unknown>).last_summary).toBe("MCP: multiagents-peer/set_summary");
+  });
+
+  test("response text deltas are joined into the slot summary when the step is done", async () => {
+    const { broker, updates } = fakeBroker();
+    const { driver, emit } = fakeDriver();
+    monitorAntigravityDriver(driver, 4253, "session-a", broker, () => {});
+    emit(step({ step_index: 2, state: "ACTIVE", step_type: "agent_response", text_delta: "Tests are " }));
+    emit(step({ step_index: 2, state: "DONE", step_type: "agent_response", text_delta: "green.\n" }));
+    await untilUpdates(updates, 1);
+
+    const patch = updates.find((u) => u.context_patch !== undefined);
+    expect((patch!.context_patch as Record<string, unknown>).last_summary).toBe("Tests are green.");
+    expect(updates.some((u) => u.context_snapshot !== undefined)).toBe(false);
+  });
+
+  test("a finished tool step is recorded as activity and reported as progress", async () => {
+    const { broker, updates } = fakeBroker();
+    const { driver, emit } = fakeDriver();
+    const events: string[] = [];
+    monitorAntigravityDriver(driver, 4254, "session-a", broker, (e) => { events.push(e.type); });
+    emit(step({ step_index: 4, state: "DONE", step_type: "tool", tool_name: "run_command", tool_info: { name: "run_command", parameters: { CommandLine: "bun test" }, output: "ok" } }));
+    await untilUpdates(updates, 1);
+
+    const patch = updates.find((u) => u.context_patch !== undefined);
+    expect((patch!.context_patch as Record<string, unknown>).last_summary).toBe("Running: bun test");
+    expect(events).toContain("agent_progress");
   });
 });

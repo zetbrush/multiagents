@@ -16,7 +16,7 @@ import type { Subprocess } from "bun";
 
 import * as fs from "node:fs";
 import { BrokerClient } from "../shared/broker-client.ts";
-import type { AgentLaunchConfig } from "../shared/types.ts";
+import type { AgentLaunchConfig, AgentType } from "../shared/types.ts";
 import { log, getGitRoot, slugify, formatDuration, safeJsonParse } from "../shared/utils.ts";
 import {
   GUARDRAIL_CHECK_INTERVAL,
@@ -28,11 +28,12 @@ import { brokerUrl } from "../shared/broker-url.ts";
 
 import { detectAgent, launchAgent, relaunchIntoSlot, announceNewMember, buildTeamContext, ENRICHED_PATH } from "./launcher.ts";
 import { getGuide, formatTopicList, type GuideTopic } from "./guide.ts";
-import { monitorProcess, monitorCodexDriver, monitorClaudeDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
+import { monitorProcess, monitorCodexDriver, monitorClaudeDriver, monitorAntigravityDriver, clearSlotTracking, clearAllTracking, type AgentEvent } from "./monitor.ts";
 import { deliverPendingMessages, type DriverSlot } from "./delivery.ts";
 import { RespawnGuard } from "./respawn-guard.ts";
 import type { CodexDriver } from "./codex-driver.ts";
 import type { ClaudeDriver } from "./claude-driver.ts";
+import type { AntigravityDriver } from "./antigravity-driver.ts";
 import { getTeamStatus, formatTeamStatusForDisplay } from "./progress.ts";
 import { checkGuardrails, enforceGuardrails } from "./guardrails.ts";
 import { handleAgentCrash, clearAllCrashHistory } from "./recovery.ts";
@@ -46,7 +47,7 @@ const BROKER_URL = brokerUrl();
 const activeProcesses: Map<string, Map<number, Subprocess>> = new Map();
 // Track pending events to push as notifications
 const pendingEvents: AgentEvent[] = [];
-// Driver-managed agents (Claude over stream-json, Codex over app-server), one driver per slot
+// Driver-managed agents (Claude and Antigravity over stream-json, Codex over app-server), one driver per slot
 const activeDrivers = new DriverRegistry();
 // One respawn per slot at a time, whichever path (crash, code-0 exit, watchdog, resume) triggers it
 const respawnGuard = new RespawnGuard();
@@ -56,6 +57,18 @@ interface LaunchedAgent {
   process: Subprocess;
   codexDriver?: CodexDriver;
   claudeDriver?: ClaudeDriver;
+  antigravityDriver?: AntigravityDriver;
+}
+
+/** Launch APIs accept these; `custom` slots are never spawned by the orchestrator. */
+const LAUNCHABLE_AGENT_TYPES = ["claude", "codex", "antigravity", "gemini"] as const satisfies readonly AgentType[];
+type LaunchableAgentType = typeof LAUNCHABLE_AGENT_TYPES[number];
+
+function driverLabel(result: LaunchedAgent): string {
+  if (result.codexDriver) return ", CodexDriver";
+  if (result.claudeDriver) return ", ClaudeDriver";
+  if (result.antigravityDriver) return ", AntigravityDriver";
+  return "";
 }
 
 async function slotIsReleased(slotId: number, brokerClient: BrokerClient): Promise<boolean> {
@@ -66,10 +79,10 @@ async function slotIsReleased(slotId: number, brokerClient: BrokerClient): Promi
   }
 }
 
-/** Graceful stop: Claude finishes its turn and exits on stdin EOF, Codex is killed. */
+/** Graceful stop: Claude and Antigravity finish their turn and exit on stdin EOF, Codex is killed. */
 async function closeDriver(state: DriverSlot): Promise<void> {
-  if (state.kind === "claude") await state.driver.close();
-  else await state.driver.kill();
+  if (state.kind === "codex") await state.driver.kill();
+  else await state.driver.close();
 }
 
 /**
@@ -115,7 +128,9 @@ function trackLaunch(sessionId: string, slotId: number, result: LaunchedAgent, b
     ? { kind: "claude", driver: result.claudeDriver, busy: false, lastNudge: 0 }
     : result.codexDriver
       ? { kind: "codex", driver: result.codexDriver, threadId: result.codexDriver.threadId, busy: false, lastNudge: 0 }
-      : null;
+      : result.antigravityDriver
+        ? { kind: "antigravity", driver: result.antigravityDriver, busy: false, lastNudge: 0 }
+        : null;
   if (!state) {
     monitorProcess(result.process, slotId, sessionId, brokerClient, handleEvent);
     return;
@@ -128,6 +143,8 @@ function trackLaunch(sessionId: string, slotId: number, result: LaunchedAgent, b
   }
   if (state.kind === "claude") {
     monitorClaudeDriver(state.driver, slotId, sessionId, brokerClient, handleEvent);
+  } else if (state.kind === "antigravity") {
+    monitorAntigravityDriver(state.driver, slotId, sessionId, brokerClient, handleEvent);
   } else {
     monitorCodexDriver(state.driver, slotId, sessionId, brokerClient, handleEvent);
   }
@@ -306,7 +323,7 @@ async function respawnAfterCrash(event: AgentEvent): Promise<void> {
       log(LOG_PREFIX, `Slot ${event.slotId} is already being respawned — skipping crash respawn`);
       return;
     }
-    log(LOG_PREFIX, `Auto-respawned slot ${event.slotId} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : result.claudeDriver ? ", ClaudeDriver" : ""})`);
+    log(LOG_PREFIX, `Auto-respawned slot ${event.slotId} (PID ${result.pid}${driverLabel(result)})`);
     pendingEvents.push({
       type: "agent_restarted",
       severity: "info",
@@ -374,7 +391,7 @@ async function autoRestartIfIncomplete(
         log(LOG_PREFIX, `${name} is already being respawned — skipping code-0 restart`);
         return true;
       }
-      log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid}${result.codexDriver ? ", CodexDriver" : result.claudeDriver ? ", ClaudeDriver" : ""})`);
+      log(LOG_PREFIX, `Auto-restarted ${name} (PID ${result.pid}${driverLabel(result)})`);
 
       pendingEvents.push({
         type: "agent_restarted",
@@ -433,7 +450,7 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
             items: {
               type: "object",
               properties: {
-                agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
+                agent_type: { type: "string", enum: [...LAUNCHABLE_AGENT_TYPES], description: "Agent CLI: claude (Claude Code), codex (Codex CLI), antigravity (Antigravity CLI, `agy`) or gemini (legacy Gemini CLI — paid API key or enterprise access only)." },
                 name: { type: "string", description: "Display name for the agent, e.g., 'Alice' or 'Backend Engineer'" },
                 role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity: 'Android Software Engineer', 'Web QA Engineer'." },
                 role_description: { type: "string", description: "Detailed role brief including platform (web/android/ios/cli/api), framework/stack, specific expertise, constraints, and acceptance criteria. The richer this is, the better the agent performs." },
@@ -503,7 +520,7 @@ Each agent receives role-specific best practices, tool discovery hints, and comp
         type: "object" as const,
         properties: {
           session_id: { type: "string" },
-          agent_type: { type: "string", enum: ["claude", "codex", "gemini"] },
+          agent_type: { type: "string", enum: [...LAUNCHABLE_AGENT_TYPES] },
           name: { type: "string", description: "Display name for the agent" },
           role: { type: "string", description: "Core role: 'Software Engineer', 'UI/UX Designer', 'QA Engineer', 'Code Reviewer'. Prefix with platform for specificity." },
           role_description: { type: "string", description: "Detailed role brief including platform, framework, expertise, constraints. The richer this is, the better the agent performs." },
@@ -690,14 +707,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         if (unavailable.length > 0) {
           // Check what IS available on this machine
-          const allTypes: Array<"claude" | "codex" | "gemini"> = ["claude", "codex", "gemini"];
-          for (const t of allTypes) {
+          for (const t of LAUNCHABLE_AGENT_TYPES) {
             const d = await detectAgent(t);
             if (d.available) availableTypes.add(t);
           }
           const availableList = availableTypes.size > 0
             ? `Available agent CLIs on this machine: ${[...availableTypes].join(", ")}.`
-            : "No agent CLIs found. Install claude, codex, or gemini CLI first.";
+            : "No agent CLIs found. Install claude, codex, or agy (Antigravity CLI) first.";
           const failedList = unavailable.map(u => `${u.name} (${u.type})`).join(", ");
           return {
             content: [{
@@ -933,7 +949,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "add_agent": {
         const { session_id, agent_type, name: agentName, role, role_description, initial_task, file_ownership } = args as {
           session_id: string;
-          agent_type: "claude" | "codex" | "gemini";
+          agent_type: LaunchableAgentType;
           name: string;
           role: string;
           role_description: string;
@@ -1545,8 +1561,9 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
 
   // --- Driver delivery loop ---
   // Every 3s: hand unacked messages to each driver (Claude: stdin user message,
-  // Codex: steer into the active turn or start a new one), interrupt Codex turns
-  // stuck in inference, and close drivers whose slot was released.
+  // Codex: steer into the active turn or start a new one, Antigravity: a new
+  // turn once idle), interrupt Codex turns stuck in inference, and close
+  // drivers whose slot was released.
   const INTERRUPT_IDLE_MS = 60_000;
 
   async function interruptIfStuck(slotId: number, state: Extract<DriverSlot, { kind: "codex" }>): Promise<void> {
@@ -1586,8 +1603,8 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     const peek = await brokerClient.peekUndelivered(slotId).catch(() => ({ count: 0 }));
     const verdict = releaseVerdict({
       busy: state.busy,
-      turnActive: state.kind === "claude" ? state.driver.busy : state.driver.activeTurnId !== null,
-      lastOutputAt: state.kind === "claude" ? state.driver.lastActivity : state.driver.lastNotificationActivity,
+      turnActive: state.kind === "codex" ? state.driver.activeTurnId !== null : state.driver.busy,
+      lastOutputAt: state.kind === "codex" ? state.driver.lastNotificationActivity : state.driver.lastActivity,
       releasedAt: state.releasedAt,
       pendingCount: peek.count,
       now,
@@ -1595,7 +1612,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
     if (verdict === "keep") return;
     activeDrivers.delete(sessionId, slotId);
     log(LOG_PREFIX, `Slot ${slotId} released ${Math.round((now - state.releasedAt) / 1000)}s ago and idle — closing ${state.kind} driver`);
-    // Not awaited: a Claude close waits for the turn to end and must not stall other slots.
+    // Not awaited: a stdin-EOF close waits for the turn to end and must not stall other slots.
     closeDriver(state).catch((err) => log(LOG_PREFIX, `Closing driver for slot ${slotId} failed: ${err}`));
   }
 
@@ -1861,7 +1878,7 @@ function startBackgroundLoops(brokerClient: BrokerClient): void {
   //   - A connected agent is judged by messages its adapter never claimed: a
   //     claimed one is merely waiting for the agent's next tool call
   //   - Disconnected agents with any actionable unacked messages → respawn immediately
-  //   - Driver-managed agents (Claude, Codex) → skip, the delivery loop handles them
+  //   - Driver-managed agents (Claude, Codex, Antigravity) → skip, the delivery loop handles them
   //   - Paused agents are left alone
   //
   const CONNECTED_STALE_MS = STUCK_THRESHOLD_MS;

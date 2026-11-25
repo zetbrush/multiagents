@@ -158,7 +158,7 @@ async function relaunchAgents(slots: Array<{ id: number; agent_type: string; dis
   const platform = process.platform;
 
   for (const slot of slots) {
-    const cmd = slot.agent_type; // claude, codex, gemini
+    const cmd = slot.agent_type === "antigravity" ? "agy" : slot.agent_type; // claude, codex, gemini
     const envVars = `MULTIAGENTS_SESSION=${sessionId} MULTIAGENTS_ROLE=${slot.role ?? ""} MULTIAGENTS_NAME=${slot.display_name ?? ""}`;
     try {
       if (platform === "darwin") {

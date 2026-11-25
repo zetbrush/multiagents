@@ -14,6 +14,7 @@ import { McpStdioClient } from "./helpers/mcp-stdio-client.ts";
 import { ClaudeAdapter } from "../adapters/claude-adapter.ts";
 import { CodexAdapter } from "../adapters/codex-adapter.ts";
 import { GeminiAdapter } from "../adapters/gemini-adapter.ts";
+import { AntigravityAdapter } from "../adapters/antigravity-adapter.ts";
 
 const BROKER_PORT = 17902;
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -63,7 +64,7 @@ afterAll(() => {
 });
 
 /** Session with one adapter-backed slot and a sender peer (fake, live pid). */
-async function spawnAgent(agentType: "claude" | "codex" | "gemini", extraEnv: Record<string, string> = {}) {
+async function spawnAgent(agentType: "claude" | "codex" | "gemini" | "antigravity", extraEnv: Record<string, string> = {}) {
   const sessionId = uid("s");
   const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-delivery-"));
   await post("/sessions/create", { id: sessionId, name: "adapter", project_dir: projectDir });
@@ -116,7 +117,7 @@ async function spawnAgent(agentType: "claude" | "codex" | "gemini", extraEnv: Re
 }
 
 describe("tool-result delivery", () => {
-  for (const agentType of ["claude", "codex", "gemini"] as const) {
+  for (const agentType of ["claude", "codex", "gemini", "antigravity"] as const) {
     test(`${agentType}: a teammate message is piggybacked onto the next tool result and acked`, async () => {
       const agent = await spawnAgent(agentType);
       await agent.send("please review auth.ts");
@@ -172,6 +173,100 @@ describe("tool-result delivery", () => {
   }, 30_000);
 });
 
+describe("antigravity under an orchestrator driver", () => {
+  test("unclaimed messages ride on any tool result, the ones the driver claimed do not", async () => {
+    const agent = await spawnAgent("antigravity", { MULTIAGENTS_DRIVER_MODE: "1" });
+    await agent.send("claimed by the driver");
+    await Bun.sleep(1000);
+    expect((await post("/message-log", { session_id: agent.sessionId }))[0].delivered).toBe(0);
+    await post("/poll-by-slot", { slot_id: agent.slot.id, retain: true });
+
+    await agent.send("arrived mid-turn");
+    const result = await agent.client.callTool("set_summary", { summary: "working" });
+    expect(result.text).toContain("[PENDING MESSAGES]");
+    expect(result.text).toContain("arrived mid-turn");
+    expect(result.text).not.toContain("claimed by the driver");
+    expect(await agent.unacked()).toBe(1);
+
+    const next = await agent.client.callTool("set_summary", { summary: "still working" });
+    expect(next.text).not.toContain("arrived mid-turn");
+  }, 30_000);
+
+  test("a host that does not pass its environment on is matched to its slot through its slot file", async () => {
+    const sessionId = uid("s");
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-slotfile-"));
+    await post("/sessions/create", { id: sessionId, name: "adapter", project_dir: projectDir });
+    const slot = await post("/slots/create", { session_id: sessionId, agent_type: "antigravity", display_name: "Designer", role: "UI/UX Designer" });
+    const senderSlot = await post("/slots/create", { session_id: sessionId, agent_type: "codex", display_name: "Reviewer", role: "Code Reviewer" });
+    const sender = await post("/register", { agent_type: "codex", pid: livePid(), cwd: projectDir, git_root: null, tty: null, summary: "", session_id: sessionId, slot_id: senderSlot.id });
+
+    // The shell stands in for `agy`: the launcher keys the slot file by its pid and the MCP server is its direct child (as with agy 1.5.13).
+    const slotJson = JSON.stringify({ slot_id: slot.id, session_id: sessionId, role: "UI/UX Designer", name: "Designer", driver_mode: true });
+    const script = `mkdir -p .multiagents/slots && printf '%s' '${slotJson}' > .multiagents/slots/$$.json; bun '${SERVER_TS}' --agent-type antigravity; true`;
+    const client = await McpStdioClient.spawn(["sh", "-c", script], {
+      cwd: projectDir,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, MULTIAGENTS_PORT: String(BROKER_PORT) },
+    });
+    clients.push(client);
+
+    let linked: { peer_id: string | null; status: string } = { peer_id: null, status: "" };
+    for (let i = 0; i < 50 && !linked.peer_id; i++) {
+      linked = await post("/slots/get", { id: slot.id });
+      if (!linked.peer_id) await Bun.sleep(100);
+    }
+    expect(linked.peer_id).toMatch(/^ag-/);
+    expect(linked.status).toBe("connected");
+    expect((await post("/slots/list", { session_id: sessionId })).length).toBe(2);
+
+    // driver mode came from the slot file: nothing is polled in the background, tool results carry what is unclaimed
+    await post("/send-message", { from_id: sender.id, to_slot_id: slot.id, text: "use the new palette", msg_type: "chat", session_id: sessionId });
+    await Bun.sleep(1000);
+    expect((await post("/message-log", { session_id: sessionId }))[0].delivered).toBe(0);
+    const result = await client.callTool("set_summary", { summary: "designing" });
+    expect(result.text).toContain("use the new palette");
+  }, 30_000);
+});
+
+describe("slot files", () => {
+  test("a slot file written for an earlier process that had the same pid is ignored", async () => {
+    const sessionId = uid("s");
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-stale-slot-"));
+    await post("/sessions/create", { id: sessionId, name: "adapter", project_dir: projectDir });
+    const slot = await post("/slots/create", { session_id: sessionId, agent_type: "antigravity", display_name: "Designer", role: "UI/UX Designer" });
+
+    const slotJson = JSON.stringify({ slot_id: slot.id, session_id: sessionId, role: "UI/UX Designer", name: "Designer", driver_mode: true, host_started: "Thu Jan  1 00:00:00 1970" });
+    const script = `mkdir -p .multiagents/slots && printf '%s' '${slotJson}' > .multiagents/slots/$$.json; bun '${SERVER_TS}' --agent-type antigravity; true`;
+    const client = await McpStdioClient.spawn(["sh", "-c", script], {
+      cwd: projectDir,
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, MULTIAGENTS_PORT: String(BROKER_PORT) },
+    });
+    clients.push(client);
+
+    // the adapter is up and registered, but not as that slot's agent
+    expect((await client.callTool("set_summary", { summary: "standalone" })).text).toContain("Summary updated");
+    const untouched = await post("/slots/get", { id: slot.id });
+    expect(untouched.peer_id).toBeNull();
+    expect(untouched.status).toBe("disconnected");
+  }, 30_000);
+});
+
+describe("startup", () => {
+  test("a tool call that arrives before the broker registration finished waits for it", async () => {
+    const sessionId = uid("s");
+    const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "adapter-startup-"));
+    await post("/sessions/create", { id: sessionId, name: "adapter", project_dir: projectDir });
+    const slot = await post("/slots/create", { session_id: sessionId, agent_type: "claude", display_name: "Agent", role: "Software Engineer" });
+    const client = await McpStdioClient.spawn(["bun", SERVER_TS, "--agent-type", "claude"], {
+      cwd: projectDir,
+      env: { ...process.env, MULTIAGENTS_PORT: String(BROKER_PORT), MULTIAGENTS_SESSION: sessionId, MULTIAGENTS_SLOT: String(slot.id) },
+    });
+    clients.push(client);
+
+    const result = await client.callTool("set_summary", { summary: "first call" });
+    expect(result.text).toContain('Summary updated: "first call"');
+  }, 30_000);
+});
+
 describe("team status", () => {
   test("check_team_status names each teammate's peer id so send_message can address them", async () => {
     const agent = await spawnAgent("claude");
@@ -183,7 +278,7 @@ describe("team status", () => {
 
 describe("instruction budget", () => {
   test("MCP instructions fit Claude Code's 4096-char cap for every adapter", () => {
-    for (const adapter of [new ClaudeAdapter(), new CodexAdapter(), new GeminiAdapter()]) {
+    for (const adapter of [new ClaudeAdapter(), new CodexAdapter(), new GeminiAdapter(), new AntigravityAdapter()]) {
       const text = adapter.getInstructions();
       expect(text.length).toBeLessThanOrEqual(4096);
       expect(text).toContain("signal_done");

@@ -31,6 +31,11 @@ const KNOWN_PATHS: Record<string, string[]> = {
     "/opt/homebrew/bin/gemini",
     path.join(os.homedir(), ".npm-global", "bin", "gemini"),
   ],
+  agy: [
+    path.join(os.homedir(), ".local", "bin", "agy"),
+    "/usr/local/bin/agy",
+    "/opt/homebrew/bin/agy",
+  ],
 };
 
 function detectAgent(name: string): { available: boolean; version?: string; resolvedPath?: string } {
@@ -73,7 +78,8 @@ export async function setup(): Promise<void> {
   const agents = [
     { name: "Claude Code", cmd: "claude", info: detectAgent("claude") },
     { name: "Codex CLI", cmd: "codex", info: detectAgent("codex") },
-    { name: "Gemini CLI", cmd: "gemini", info: detectAgent("gemini") },
+    { name: "Antigravity CLI", cmd: "agy", info: detectAgent("agy") },
+    { name: "Gemini CLI (legacy)", cmd: "gemini", info: detectAgent("gemini") },
   ];
 
   for (const a of agents) {
@@ -84,7 +90,7 @@ export async function setup(): Promise<void> {
 
   const available = agents.filter(a => a.info.available);
   if (available.length === 0) {
-    console.error("\n\x1b[31mNo supported agents found. Install at least one: claude, codex, or gemini.\x1b[0m");
+    console.error("\n\x1b[31mNo supported agents found. Install at least one: claude, codex, or agy (Antigravity CLI).\x1b[0m");
     process.exit(1);
   }
 

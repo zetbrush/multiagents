@@ -37,6 +37,19 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
 }
 
 describe("CodexDriver session start", () => {
+  test("per-thread config overrides are sent on thread/start and thread/resume, and left out when there are none", async () => {
+    const { driver, dir, entries } = await spawnFake();
+    const config = { "mcp_servers.multiagents.enabled": false };
+    const first = await driver.startSession({ prompt: "hello", cwd: dir, config });
+    await driver.resumeSession({ threadId: first.threadId, cwd: dir, config });
+    expect(entries().find((e) => e.request === "thread/start").params.config).toEqual(config);
+    expect(entries().find((e) => e.request === "thread/resume").params.config).toEqual(config);
+
+    const plain = await spawnFake();
+    await plain.driver.startSession({ prompt: "hello", cwd: plain.dir });
+    expect("config" in plain.entries().find((e) => e.request === "thread/start").params).toBe(false);
+  });
+
   test("sends developerInstructions, cwd, sandbox and approvalPolicy on thread/start", async () => {
     const { driver, dir, entries } = await spawnFake();
     await driver.startSession({ prompt: "hello", cwd: dir, sandbox: "workspace-write", developerInstructions: "You are Alice, reviewer." });

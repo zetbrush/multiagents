@@ -14,10 +14,11 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `server.ts` — MCP stdio server, one per agent CLI instance (`adapters/*`). Prepends unread messages to every tool result (`[PENDING MESSAGES]`) and acks them; Claude also gets a best-effort channel notification.
 - `adapters/protocol-text.ts` — Team protocol: short form for MCP `instructions` (Claude Code caps them at 4096 chars, Codex reads 512), full form for orchestrator prompts.
 - `orchestrator/claude-driver.ts` — Long-lived `claude -p --input-format stream-json` session; teammate messages are written to stdin and read mid-turn. `system/init` only arrives after the first message; closing stdin ends the session.
-- `orchestrator/codex-driver.ts` — `codex app-server` JSON-RPC client (shapes verified against the 0.156.1 schema).
+- `orchestrator/codex-driver.ts` — `codex app-server` JSON-RPC client (shapes verified against the 0.156.1 schema, re-checked on 0.170.0). The launcher rewrites only the `multiagents-peer` table of `~/.codex/config.toml`; a standalone `multiagents` server there stays and is switched off per thread (`config: {"mcp_servers.multiagents.enabled": false}` on `thread/start`/`thread/resume`, sent only when that table exists — Codex rejects the override for an unknown server).
+- `orchestrator/antigravity-driver.ts` — Long-lived `agy --input-format stream-json --output-format stream-json` session (event shapes from https://antigravity.google/docs/cli/headless, verified on agy 1.5.13). `init` is printed at startup; one turn per prompt: a prompt written mid-turn waits, so delivery only writes when the driver is idle and the adapter keeps surfacing unclaimed messages in tool results. No per-launch MCP flag: the launcher registers `multiagents-peer` in `<project>/.agents/mcp_config.json` (a same-named entry in the global `~/.gemini/config/mcp_config.json` wins, so that one is repointed when present). agy starts MCP servers as direct children with its cwd and environment; the adapter takes its slot from the env, falling back to `.multiagents/slots/<agy pid>.json`.
 - `orchestrator/delivery.ts` — Hands unacked messages to a driver (`retain` poll) and acks them on confirmed hand-off.
 - `orchestrator/supervision.ts` — Driver registry (one driver per slot), non-overlapping loop ticks, release and watchdog verdicts; pure enough to unit-test.
-- `orchestrator/monitor.ts` — Slot summaries and token accounting. Claude's `result.usage` is per turn (added as is); Codex's `thread/tokenUsage/updated.total` is cumulative (diffed).
+- `orchestrator/monitor.ts` — Slot summaries and token accounting. Claude's `result.usage` is per turn (added as is); Codex's `thread/tokenUsage/updated.total` and Antigravity's `result.usage` are cumulative (diffed; a resumed Antigravity conversation's first turn is counted from its steps).
 - `shared/types.ts` — Shared TypeScript types for broker API.
 - `shared/summarize.ts` — Git-based summary of what an agent is working on (no API calls).
 - `cli.ts` — CLI utility for inspecting broker state.
@@ -37,7 +38,8 @@ claude --dangerously-load-development-channels server:multiagents
 # shared/broker-url.ts and the orchestrator forwards it to spawned agents — an
 # invalid value falls back to the default with a warning),
 # MULTIAGENTS_CLAUDE_MODEL (model for driver-launched Claude agents),
-# MULTIAGENTS_CLAUDE_COMMAND / MULTIAGENTS_CODEX_COMMAND (override the CLI binaries),
+# MULTIAGENTS_CLAUDE_COMMAND / MULTIAGENTS_CODEX_COMMAND / MULTIAGENTS_ANTIGRAVITY_COMMAND
+# (override the CLI binaries), MULTIAGENTS_ANTIGRAVITY_MODEL (model slug for Antigravity agents),
 # MULTIAGENTS_CLEANUP_INTERVAL_MS (broker stale-peer sweep), MULTIAGENTS_NO_DASHBOARD=1
 # (orchestrator opens no terminal/web dashboards — tests, headless hosts),
 # MULTIAGENTS_LIVE_TESTS=1 (run the live tests against the real CLIs, costs API usage).
@@ -84,7 +86,8 @@ trusted publishing (OIDC — no token in the repo or secrets; the publisher on n
 Use `bun test` to run tests. `tests/launcher.test.ts` writes the global `~/.codex/config.toml` /
 `~/.gemini/settings.json` (it saves and restores them); run the suite with a throwaway
 `HOME=$(mktemp -d) bun test` to keep your real configs untouched. Driver tests run against
-`tests/fakes/fake-claude.ts` and `tests/fakes/fake-codex-app-server.ts`.
+`tests/fakes/fake-claude.ts`, `tests/fakes/fake-codex-app-server.ts` and `tests/fakes/fake-agy.ts`;
+`tests/antigravity-team.test.ts` runs the real orchestrator, broker and adapter against the fake `agy`.
 
 ```ts#index.test.ts
 import { test, expect } from "bun:test";

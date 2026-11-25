@@ -135,4 +135,73 @@ describe("install-mcp / preuninstall", () => {
     const settings = JSON.parse(fs.readFileSync(path.join(home, ".claude", "settings.json"), "utf-8"));
     expect(settings.permissions.allow).toEqual(["mcp__multiagents", "mcp__multiagents-orch"]);
   });
+
+  test("configures the Antigravity CLI's shared MCP config and tool permission, and removes both on uninstall", () => {
+    const home = makeTempHome();
+    for (const name of ["claude", "agy"]) writeExecutable(home, name, "#!/bin/sh\nexit 0\n");
+    const mcpConfigPath = path.join(home, ".gemini", "config", "mcp_config.json");
+    const settingsPath = path.join(home, ".gemini", "antigravity-cli", "settings.json");
+    fs.mkdirSync(path.dirname(mcpConfigPath), { recursive: true });
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    // the Antigravity app creates the MCP config as an empty file
+    fs.writeFileSync(mcpConfigPath, "");
+    fs.writeFileSync(settingsPath, JSON.stringify({ colorScheme: "dark", permissions: { allow: ["command(git)"], deny: ["command(sudo)"] } }));
+
+    const install = runInstall(home);
+    expect(install.exitCode).toBe(0);
+    expect(install.stdout).toContain("Antigravity CLI: MCP server written");
+
+    const server = JSON.parse(fs.readFileSync(mcpConfigPath, "utf-8")).mcpServers["multiagents-peer"];
+    expect(server.args[0]).toEndWith("server.ts");
+    expect(server.args.slice(1)).toEqual(["--agent-type", "antigravity"]);
+    const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    expect(settings.colorScheme).toBe("dark");
+    expect(settings.permissions.allow).toEqual(["command(git)", "mcp(multiagents-peer/*)"]);
+    expect(settings.permissions.deny).toEqual(["command(sudo)"]);
+
+    const again = runInstall(home);
+    expect(again.stdout).toContain("Antigravity CLI: MCP server already configured");
+    expect(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).permissions.allow).toEqual(["command(git)", "mcp(multiagents-peer/*)"]);
+
+    const uninstall = runPreuninstall(home);
+    expect(uninstall.exitCode).toBe(0);
+    expect(JSON.parse(fs.readFileSync(mcpConfigPath, "utf-8")).mcpServers["multiagents-peer"]).toBeUndefined();
+    const cleaned = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    expect(cleaned.permissions.allow).toEqual(["command(git)"]);
+    expect(cleaned.colorScheme).toBe("dark");
+  });
+
+  test("keeps the user's other Antigravity MCP servers and leaves a malformed config alone", () => {
+    const home = makeTempHome();
+    for (const name of ["claude", "agy"]) writeExecutable(home, name, "#!/bin/sh\nexit 0\n");
+    const mcpConfigPath = path.join(home, ".gemini", "config", "mcp_config.json");
+    fs.mkdirSync(path.dirname(mcpConfigPath), { recursive: true });
+    fs.writeFileSync(mcpConfigPath, JSON.stringify({ mcpServers: { linter: { command: "lint-mcp" } } }));
+
+    expect(runInstall(home).exitCode).toBe(0);
+    const servers = JSON.parse(fs.readFileSync(mcpConfigPath, "utf-8")).mcpServers;
+    expect(servers.linter).toEqual({ command: "lint-mcp" });
+    expect(servers["multiagents-peer"]).toBeDefined();
+
+    fs.writeFileSync(mcpConfigPath, "{ not json");
+    const install = runInstall(home);
+    expect(install.exitCode).toBe(0);
+    expect(install.stdout).toContain("Antigravity CLI:");
+    expect(install.stdout).toContain("skipping");
+    expect(fs.readFileSync(mcpConfigPath, "utf-8")).toBe("{ not json");
+  });
+
+  test("leaves Antigravity's config alone when only the desktop app is installed", () => {
+    const home = makeTempHome();
+    writeExecutable(home, "claude", "#!/bin/sh\nexit 0\n");
+    const mcpConfigPath = path.join(home, ".gemini", "config", "mcp_config.json");
+    fs.mkdirSync(path.dirname(mcpConfigPath), { recursive: true });
+    fs.writeFileSync(mcpConfigPath, "");
+
+    const install = runInstall(home);
+    expect(install.exitCode).toBe(0);
+    expect(install.stdout).toContain("Antigravity CLI: not detected");
+    expect(fs.readFileSync(mcpConfigPath, "utf-8")).toBe("");
+    expect(fs.existsSync(path.join(home, ".gemini", "antigravity-cli"))).toBe(false);
+  });
 });

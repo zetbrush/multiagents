@@ -3,7 +3,7 @@
  * create_team → the agents work, review and approve → a crashed driver is
  * respawned → release_all closes the drivers → end_session. Runs only with
  * MULTIAGENTS_LIVE_TESTS=1 (costs API usage; set MULTIAGENTS_CLAUDE_MODEL=haiku).
- * The launcher rewrites ~/.codex/config.toml for the test broker; it is restored afterwards.
+ * The launcher rewrites its section of ~/.codex/config.toml for the test broker; it is restored afterwards.
  */
 
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
@@ -11,12 +11,15 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { McpStdioClient } from "./helpers/mcp-stdio-client.ts";
+import { restoreCodexConfig } from "./helpers/codex-config.ts";
 
 const LIVE = process.env.MULTIAGENTS_LIVE_TESTS === "1";
 const BROKER_PORT = 17908;
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const ORCHESTRATOR = new URL("../orchestrator/orchestrator-server.ts", import.meta.url).pathname;
-const GLOBAL_CONFIGS = [path.join(os.homedir(), ".codex", "config.toml"), path.join(os.homedir(), ".gemini", "settings.json")];
+const CODEX_CONFIG = path.join(os.homedir(), ".codex", "config.toml");
+const GLOBAL_CONFIGS = [CODEX_CONFIG, path.join(os.homedir(), ".gemini", "settings.json")];
+const TMP_PREFIX = "live-orchestrator-";
 
 let brokerProc: import("bun").Subprocess | null = null;
 let client: McpStdioClient | null = null;
@@ -48,7 +51,7 @@ const stateOf = async (sessionId: string, name: string) => (await slotsOf(sessio
 beforeAll(async () => {
   if (!LIVE) return;
   for (const file of GLOBAL_CONFIGS) backups.set(file, fs.existsSync(file) ? fs.readFileSync(file, "utf-8") : null);
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "live-orchestrator-"));
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), TMP_PREFIX));
   const brokerPath = new URL("../broker.ts", import.meta.url).pathname;
   brokerProc = Bun.spawn(["bun", brokerPath], {
     env: { ...process.env, MULTIAGENTS_PORT: String(BROKER_PORT), MULTIAGENTS_DB: path.join(tmpDir, "peers.db") },
@@ -76,6 +79,8 @@ afterAll(async () => {
   brokerProc?.kill();
   for (const [file, content] of backups) {
     if (content === null) { try { fs.unlinkSync(file); } catch { /* never existed */ } }
+    // the user's own Codex may have written to its config meanwhile
+    else if (file === CODEX_CONFIG) restoreCodexConfig(file, content, TMP_PREFIX);
     else fs.writeFileSync(file, content);
   }
 });
